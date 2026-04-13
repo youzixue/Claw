@@ -16,19 +16,33 @@
     </div>
 
     <template v-else>
-      <div class="section-title">外部联动因子</div>
-      <div class="factor-grid">
-        <div v-for="item in externalFactors" :key="item.key" class="stat-card factor-card">
+      <div class="section-title">结论卡片</div>
+      <div class="conclusion-grid">
+        <div v-for="item in conclusions" :key="item.key" class="conclusion-card" :class="`tone-${item.tone || 'neutral'}`">
           <div class="stat-label">{{ item.label }}</div>
-          <div class="stat-value big" :class="changeColorClass(item.change_pct)">
-            {{ item.price != null ? Number(item.price).toFixed(2) : '--' }}
-          </div>
-          <div class="stat-sub" :class="changeColorClass(item.change_pct)">
-            {{ formatChange(item.change_pct) }}
-          </div>
-          <div class="factor-meta">
-            <span class="market-tag">{{ item.market || '--' }}</span>
-            <span class="stat-date">{{ item.trade_time || '--' }}</span>
+          <div class="conclusion-value">{{ item.value }}</div>
+          <div class="mapping-note">{{ item.note || '--' }}</div>
+        </div>
+      </div>
+
+      <div class="section-title">外部联动因子</div>
+      <div class="factor-groups">
+        <div v-for="group in groupedFactors" :key="group.key" class="factor-group-card">
+          <div class="group-title">{{ group.label }}</div>
+          <div class="factor-grid">
+            <div v-for="item in group.items" :key="item.key" class="stat-card factor-card">
+              <div class="stat-label">{{ item.label }}</div>
+              <div class="stat-value big" :class="changeColorClass(item.change_pct)">
+                {{ item.price != null ? Number(item.price).toFixed(2) : '--' }}
+              </div>
+              <div class="stat-sub" :class="changeColorClass(item.change_pct)">
+                {{ formatChange(item.change_pct) }}
+              </div>
+              <div class="factor-meta">
+                <span class="market-tag">{{ item.market || '--' }}</span>
+                <span class="stat-date">{{ item.trade_time || '--' }}</span>
+              </div>
+            </div>
           </div>
         </div>
         <el-empty v-if="externalFactors.length === 0" description="暂无外部联动数据" :image-size="40" />
@@ -67,6 +81,7 @@ import { changeColorClass, formatChange, formatDate } from '@/composables/useUti
 
 const data = ref({
   snapshot_time: null,
+  conclusions: [],
   external_factors: [],
   mapping_insights: [],
 })
@@ -74,8 +89,31 @@ const loading = ref(true)
 const error = ref('')
 
 const snapshotTime = computed(() => data.value.snapshot_time)
+const conclusions = computed(() => data.value.conclusions || [])
 const externalFactors = computed(() => data.value.external_factors || [])
 const mappingInsights = computed(() => data.value.mapping_insights || [])
+
+const factorGroupMeta = {
+  HK: { key: 'hk', label: '港股' },
+  US: { key: 'us', label: '美股' },
+  US_CN: { key: 'us_cn', label: '中概' },
+  A50: { key: 'a50', label: 'A50 / 权重' },
+  US_RATE: { key: 'macro', label: '宏观' },
+  CMDTY: { key: 'commodity', label: '商品' },
+  FX: { key: 'fx', label: '汇率' },
+}
+
+const groupedFactors = computed(() => {
+  const groups = new Map()
+  externalFactors.value.forEach((item) => {
+    const meta = factorGroupMeta[item.market] || { key: 'other', label: '其他' }
+    if (!groups.has(meta.key)) {
+      groups.set(meta.key, { ...meta, items: [] })
+    }
+    groups.get(meta.key).items.push(item)
+  })
+  return Array.from(groups.values())
+})
 
 const mappingStatusLabel = (status) => {
   const map = {
@@ -146,6 +184,64 @@ onMounted(async () => {
 
 .time-value {
   font-size: 13px;
+  color: var(--el-text-color-primary);
+}
+
+.conclusion-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+
+.conclusion-card {
+  border-radius: 10px;
+  padding: 16px;
+  border: 1px solid var(--claw-border);
+  background: var(--claw-bg-card);
+}
+
+.conclusion-value {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 8px 0 10px;
+}
+
+.tone-positive {
+  border-color: rgba(103, 194, 58, 0.35);
+  background: rgba(103, 194, 58, 0.08);
+}
+
+.tone-negative {
+  border-color: rgba(245, 108, 108, 0.35);
+  background: rgba(245, 108, 108, 0.08);
+}
+
+.tone-warning {
+  border-color: rgba(230, 162, 60, 0.35);
+  background: rgba(230, 162, 60, 0.08);
+}
+
+.tone-neutral {
+  border-color: var(--claw-border);
+}
+
+.factor-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.factor-group-card {
+  background: var(--claw-bg-card);
+  border: 1px solid var(--claw-border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.group-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 12px;
   color: var(--el-text-color-primary);
 }
 
@@ -230,8 +326,9 @@ onMounted(async () => {
 }
 
 @media (max-width: 1200px) {
+  .conclusion-grid,
   .factor-grid {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
   }
 }
 
@@ -245,6 +342,7 @@ onMounted(async () => {
     align-items: flex-start;
   }
 
+  .conclusion-grid,
   .factor-grid,
   .mapping-list {
     grid-template-columns: 1fr;

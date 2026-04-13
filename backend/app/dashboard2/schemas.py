@@ -19,8 +19,17 @@ class MappingInsightItem(BaseModel):
     note: Optional[str] = None
 
 
+class OverviewConclusionItem(BaseModel):
+    key: str
+    label: str
+    value: str
+    tone: str = "neutral"  # positive/negative/warning/neutral
+    note: Optional[str] = None
+
+
 class Dashboard2Snapshot(BaseModel):
     trade_date: Optional[str] = None
     snapshot_time: Optional[str] = None
+    conclusions: List[OverviewConclusionItem] = []
     external_factors: List[ExternalFactorItem] = []
     mapping_insights: List[MappingInsightItem] = []
