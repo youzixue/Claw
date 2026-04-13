@@ -25,6 +25,7 @@ class ExternalFactorCollector:
         items.extend(self._collect_hk_indices())
         items.extend(self._collect_fx())
         items.extend(self._collect_us_indices())
+        items.extend(self._collect_a50())
         items.extend(self._collect_tencent_indices())
         items.extend(self._collect_us10y())
         items.extend(self._collect_commodities())
@@ -127,17 +128,6 @@ class ExternalFactorCollector:
     def _collect_tencent_indices(self) -> List[ExternalFactorItem]:
         out: List[ExternalFactorItem] = []
 
-        a50 = self._parse_tencent_quote('hf_CHA50CFD')
-        if a50 and len(a50) >= 14:
-            out.append(ExternalFactorItem(
-                key='a50',
-                label='富时中国A50',
-                price=_safe_float(a50[0]),
-                change_pct=_safe_float(a50[1]),
-                trade_time=f"{a50[12]} {a50[6]}".strip() if len(a50) > 12 else None,
-                market='A50',
-            ))
-
         hxc = self._parse_tencent_quote('usHXC')
         if hxc and len(hxc) >= 32:
             out.append(ExternalFactorItem(
@@ -149,6 +139,38 @@ class ExternalFactorCollector:
                 market='US_CN',
             ))
 
+        return out
+
+    def _collect_a50(self) -> List[ExternalFactorItem]:
+        out: List[ExternalFactorItem] = []
+        try:
+            resp = requests.get(
+                'https://hq.sinajs.cn/list=hf_CHA50CFD',
+                timeout=10,
+                headers={'Referer': 'https://finance.sina.com.cn'}
+            )
+            resp.raise_for_status()
+            text = resp.text.strip()
+            if '="";' in text:
+                return out
+            raw = text.split('="', 1)[1].rsplit('";', 1)[0]
+            parts = raw.split(',')
+            if len(parts) >= 14:
+                latest = _safe_float(parts[0])
+                prev_close = _safe_float(parts[8])
+                change_pct = 0.0
+                if prev_close:
+                    change_pct = round((latest - prev_close) / prev_close * 100, 2)
+                out.append(ExternalFactorItem(
+                    key='a50',
+                    label='富时中国A50',
+                    price=latest,
+                    change_pct=change_pct,
+                    trade_time=f"{parts[12]} {parts[6]}".strip(),
+                    market='A50',
+                ))
+        except Exception:
+            pass
         return out
 
     def _collect_us10y(self) -> List[ExternalFactorItem]:
