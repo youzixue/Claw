@@ -6,7 +6,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.stock import StockDaily, MarketSentiment
 from .mapping import GLOBAL_TO_CN_SECTOR_MAPPING
-from .schemas import Dashboard2Snapshot, MappingInsightItem, OverviewConclusionItem
+from .schemas import (
+    Dashboard2Snapshot,
+    MappingInsightItem,
+    OverviewConclusionItem,
+    AShareCoreState,
+    AShareIndexItem,
+)
 from .external_sources import external_factor_collector
 
 
@@ -151,6 +157,42 @@ class Dashboard2Service:
             OverviewConclusionItem(key="biggest_divergence", label="最大背离点", value=div_value, tone=div_tone, note=div_note),
         ]
 
+    def _build_a_share_core(self, ctx: dict) -> AShareCoreState:
+        sh = ctx.get("sh")
+        sz = ctx.get("sz")
+        cyb = ctx.get("cyb")
+        sentiment = ctx.get("sentiment")
+        return AShareCoreState(
+            indices=[
+                AShareIndexItem(code="000001", label="上证指数", price=getattr(sh, "close", 0) or 0, change_pct=getattr(sh, "change_pct", 0) or 0),
+                AShareIndexItem(code="399001", label="深证成指", price=getattr(sz, "close", 0) or 0, change_pct=getattr(sz, "change_pct", 0) or 0),
+                AShareIndexItem(code="399006", label="创业板指", price=getattr(cyb, "close", 0) or 0, change_pct=getattr(cyb, "change_pct", 0) or 0),
+            ],
+            sentiment_cycle=getattr(sentiment, "sentiment_cycle", None),
+            limit_up_count=getattr(sentiment, "limit_up_count", 0) or 0,
+            limit_down_count=getattr(sentiment, "limit_down_count", 0) or 0,
+            seal_rate=getattr(sentiment, "seal_rate", 0) or 0,
+            board_height=getattr(sentiment, "board_height", 0) or 0,
+            main_net_inflow=getattr(sentiment, "main_net_inflow", 0) or 0,
+        )
+
+    def _build_summary_text(self, conclusions: list[OverviewConclusionItem], mappings: list[MappingInsightItem]) -> str:
+        outer = next((x for x in conclusions if x.key == "outer_bias"), None)
+        mood = next((x for x in conclusions if x.key == "a_share_mood"), None)
+        strongest = next((x for x in conclusions if x.key == "strongest_mapping"), None)
+        divergence = next((x for x in conclusions if x.key == "biggest_divergence"), None)
+
+        summary = []
+        if outer and mood:
+            summary.append(f"{outer.value}，但{mood.value}")
+        if strongest and strongest.value not in {"暂无清晰主线", "暂无显著背离"}:
+            summary.append(f"当前更值得盯的是{strongest.value}")
+        if divergence and divergence.value != "暂无显著背离":
+            summary.append(f"同时留意{divergence.value}这条背离线索")
+        if not summary:
+            summary.append("当前外部与A股联动信号仍偏中性，先观察进一步共振")
+        return "，".join(summary) + "。"
+
     async def build_snapshot(self, db: AsyncSession) -> Dashboard2Snapshot:
         factors = external_factor_collector.collect()
         factor_map = {f.key: f for f in factors}
@@ -160,13 +202,12 @@ class Dashboard2Service:
         for k, v in GLOBAL_TO_CN_SECTOR_MAPPING.items():
             factor = factor_map.get(k)
             if factor is None:
-                note = "数据源待接入"
                 mappings.append(MappingInsightItem(
                     source_key=k,
                     source_label=v["label"],
                     a_share_themes=v["a_share_themes"],
                     status="missing",
-                    note=note,
+                    note="数据源待接入",
                 ))
                 continue
 
@@ -180,11 +221,15 @@ class Dashboard2Service:
             ))
 
         conclusions = self._build_conclusions(factors, mappings, a_share_ctx)
+        a_share_core = self._build_a_share_core(a_share_ctx)
+        summary_text = self._build_summary_text(conclusions, mappings)
 
         return Dashboard2Snapshot(
             trade_date=None,
             snapshot_time=datetime.now().isoformat(timespec="seconds"),
+            summary_text=summary_text,
             conclusions=conclusions,
+            a_share_core=a_share_core,
             external_factors=factors,
             mapping_insights=mappings,
         )
