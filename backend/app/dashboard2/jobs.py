@@ -10,7 +10,7 @@ from .cache import dashboard_snapshot_cache
 async def refresh_dashboard2_snapshot():
     async with async_session() as session:
         try:
-            snapshot = dashboard2_service.build_snapshot()
+            snapshot = await dashboard2_service.build_snapshot(session)
             await dashboard_snapshot_cache.save(session, snapshot, status="ok")
             await session.commit()
             logger.debug("overview-v2 快照刷新完成")

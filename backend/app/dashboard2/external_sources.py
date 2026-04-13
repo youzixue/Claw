@@ -115,7 +115,9 @@ class ExternalFactorCollector:
             resp = requests.get(url, timeout=10)
             resp.raise_for_status()
             text = resp.text.strip()
-            if '="";' in text or 'none_match' in text:
+            if '="";' in text:
+                return None
+            if 'none_match' in text and code != 'hf_CHA50CFD':
                 return None
             raw = text.split('="', 1)[1].rsplit('";', 1)[0]
             return raw.split('~') if '~' in raw else raw.split(',')
@@ -125,7 +127,6 @@ class ExternalFactorCollector:
     def _collect_tencent_indices(self) -> List[ExternalFactorItem]:
         out: List[ExternalFactorItem] = []
 
-        # A50 CFD
         a50 = self._parse_tencent_quote('hf_CHA50CFD')
         if a50 and len(a50) >= 14:
             out.append(ExternalFactorItem(
@@ -137,7 +138,6 @@ class ExternalFactorCollector:
                 market='A50',
             ))
 
-        # 纳斯达克中国金龙指数
         hxc = self._parse_tencent_quote('usHXC')
         if hxc and len(hxc) >= 32:
             out.append(ExternalFactorItem(

@@ -1139,17 +1139,58 @@ class DataScheduler:
                 seal_rate = round(lu_count / (lu_count + bl_count) * 100, 1) if (lu_count + bl_count) > 0 else 0
                 board_height = max([lu.consecutive_days or 1 for lu in limit_ups], default=0)
                 main_net_inflow = round(sum(main_flows) / 1e8, 2) if main_flows else 0
+                advance_decline_ratio = round(lu_count / ld_count, 2) if ld_count > 0 else float(lu_count)
 
-                sentiment_cycle = "recovery"
-                if lu_count < 20 or (seal_rate < 40 and lu_count < 30):
-                    sentiment_cycle = "freezing"
-                elif lu_count >= 80 and seal_rate >= 80:
+                score = 0
+                if lu_count >= 80:
+                    score += 2
+                elif lu_count >= 50:
+                    score += 1
+                elif lu_count < 20:
+                    score -= 2
+                elif lu_count < 30:
+                    score -= 1
+
+                if seal_rate >= 80:
+                    score += 2
+                elif seal_rate >= 65:
+                    score += 1
+                elif seal_rate < 45:
+                    score -= 2
+                elif seal_rate < 60:
+                    score -= 1
+
+                if board_height >= 5:
+                    score += 2
+                elif board_height >= 3:
+                    score += 1
+                elif board_height <= 1:
+                    score -= 1
+
+                if ld_count >= 20:
+                    score -= 2
+                elif ld_count >= 10:
+                    score -= 1
+
+                if bl_count >= lu_count and bl_count >= 20:
+                    score -= 2
+                elif bl_count >= max(10, lu_count * 0.5):
+                    score -= 1
+
+                if main_net_inflow >= 80:
+                    score += 1
+                elif main_net_inflow <= -80:
+                    score -= 1
+
+                if score >= 4:
                     sentiment_cycle = "climax"
-                elif lu_count >= 50 and seal_rate < 70:
+                elif score >= 1:
+                    sentiment_cycle = "recovery"
+                elif score <= -4:
+                    sentiment_cycle = "freezing"
+                else:
                     sentiment_cycle = "divergence"
 
-                # 使用真实可得字段先形成第一版市场情绪快照
-                # advance_decline_ratio / turnover_total 后续可接入更真实的全市场广度口径
                 sentiment_record = {
                     "trade_date": today,
                     "sentiment_cycle": sentiment_cycle,
@@ -1158,7 +1199,7 @@ class DataScheduler:
                     "broken_limit_count": bl_count,
                     "seal_rate": seal_rate,
                     "board_height": board_height,
-                    "advance_decline_ratio": round(lu_count / ld_count, 2) if ld_count > 0 else float(lu_count),
+                    "advance_decline_ratio": advance_decline_ratio,
                     "turnover_total": 0,
                     "main_net_inflow": main_net_inflow,
                 }

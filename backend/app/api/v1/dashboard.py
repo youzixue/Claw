@@ -160,5 +160,5 @@ async def dashboard_overview_v2(db: AsyncSession = Depends(get_db)):
     cached = await dashboard_snapshot_cache.latest(db)
     if cached:
         return cached
-    snapshot = dashboard2_service.build_snapshot().model_dump()
+    snapshot = (await dashboard2_service.build_snapshot(db)).model_dump()
     return snapshot
