@@ -16,7 +16,10 @@
     </div>
 
     <template v-else>
-      <div class="section-title">总评摘要</div>
+      <div class="section-title section-title-inline">
+        <span>总评摘要</span>
+        <span class="refresh-status" :class="refreshStatusClass">{{ refreshStatusText }}</span>
+      </div>
       <div class="summary-card">
         {{ summaryText || '暂无总评' }}
       </div>
@@ -60,7 +63,7 @@
 
       <div class="section-title section-title-inline">
         <span>结论卡片</span>
-        <span class="auto-refresh-tip">自动刷新中，每 45 秒更新一次</span>
+        <span class="auto-refresh-tip">每 45 秒自动刷新</span>
       </div>
       <div class="conclusion-grid">
         <div v-for="item in conclusions" :key="item.key" class="conclusion-card" :class="`tone-${item.tone || 'neutral'}`">
@@ -121,6 +124,7 @@
 
 <script setup>
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
+import dayjs from 'dayjs'
 import { getDashboardOverviewV2 } from '@/api'
 import { changeColorClass, formatChange, formatDate, sentimentCycleLabel } from '@/composables/useUtils'
 
@@ -137,6 +141,8 @@ const data = ref({
 const loading = ref(true)
 const error = ref('')
 const refreshing = ref(false)
+const lastRefreshAt = ref(null)
+const lastRefreshFailedAt = ref(null)
 let refreshTimer = null
 
 const snapshotTime = computed(() => data.value.snapshot_time)
@@ -145,6 +151,21 @@ const conclusions = computed(() => data.value.conclusions || [])
 const aShareCore = computed(() => data.value.a_share_core || { indices: [] })
 const externalFactors = computed(() => data.value.external_factors || [])
 const mappingInsights = computed(() => data.value.mapping_insights || [])
+
+const refreshStatusText = computed(() => {
+  if (refreshing.value) return '刷新中...'
+  if (lastRefreshFailedAt.value) return `刷新失败，${dayjs(lastRefreshFailedAt.value).format('HH:mm:ss')} 后将自动重试`
+  if (!lastRefreshAt.value) return `每 ${REFRESH_MS / 1000} 秒自动刷新`
+  const diffSec = dayjs().diff(lastRefreshAt.value, 'second')
+  if (diffSec < 5) return '刚刚更新'
+  return `${diffSec} 秒前更新`
+})
+
+const refreshStatusClass = computed(() => {
+  if (refreshing.value) return 'status-refreshing'
+  if (lastRefreshFailedAt.value) return 'status-failed'
+  return 'status-ok'
+})
 
 const factorGroupMeta = {
   HK: { key: 'hk', label: '港股' },
@@ -189,8 +210,11 @@ const loadData = async ({ silent = false } = {}) => {
     const res = await getDashboardOverviewV2()
     data.value = res
     error.value = ''
+    lastRefreshAt.value = dayjs()
+    lastRefreshFailedAt.value = null
   } catch (e) {
     if (!silent) error.value = 'Dashboard 2.0 加载失败'
+    lastRefreshFailedAt.value = dayjs()
     console.error('overview-v2 数据加载失败:', e)
   } finally {
     if (!silent) loading.value = false
@@ -228,6 +252,10 @@ onBeforeUnmount(() => {
 .metric-item-wide { grid-column: span 1; }
 .metric-label, .stat-date, .mapping-note, .auto-refresh-tip { color: var(--claw-text-muted, #909399); }
 .metric-value { font-size: 16px; font-weight: 700; }
+.refresh-status { font-size: 12px; }
+.status-ok { color: #67c23a; }
+.status-refreshing { color: #409eff; }
+.status-failed { color: #e6a23c; }
 .conclusion-card { border-radius: 10px; padding: 16px; border: 1px solid var(--claw-border); background: var(--claw-bg-card); }
 .conclusion-value { font-size: 20px; font-weight: 700; margin: 8px 0 10px; }
 .tone-positive { border-color: rgba(103, 194, 58, 0.35); background: rgba(103, 194, 58, 0.08); }
