@@ -21,6 +21,14 @@ GLOBAL_TO_CN_SECTOR_MAPPING = {
         "label": "中概/金龙",
         "a_share_themes": ["平台经济映射", "AI应用", "软件服务", "金融科技", "传媒"],
     },
+    "us_nasdaq": {
+        "label": "纳斯达克",
+        "a_share_themes": ["成长风格", "科技股", "AI链", "创业板"],
+    },
+    "us_sp500": {
+        "label": "标普500",
+        "a_share_themes": ["全球风险偏好", "权重白马", "核心资产"],
+    },
     "rates_us10y": {
         "label": "美债10Y",
         "a_share_themes": ["成长风格", "高估值科技", "创业板"],

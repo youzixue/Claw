@@ -23,6 +23,7 @@ class ExternalFactorCollector:
         items: List[ExternalFactorItem] = []
         items.extend(self._collect_hk_indices())
         items.extend(self._collect_fx())
+        items.extend(self._collect_us_indices())
         items.extend(self._collect_us10y())
         items.extend(self._collect_commodities())
         return items
@@ -76,6 +77,34 @@ class ExternalFactorCollector:
                 ))
         except Exception:
             pass
+        return out
+
+    def _collect_us_indices(self) -> List[ExternalFactorItem]:
+        out: List[ExternalFactorItem] = []
+        mapping = {
+            ".IXIC": ("us_nasdaq", "纳斯达克"),
+            ".INX": ("us_sp500", "标普500"),
+        }
+        for symbol, (key, label) in mapping.items():
+            try:
+                df = ak.index_us_stock_sina(symbol=symbol)
+                if isinstance(df, pd.DataFrame) and len(df) > 0:
+                    row = df.iloc[-1]
+                    prev_close = _safe_float(row.get("open"))
+                    close = _safe_float(row.get("close"))
+                    change_pct = 0.0
+                    if prev_close:
+                        change_pct = round((close - prev_close) / prev_close * 100, 2)
+                    out.append(ExternalFactorItem(
+                        key=key,
+                        label=label,
+                        price=close,
+                        change_pct=change_pct,
+                        trade_time=str(row.get("date")) if row.get("date") is not None else None,
+                        market="US",
+                    ))
+            except Exception:
+                continue
         return out
 
     def _collect_us10y(self) -> List[ExternalFactorItem]:
