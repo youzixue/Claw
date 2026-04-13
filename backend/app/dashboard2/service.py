@@ -182,16 +182,41 @@ class Dashboard2Service:
         strongest = next((x for x in conclusions if x.key == "strongest_mapping"), None)
         divergence = next((x for x in conclusions if x.key == "biggest_divergence"), None)
 
-        summary = []
+        synced_count = sum(1 for m in mappings if m.status == "synced")
+        diverging_count = sum(1 for m in mappings if m.status == "diverging")
+        lagging_count = sum(1 for m in mappings if m.status == "lagging")
+
+        parts = []
         if outer and mood:
-            summary.append(f"{outer.value}，但{mood.value}")
+            connector = "同时"
+            if diverging_count >= 3 and synced_count <= 1:
+                connector = "不过"
+            elif synced_count >= 3 and diverging_count == 0:
+                connector = "且"
+            parts.append(f"{outer.value}，{connector}{mood.value}")
+
         if strongest and strongest.value not in {"暂无清晰主线", "暂无显著背离"}:
-            summary.append(f"当前更值得盯的是{strongest.value}")
+            if synced_count >= 2:
+                parts.append(f"当前同步线索里，{strongest.value}相对更强")
+            elif lagging_count >= 2:
+                parts.append(f"{strongest.value}这条线已有方向，但A股跟随仍不算充分")
+            else:
+                parts.append(f"短线可以优先盯{strongest.value}")
+
         if divergence and divergence.value != "暂无显著背离":
-            summary.append(f"同时留意{divergence.value}这条背离线索")
-        if not summary:
-            summary.append("当前外部与A股联动信号仍偏中性，先观察进一步共振")
-        return "，".join(summary) + "。"
+            if diverging_count >= 3:
+                parts.append(f"背离点偏多，尤其要留意{divergence.value}这条线")
+            else:
+                parts.append(f"同时留意{divergence.value}这条背离线索")
+        elif synced_count >= 3:
+            parts.append("整体联动比前面更顺，市场在尝试形成共振")
+        elif lagging_count >= 3:
+            parts.append("外部方向有了，但A股内部反馈还偏慢，先看是否继续确认")
+
+        if not parts:
+            parts.append("当前外部与A股联动信号仍偏中性，先观察进一步共振")
+
+        return "，".join(parts) + "。"
 
     async def build_snapshot(self, db: AsyncSession) -> Dashboard2Snapshot:
         factors = external_factor_collector.collect()

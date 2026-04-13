@@ -58,7 +58,10 @@
         </div>
       </div>
 
-      <div class="section-title">结论卡片</div>
+      <div class="section-title section-title-inline">
+        <span>结论卡片</span>
+        <span class="auto-refresh-tip">自动刷新中，每 45 秒更新一次</span>
+      </div>
       <div class="conclusion-grid">
         <div v-for="item in conclusions" :key="item.key" class="conclusion-card" :class="`tone-${item.tone || 'neutral'}`">
           <div class="stat-label">{{ item.label }}</div>
@@ -117,9 +120,11 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { getDashboardOverviewV2 } from '@/api'
 import { changeColorClass, formatChange, formatDate, sentimentCycleLabel } from '@/composables/useUtils'
+
+const REFRESH_MS = 45 * 1000
 
 const data = ref({
   snapshot_time: null,
@@ -131,6 +136,8 @@ const data = ref({
 })
 const loading = ref(true)
 const error = ref('')
+const refreshing = ref(false)
+let refreshTimer = null
 
 const snapshotTime = computed(() => data.value.snapshot_time)
 const summaryText = computed(() => data.value.summary_text || '')
@@ -174,15 +181,34 @@ const formatAmountYi = (val) => {
   return `${Number(val).toFixed(2)} 亿`
 }
 
-onMounted(async () => {
+const loadData = async ({ silent = false } = {}) => {
+  if (refreshing.value) return
   try {
-    loading.value = true
-    data.value = await getDashboardOverviewV2()
+    refreshing.value = true
+    if (!silent) loading.value = true
+    const res = await getDashboardOverviewV2()
+    data.value = res
+    error.value = ''
   } catch (e) {
-    error.value = 'Dashboard 2.0 加载失败'
+    if (!silent) error.value = 'Dashboard 2.0 加载失败'
     console.error('overview-v2 数据加载失败:', e)
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
+    refreshing.value = false
+  }
+}
+
+onMounted(async () => {
+  await loadData()
+  refreshTimer = window.setInterval(() => {
+    loadData({ silent: true })
+  }, REFRESH_MS)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer) {
+    window.clearInterval(refreshTimer)
+    refreshTimer = null
   }
 })
 </script>
@@ -200,7 +226,7 @@ onMounted(async () => {
 .core-metrics-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 16px; }
 .metric-item { display: flex; flex-direction: column; gap: 6px; padding: 12px; border-radius: 8px; background: rgba(127,127,127,.08); }
 .metric-item-wide { grid-column: span 1; }
-.metric-label, .stat-date, .mapping-note { color: var(--claw-text-muted, #909399); }
+.metric-label, .stat-date, .mapping-note, .auto-refresh-tip { color: var(--claw-text-muted, #909399); }
 .metric-value { font-size: 16px; font-weight: 700; }
 .conclusion-card { border-radius: 10px; padding: 16px; border: 1px solid var(--claw-border); background: var(--claw-bg-card); }
 .conclusion-value { font-size: 20px; font-weight: 700; margin: 8px 0 10px; }
@@ -209,6 +235,7 @@ onMounted(async () => {
 .tone-warning { border-color: rgba(230, 162, 60, 0.35); background: rgba(230, 162, 60, 0.08); }
 .factor-groups { display: flex; flex-direction: column; gap: 16px; }
 .group-title, .mapping-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; color: var(--el-text-color-primary); }
+.section-title-inline { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .factor-card { min-height: 132px; }
 .factor-meta, .mapping-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .market-tag { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; background: rgba(64, 158, 255, 0.12); color: #409eff; font-size: 12px; }
@@ -216,5 +243,5 @@ onMounted(async () => {
 .mapping-themes { display: flex; flex-wrap: wrap; gap: 8px; }
 .loading-wrapper { padding: 40px 0; }
 @media (max-width: 1200px) { .core-index-grid, .factor-grid, .conclusion-grid { grid-template-columns: repeat(2, 1fr); } .core-metrics-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 768px) { .page-head { flex-direction: column; align-items: flex-start; } .snapshot-time { align-items: flex-start; } .core-index-grid, .factor-grid, .conclusion-grid, .mapping-list, .core-metrics-grid { grid-template-columns: 1fr; } }
+@media (max-width: 768px) { .page-head, .section-title-inline { flex-direction: column; align-items: flex-start; } .snapshot-time { align-items: flex-start; } .core-index-grid, .factor-grid, .conclusion-grid, .mapping-list, .core-metrics-grid { grid-template-columns: 1fr; } }
 </style>
