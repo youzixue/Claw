@@ -1,50 +1,80 @@
 <template>
   <div class="page-container">
-    <h2 class="page-title">🏆 绩效中心</h2>
-
-    <!-- 信号统计 -->
-    <div class="stat-row">
-      <div class="stat-card"><div class="stat-label">总信号数</div><div class="stat-value">{{ signalStats.total || '--' }}</div></div>
-      <div class="stat-card"><div class="stat-label">胜率</div><div class="stat-value" :class="signalStats.win_rate >= 0.5 ? 'text-red' : 'text-green'">{{ signalStats.win_rate ? (signalStats.win_rate * 100).toFixed(1) + '%' : '--' }}</div></div>
-      <div class="stat-card"><div class="stat-label">平均收益</div><div class="stat-value" :class="changeColorClass(signalStats.avg_return)">{{ signalStats.avg_return ? formatChange(signalStats.avg_return) : '--' }}</div></div>
-      <div class="stat-card"><div class="stat-label">最大回撤</div><div class="stat-value text-green">{{ signalStats.max_drawdown ? signalStats.max_drawdown.toFixed(2) + '%' : '--' }}</div></div>
+    <div class="page-shell performance-page">
+      <div class="page-hero">
+      <div>
+        <h2 class="page-title">🏆 绩效中心</h2>
+        <div class="page-subtitle">统一查看信号统计、因子质量与单笔信号归因结果</div>
+      </div>
+      <div class="hero-chip">
+        <el-icon><Trophy /></el-icon>
+        <span>策略表现概览</span>
+      </div>
     </div>
 
-    <el-tabs v-model="activeTab" >
-      <!-- 信号类型分布 -->
-      <el-tab-pane label="信号分布" name="distribution">
-        <v-chart :option="pieOption" style="height: 350px" autoresize />
-      </el-tab-pane>
-
-      <!-- 因子评估 -->
-      <el-tab-pane label="因子评估" name="factor-eval">
-        <el-table :data="factorEvalList" stripe size="small" empty-text="暂无数据">
-          <el-table-column prop="factor_name" label="因子" min-width="150" />
-          <el-table-column prop="ic_mean" label="IC" width="80" align="right">
-            <template #default="{ row }">{{ row.ic_mean?.toFixed(4) || '--' }}</template>
-          </el-table-column>
-          <el-table-column prop="ir" label="IR" width="70" align="right">
-            <template #default="{ row }">{{ row.ir?.toFixed(3) || '--' }}</template>
-          </el-table-column>
-          <el-table-column prop="is_decaying" label="衰减" width="70" align="center">
-            <template #default="{ row }"><el-tag v-if="row.is_decaying" type="danger" size="small">是</el-tag><span v-else class="text-gray">否</span></template>
-          </el-table-column>
-        </el-table>
-      </el-tab-pane>
-
-      <!-- 信号归因 -->
-      <el-tab-pane label="信号归因" name="attribution">
-        <div class="query-row">
-          <el-input v-model="attrSignalId" placeholder="输入信号ID" style="width: 200px" @keyup.enter="queryAttribution" />
-          <el-button type="primary" @click="queryAttribution" :loading="querying">查询</el-button>
+      <div class="metrics-panel performance-metrics-panel">
+        <div class="stat-row">
+          <div class="stat-card perf-stat-card">
+        <div class="metric-head"><el-icon><Histogram /></el-icon><span>总信号数</span></div>
+        <div class="stat-value">{{ signalStats.total || '--' }}</div>
+      </div>
+      <div class="stat-card perf-stat-card">
+        <div class="metric-head"><el-icon><DataLine /></el-icon><span>胜率</span></div>
+        <div class="stat-value" :class="signalStats.win_rate >= 0.5 ? 'text-red' : 'text-green'">{{ signalStats.win_rate ? (signalStats.win_rate * 100).toFixed(1) + '%' : '--' }}</div>
+      </div>
+      <div class="stat-card perf-stat-card">
+        <div class="metric-head"><el-icon><TrendCharts /></el-icon><span>平均收益</span></div>
+        <div class="stat-value" :class="changeColorClass(signalStats.avg_return)">{{ signalStats.avg_return ? formatChange(signalStats.avg_return) : '--' }}</div>
+      </div>
+          <div class="stat-card perf-stat-card">
+            <div class="metric-head"><el-icon><Bottom /></el-icon><span>最大回撤</span></div>
+            <div class="stat-value text-green">{{ signalStats.max_drawdown ? signalStats.max_drawdown.toFixed(2) + '%' : '--' }}</div>
+          </div>
         </div>
-        <el-descriptions v-if="attribution" :column="2" size="small" border>
-          <el-descriptions-item v-for="(val, key) in attribution" :key="key" :label="key">
-            {{ typeof val === 'number' ? val.toFixed(4) : typeof val === 'object' ? JSON.stringify(val) : val }}
-          </el-descriptions-item>
-        </el-descriptions>
+      </div>
+
+      <el-tabs v-model="activeTab">
+      <el-tab-pane label="信号分布" name="distribution">
+        <div class="panel-card chart-panel">
+          <div class="panel-title"><el-icon><PieChart /></el-icon>信号类型分布</div>
+          <v-chart :option="pieOption" style="height: 350px" autoresize />
+        </div>
       </el-tab-pane>
-    </el-tabs>
+
+      <el-tab-pane label="因子评估" name="factor-eval">
+        <div class="panel-card">
+          <div class="panel-title"><el-icon><Cpu /></el-icon>因子评估</div>
+          <el-table :data="factorEvalList" stripe size="small" empty-text="暂无数据">
+            <el-table-column prop="factor_name" label="因子" min-width="150" />
+            <el-table-column prop="ic_mean" label="IC" width="80" align="right">
+              <template #default="{ row }">{{ row.ic_mean?.toFixed(4) || '--' }}</template>
+            </el-table-column>
+            <el-table-column prop="ir" label="IR" width="70" align="right">
+              <template #default="{ row }">{{ row.ir?.toFixed(3) || '--' }}</template>
+            </el-table-column>
+            <el-table-column prop="is_decaying" label="衰减" width="70" align="center">
+              <template #default="{ row }"><el-tag v-if="row.is_decaying" type="danger" size="small">是</el-tag><span v-else class="text-gray">否</span></template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="信号归因" name="attribution">
+        <div class="panel-card attribution-panel">
+          <div class="panel-title"><el-icon><Search /></el-icon>信号归因查询</div>
+          <div class="query-row">
+            <el-input v-model="attrSignalId" placeholder="输入信号ID" style="width: 240px" @keyup.enter="queryAttribution" />
+            <el-button type="primary" @click="queryAttribution" :loading="querying">查询</el-button>
+          </div>
+          <el-descriptions v-if="attribution" :column="2" size="small" border>
+            <el-descriptions-item v-for="(val, key) in attribution" :key="key" :label="key">
+              {{ typeof val === 'number' ? val.toFixed(4) : typeof val === 'object' ? JSON.stringify(val) : val }}
+            </el-descriptions-item>
+          </el-descriptions>
+        </div>
+      </el-tab-pane>
+      </el-tabs>
+    </div>
   </div>
 </template>
 
@@ -70,8 +100,8 @@ const pieOption = computed(() => {
   return {
     backgroundColor: 'transparent',
     tooltip: { trigger: 'item' },
-    series: [{ type: 'pie', radius: ['40%', '70%'], data, label: { color: '#1d2939' }, emphasis: { itemStyle: { shadowBlur: 10 } } }],
-    color: ['#ef4444', '#f59e0b', '#3b82f6', '#22c55e', '#8b5cf6'],
+    series: [{ type: 'pie', radius: ['40%', '70%'], data, label: { color: '#34507a' }, emphasis: { itemStyle: { shadowBlur: 10 } } }],
+    color: ['#007aff', '#5ac8fa', '#34c759', '#ff9500', '#af52de'],
   }
 })
 
@@ -95,7 +125,20 @@ onMounted(async () => {
 </script>
 
 <style scoped lang="scss">
-.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
-.query-row { display: flex; gap: 12px; margin-bottom: 16px; }
-@media (max-width: 768px) { .stat-row { grid-template-columns: repeat(2, 1fr); } }
+.performance-page { display: flex; flex-direction: column; gap: 18px; }
+.performance-metrics-panel { padding: 4px; }
+.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 0; }
+.perf-stat-card { padding: 16px; background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 14px; box-shadow: var(--claw-shadow-sm); }
+.metric-head { color: var(--claw-text-muted); font-size: 13px; margin-bottom: 10px; }
+.chart-panel { min-height: 390px; }
+.query-row { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+:deep(.el-tabs__header) { margin-bottom: 18px; }
+:deep(.el-tabs__nav-wrap::after) { background: var(--claw-border-light); }
+:deep(.el-tabs__item) { height: 40px; font-weight: 500; }
+:deep(.el-table) { border: 1px solid var(--claw-border); border-radius: 14px; overflow: hidden; box-shadow: var(--claw-shadow-sm); }
+:deep(.el-table th.el-table__cell) { background: #f7faff; }
+:deep(.el-descriptions) { border-radius: 12px; overflow: hidden; }
+@media (max-width: 768px) {
+  .stat-row { grid-template-columns: repeat(2, 1fr); }
+}
 </style>

@@ -1,6 +1,7 @@
 <template>
-  <div class="page-container overview-v2-page">
-    <div class="page-head">
+  <div class="page-container">
+    <div class="page-shell overview-v2-page">
+      <div class="page-hero page-head">
       <div>
         <h2 class="page-title">🦅 Dashboard 2.0</h2>
         <div class="page-subtitle">跨市场联动总览，自动读取后台快照</div>
@@ -11,30 +12,47 @@
       </div>
     </div>
 
-    <div v-if="loading" class="loading-wrapper">
+      <div v-if="loading" class="loading-wrapper panel-card">
       <el-skeleton :rows="10" animated />
     </div>
 
     <template v-else>
-      <div class="section-title section-title-inline">
-        <span>总评摘要</span>
-        <span class="refresh-status" :class="refreshStatusClass">{{ refreshStatusText }}</span>
-      </div>
-      <div class="summary-card">
-        {{ summaryText || '暂无总评' }}
-      </div>
-
-      <div class="section-title">风险 / 机会聚焦</div>
-      <div class="focus-strip-grid">
-        <div v-for="item in focusStrips" :key="item.kind" class="focus-strip" :class="`focus-${item.kind} focus-tone-${item.tone || 'neutral'}`">
-          <div class="focus-kicker">{{ item.kind === 'opportunity' ? '机会方向' : '风险方向' }}</div>
-          <div class="focus-label">{{ item.label }}</div>
-          <div class="focus-detail">{{ item.detail || '--' }}</div>
+      <section class="section-block summary-block">
+        <div class="section-title section-title-inline">
+          <span>总评摘要</span>
+          <span class="refresh-status" :class="refreshStatusClass">
+            <el-icon><RefreshRight /></el-icon>
+            {{ refreshStatusText }}
+          </span>
         </div>
-      </div>
+        <div class="summary-card summary-card-hero">
+          <div class="summary-icon-wrap">
+            <el-icon><DataAnalysis /></el-icon>
+          </div>
+          <div class="summary-content">
+            {{ summaryText || '暂无总评' }}
+          </div>
+        </div>
+      </section>
 
-      <div class="section-title">A股核心状态</div>
-      <div class="a-share-core-card">
+      <section class="section-block">
+        <div class="section-title">风险 / 机会聚焦</div>
+        <div class="focus-strip-grid">
+          <div v-for="item in focusStrips" :key="item.kind" class="focus-strip" :class="`focus-${item.kind} focus-tone-${item.tone || 'neutral'}`">
+            <div class="focus-kicker">
+              <el-icon v-if="item.kind === 'opportunity'"><Opportunity /></el-icon>
+              <el-icon v-else><Warning /></el-icon>
+              {{ item.kind === 'opportunity' ? '机会方向' : '风险方向' }}
+            </div>
+            <div class="focus-label">{{ item.label }}</div>
+            <div class="focus-detail">{{ item.detail || '--' }}</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-title">A股核心状态</div>
+        <div class="a-share-core-card">
         <div class="core-index-grid">
           <div v-for="item in aShareCore.indices || []" :key="item.code" class="stat-card factor-card">
             <div class="stat-label">{{ item.label }}</div>
@@ -48,42 +66,47 @@
         </div>
         <div class="core-metrics-grid">
           <div class="metric-item">
-            <span class="metric-label">情绪周期</span>
+            <span class="metric-label"><el-icon><Sunny /></el-icon>情绪周期</span>
             <span class="metric-value">{{ sentimentCycleLabel(aShareCore.sentiment_cycle) }}</span>
           </div>
           <div class="metric-item">
-            <span class="metric-label">涨停 / 跌停</span>
+            <span class="metric-label"><el-icon><Histogram /></el-icon>涨停 / 跌停</span>
             <span class="metric-value"><span class="text-red">{{ aShareCore.limit_up_count ?? '--' }}</span> / <span class="text-green">{{ aShareCore.limit_down_count ?? '--' }}</span></span>
           </div>
           <div class="metric-item">
-            <span class="metric-label">封板率</span>
+            <span class="metric-label"><el-icon><Finished /></el-icon>封板率</span>
             <span class="metric-value">{{ aShareCore.seal_rate != null ? Number(aShareCore.seal_rate).toFixed(1) + '%' : '--' }}</span>
           </div>
           <div class="metric-item">
-            <span class="metric-label">最高连板</span>
+            <span class="metric-label"><el-icon><Top /></el-icon>最高连板</span>
             <span class="metric-value">{{ aShareCore.board_height ?? '--' }}</span>
           </div>
           <div class="metric-item metric-item-wide">
-            <span class="metric-label">主力净流入</span>
+            <span class="metric-label"><el-icon><Coin /></el-icon>主力净流入</span>
             <span class="metric-value" :class="changeColorClass(aShareCore.main_net_inflow)">{{ formatAmountYi(aShareCore.main_net_inflow) }}</span>
           </div>
         </div>
       </div>
 
-      <div class="section-title section-title-inline">
-        <span>结论卡片</span>
-        <span class="auto-refresh-tip">每 45 秒自动刷新</span>
-      </div>
-      <div class="conclusion-grid">
-        <div v-for="item in conclusions" :key="item.key" class="conclusion-card" :class="`tone-${item.tone || 'neutral'}`">
-          <div class="stat-label">{{ item.label }}</div>
-          <div class="conclusion-value">{{ item.value }}</div>
-          <div class="mapping-note">{{ item.note || '--' }}</div>
-        </div>
-      </div>
+      </section>
 
-      <div class="section-title">外部联动因子</div>
-      <div class="factor-groups">
+      <section class="section-block">
+        <div class="section-title section-title-inline">
+          <span>结论卡片</span>
+          <span class="auto-refresh-tip">每 45 秒自动刷新</span>
+        </div>
+        <div class="conclusion-grid">
+          <div v-for="item in conclusions" :key="item.key" class="conclusion-card" :class="`tone-${item.tone || 'neutral'}`">
+            <div class="stat-label">{{ item.label }}</div>
+            <div class="conclusion-value">{{ item.value }}</div>
+            <div class="mapping-note">{{ item.note || '--' }}</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-title">外部联动因子</div>
+        <div class="factor-groups">
         <div v-for="group in groupedFactors" :key="group.key" class="factor-group-card">
           <div class="group-title">{{ group.label }}</div>
           <div class="factor-grid">
@@ -105,9 +128,12 @@
         <el-empty v-if="externalFactors.length === 0" description="暂无外部联动数据" :image-size="40" />
       </div>
 
-      <div class="section-title">外盘主题 → A股映射</div>
-      <div class="mapping-list">
-        <div v-for="item in mappingInsights" :key="item.source_key" class="mapping-card">
+      </section>
+
+      <section class="section-block">
+        <div class="section-title">外盘主题 → A股映射</div>
+        <div class="mapping-list">
+          <div v-for="item in mappingInsights" :key="item.source_key" class="mapping-card">
           <div class="mapping-head">
             <div>
               <div class="mapping-title">{{ item.source_label }}</div>
@@ -123,11 +149,13 @@
           </div>
           <div class="mapping-note">{{ item.note || '--' }}</div>
         </div>
-        <el-empty v-if="mappingInsights.length === 0" description="暂无映射判断" :image-size="40" />
-      </div>
+          <el-empty v-if="mappingInsights.length === 0" description="暂无映射判断" :image-size="40" />
+        </div>
+      </section>
     </template>
 
     <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" style="margin-top: 16px" />
+    </div>
   </div>
 </template>
 
@@ -249,16 +277,20 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped lang="scss">
-.overview-v2-page { display: flex; flex-direction: column; gap: 16px; }
-.page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
-.page-subtitle { color: var(--claw-text-muted, #909399); font-size: 13px; margin-top: 4px; }
+.overview-v2-page { display: flex; flex-direction: column; gap: 20px; }
+.page-head { align-items: flex-end; }
+.section-block { display: flex; flex-direction: column; gap: 12px; }
+.summary-block { gap: 10px; }
 .snapshot-time { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .time-label { color: var(--claw-text-muted, #909399); font-size: 12px; }
 .time-value { font-size: 13px; color: var(--el-text-color-primary); }
 .summary-card { background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 10px; padding: 16px; line-height: 1.8; font-size: 15px; }
+.summary-card-hero { display: flex; gap: 14px; align-items: flex-start; }
+.summary-icon-wrap { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; border-radius: 12px; background: rgba(0,122,255,0.1); color: var(--claw-primary); border: 1px solid rgba(0,122,255,0.08); flex-shrink: 0; }
+.summary-content { flex: 1; }
 .focus-strip-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
 .focus-strip { border-radius: 10px; padding: 16px; border: 1px solid var(--claw-border); }
-.focus-kicker { font-size: 12px; color: var(--claw-text-muted, #909399); margin-bottom: 8px; }
+.focus-kicker { font-size: 12px; color: var(--claw-text-muted, #909399); margin-bottom: 8px; display: inline-flex; align-items: center; gap: 6px; }
 .focus-label { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
 .focus-detail { color: var(--claw-text-muted, #909399); line-height: 1.6; }
 .focus-opportunity { background: rgba(103, 194, 58, 0.08); border-color: rgba(103, 194, 58, 0.35); }
@@ -269,8 +301,9 @@ onBeforeUnmount(() => {
 .metric-item { display: flex; flex-direction: column; gap: 6px; padding: 12px; border-radius: 8px; background: rgba(127,127,127,.08); }
 .metric-item-wide { grid-column: span 1; }
 .metric-label, .stat-date, .mapping-note, .auto-refresh-tip { color: var(--claw-text-muted, #909399); }
+.metric-label { display: inline-flex; align-items: center; gap: 6px; }
 .metric-value { font-size: 16px; font-weight: 700; }
-.refresh-status { font-size: 12px; }
+.refresh-status { font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
 .status-ok { color: #67c23a; }
 .status-refreshing { color: #409eff; }
 .status-failed { color: #e6a23c; }
@@ -289,5 +322,5 @@ onBeforeUnmount(() => {
 .mapping-themes { display: flex; flex-wrap: wrap; gap: 8px; }
 .loading-wrapper { padding: 40px 0; }
 @media (max-width: 1200px) { .core-index-grid, .factor-grid, .conclusion-grid { grid-template-columns: repeat(2, 1fr); } .core-metrics-grid, .focus-strip-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 768px) { .page-head, .section-title-inline { flex-direction: column; align-items: flex-start; } .snapshot-time { align-items: flex-start; } .core-index-grid, .factor-grid, .conclusion-grid, .mapping-list, .core-metrics-grid, .focus-strip-grid { grid-template-columns: 1fr; } }
+@media (max-width: 768px) { .page-head, .section-title-inline { flex-direction: column; align-items: flex-start; } .snapshot-time { align-items: flex-start; } .summary-card-hero { flex-direction: column; } .core-index-grid, .factor-grid, .conclusion-grid, .mapping-list, .core-metrics-grid, .focus-strip-grid { grid-template-columns: 1fr; } }
 </style>

@@ -1,9 +1,19 @@
 <template>
   <div class="page-container">
-    <h2 class="page-title">📊 板块营地</h2>
+    <div class="page-shell sectors-page">
+      <div class="page-hero mb-16">
+      <div>
+        <h2 class="page-title">📊 板块营地</h2>
+        <div class="page-subtitle">围绕强弱、轮动、生命周期与主线状态做统一观察</div>
+      </div>
+      <div class="hero-chip">
+        <el-icon><Grid /></el-icon>
+        <span>{{ categoryLabel }}板块视图</span>
+      </div>
+    </div>
 
     <!-- 板块类型切换：概念/行业两个大Tab -->
-    <div class="category-tabs mb-16">
+    <div class="category-tabs toolbar-card mb-16">
       <el-radio-group v-model="sectorCategory" size="default" @change="onCategoryChange">
         <el-radio-button value="concept">🔥 概念板块</el-radio-button>
         <el-radio-button value="industry">🏭 行业板块</el-radio-button>
@@ -12,7 +22,8 @@
     </div>
 
     <!-- 概览统计 -->
-    <el-row :gutter="12" class="mb-16" v-if="stats.total > 0">
+      <div class="metrics-panel" v-if="stats.total > 0">
+        <el-row :gutter="12" class="metrics-row">
       <el-col :xs="12" :sm="6">
         <el-card shadow="never" class="stat-card">
           <div class="stat-label">{{ categoryLabel }}总数</div>
@@ -39,10 +50,11 @@
           <div class="stat-value" style="font-size: 16px">{{ stats.tradeDate }}</div>
         </el-card>
       </el-col>
-    </el-row>
+        </el-row>
+      </div>
 
-    <!-- 子Tab: 强弱/轮动/持续性/生命周期 -->
-    <el-tabs v-model="activeSubTab">
+      <!-- 子Tab: 强弱/轮动/持续性/生命周期 -->
+      <el-tabs v-model="activeSubTab">
       <!-- 板块生命周期(核心重构) -->
       <el-tab-pane label="生命周期" name="lifecycle">
         <div v-if="loading" class="loading-container">
@@ -587,6 +599,7 @@
         </template>
       </el-tab-pane>
     </el-tabs>
+    </div>
   </div>
 </template>
 
@@ -1258,6 +1271,20 @@ onMounted(async () => {
 .mr-4 { margin-right: 4px; }
 .mt-24 { margin-top: 24px; }
 
+.sectors-page {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.metrics-panel {
+  padding: 4px 4px 0;
+}
+
+.metrics-row {
+  margin-bottom: 0;
+}
+
 .stat-card {
   text-align: center;
   .stat-label {
@@ -1274,16 +1301,31 @@ onMounted(async () => {
 
 .loading-container {
   padding: 20px;
+  background: var(--claw-bg-card);
+  border: 1px solid var(--claw-border);
+  border-radius: 14px;
 }
 
 .category-tabs {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
+
+  :deep(.el-radio-group) {
+    gap: 8px;
+    display: flex;
+    flex-wrap: wrap;
+  }
 
   :deep(.el-radio-button__inner) {
     font-size: 14px;
     font-weight: 500;
+    border-radius: 10px !important;
+    border-left: 1px solid var(--claw-border) !important;
+    box-shadow: none !important;
+    padding: 10px 14px;
   }
 }
 
@@ -1291,6 +1333,10 @@ onMounted(async () => {
   font-size: 13px;
   color: #98a2b3;
   font-weight: 500;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(245,247,250,0.9);
+  border: 1px solid var(--claw-border-light);
 }
 
 .pagination-wrap {
@@ -1312,9 +1358,10 @@ onMounted(async () => {
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
-  padding: 8px 12px;
-  background: var(--el-fill-color-lighter);
-  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(245,247,250,0.92);
+  border: 1px solid var(--claw-border-light);
+  border-radius: 12px;
 }
 
 .lc-stat-item {
@@ -1429,6 +1476,10 @@ onMounted(async () => {
   overflow-x: auto;
   max-height: 600px;
   overflow-y: auto;
+  background: var(--claw-bg-card);
+  border: 1px solid var(--claw-border);
+  border-radius: 14px;
+  box-shadow: var(--claw-shadow-sm);
 }
 
 .calendar-table {
@@ -1516,6 +1567,9 @@ onMounted(async () => {
 
 .mainline-card {
   height: 100%;
+  border-radius: 14px;
+  border: 1px solid var(--claw-border);
+  box-shadow: var(--claw-shadow-sm);
 
   .card-header {
     display: flex;
@@ -1594,9 +1648,10 @@ onMounted(async () => {
   display: flex;
   gap: 24px;
   flex-wrap: wrap;
-  padding: 12px 16px;
-  background: var(--el-fill-color-light);
-  border-radius: 8px;
+  padding: 14px 16px;
+  background: rgba(245,247,250,0.92);
+  border: 1px solid var(--claw-border-light);
+  border-radius: 14px;
 
   .summary-item {
     display: flex;
@@ -1617,6 +1672,12 @@ onMounted(async () => {
 }
 
 .kline-quick-pick {
+  padding: 16px;
+  background: var(--claw-bg-card);
+  border: 1px solid var(--claw-border);
+  border-radius: 14px;
+  box-shadow: var(--claw-shadow-sm);
+
   .quick-title {
     font-size: 16px;
     font-weight: 500;
@@ -1651,5 +1712,32 @@ onMounted(async () => {
       align-items: center;
     }
   }
+}
+
+:deep(.el-tabs__header) {
+  margin-bottom: 18px;
+}
+
+:deep(.el-tabs__nav-wrap::after) {
+  background: var(--claw-border-light);
+}
+
+:deep(.el-tabs__item) {
+  height: 40px;
+  font-weight: 500;
+}
+
+:deep(.el-table) {
+  border: 1px solid var(--claw-border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: var(--claw-shadow-sm);
+}
+
+:deep(.el-table th.el-table__cell) {
+  background: #f7faff;
+}
+
+@media (max-width: 768px) {
 }
 </style>
