@@ -11,6 +11,7 @@ from app.models.stock import StockDaily, LimitUpPool
 from app.risk.circuit_breaker import sentiment_circuit_breaker
 from app.data.sources.eastmoney_source import EastMoneySource
 from app.dashboard2.service import dashboard2_service
+from app.dashboard2.cache import dashboard_snapshot_cache
 
 router = APIRouter()
 
@@ -154,6 +155,10 @@ async def dashboard_overview(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/overview-v2")
-async def dashboard_overview_v2():
-    """总览 2.0 聚合接口"""
-    return dashboard2_service.build_snapshot().model_dump()
+async def dashboard_overview_v2(db: AsyncSession = Depends(get_db)):
+    """总览 2.0 聚合接口，优先读取后台快照"""
+    cached = await dashboard_snapshot_cache.latest(db)
+    if cached:
+        return cached
+    snapshot = dashboard2_service.build_snapshot().model_dump()
+    return snapshot

@@ -113,6 +113,12 @@ class DataScheduler:
             id="sector_derive", name="板块派生计算(持续性+强弱+生命周期)",
         )
 
+        # === overview-v2 快照: 每60秒 ===
+        self.scheduler.add_job(
+            self._dashboard2_snapshot, IntervalTrigger(seconds=60),
+            id="dashboard2_snapshot", name="overview-v2 快照刷新(60s)",
+        )
+
         # === 数据质量检查: 每5分钟 ===
         self.scheduler.add_job(
             self._quality_check, IntervalTrigger(minutes=5),
@@ -1173,6 +1179,11 @@ class DataScheduler:
             except Exception as e:
                 logger.error(f"指数与情绪快照失败: {e}")
                 await session.rollback()
+
+    async def _dashboard2_snapshot(self):
+        """overview-v2 快照刷新"""
+        from app.dashboard2.jobs import refresh_dashboard2_snapshot
+        await refresh_dashboard2_snapshot()
 
     async def _intraday_sina(self):
         """盘中新浪 — 概念板块实时行情(5分钟/次)

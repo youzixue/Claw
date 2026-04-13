@@ -1,10 +1,11 @@
 """Dashboard 2.0 外部联动因子采集"""
 
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from .schemas import ExternalFactorItem
 
@@ -24,6 +25,7 @@ class ExternalFactorCollector:
         items.extend(self._collect_hk_indices())
         items.extend(self._collect_fx())
         items.extend(self._collect_us_indices())
+        items.extend(self._collect_tencent_indices())
         items.extend(self._collect_us10y())
         items.extend(self._collect_commodities())
         return items
@@ -105,6 +107,48 @@ class ExternalFactorCollector:
                     ))
             except Exception:
                 continue
+        return out
+
+    def _parse_tencent_quote(self, code: str) -> Optional[list[str]]:
+        try:
+            url = f"https://qt.gtimg.cn/q={code}"
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            text = resp.text.strip()
+            if '="";' in text or 'none_match' in text:
+                return None
+            raw = text.split('="', 1)[1].rsplit('";', 1)[0]
+            return raw.split('~') if '~' in raw else raw.split(',')
+        except Exception:
+            return None
+
+    def _collect_tencent_indices(self) -> List[ExternalFactorItem]:
+        out: List[ExternalFactorItem] = []
+
+        # A50 CFD
+        a50 = self._parse_tencent_quote('hf_CHA50CFD')
+        if a50 and len(a50) >= 14:
+            out.append(ExternalFactorItem(
+                key='a50',
+                label='富时中国A50',
+                price=_safe_float(a50[0]),
+                change_pct=_safe_float(a50[1]),
+                trade_time=f"{a50[12]} {a50[6]}".strip() if len(a50) > 12 else None,
+                market='A50',
+            ))
+
+        # 纳斯达克中国金龙指数
+        hxc = self._parse_tencent_quote('usHXC')
+        if hxc and len(hxc) >= 32:
+            out.append(ExternalFactorItem(
+                key='china_adr',
+                label='纳斯达克中国金龙',
+                price=_safe_float(hxc[3]),
+                change_pct=_safe_float(hxc[32]),
+                trade_time=hxc[30] if len(hxc) > 30 else None,
+                market='US_CN',
+            ))
+
         return out
 
     def _collect_us10y(self) -> List[ExternalFactorItem]:
