@@ -27,6 +27,13 @@ class OverviewConclusionItem(BaseModel):
     note: Optional[str] = None
 
 
+class FocusStripItem(BaseModel):
+    kind: str  # opportunity/risk
+    label: str
+    detail: Optional[str] = None
+    tone: str = "neutral"
+
+
 class AShareIndexItem(BaseModel):
     code: str
     label: str
@@ -49,6 +56,7 @@ class Dashboard2Snapshot(BaseModel):
     snapshot_time: Optional[str] = None
     summary_text: Optional[str] = None
     conclusions: List[OverviewConclusionItem] = []
+    focus_strips: List[FocusStripItem] = []
     a_share_core: Optional[AShareCoreState] = None
     external_factors: List[ExternalFactorItem] = []
     mapping_insights: List[MappingInsightItem] = []

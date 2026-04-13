@@ -10,6 +10,7 @@ from .schemas import (
     Dashboard2Snapshot,
     MappingInsightItem,
     OverviewConclusionItem,
+    FocusStripItem,
     AShareCoreState,
     AShareIndexItem,
 )
@@ -157,6 +158,24 @@ class Dashboard2Service:
             OverviewConclusionItem(key="biggest_divergence", label="最大背离点", value=div_value, tone=div_tone, note=div_note),
         ]
 
+    def _build_focus_strips(self, conclusions: list[OverviewConclusionItem], mappings: list[MappingInsightItem]) -> list[FocusStripItem]:
+        strongest = next((x for x in conclusions if x.key == "strongest_mapping"), None)
+        divergence = next((x for x in conclusions if x.key == "biggest_divergence"), None)
+        mood = next((x for x in conclusions if x.key == "a_share_mood"), None)
+
+        opportunity_label = strongest.value if strongest and strongest.value != "暂无清晰主线" else "等待更清晰机会"
+        opportunity_detail = strongest.note if strongest else "同步主线尚未形成"
+        if mood and mood.value in {"A股情绪修复", "A股情绪亢奋"} and strongest and strongest.value != "暂无清晰主线":
+            opportunity_detail = f"{mood.value}，{strongest.note}"
+
+        risk_label = divergence.value if divergence and divergence.value != "暂无显著背离" else "暂无突出风险线"
+        risk_detail = divergence.note if divergence else "主要映射暂未见明显反向冲突"
+
+        return [
+            FocusStripItem(kind="opportunity", label=opportunity_label, detail=opportunity_detail, tone="positive" if strongest and strongest.tone == "positive" else "neutral"),
+            FocusStripItem(kind="risk", label=risk_label, detail=risk_detail, tone="negative" if divergence and divergence.value != "暂无显著背离" else "neutral"),
+        ]
+
     def _build_a_share_core(self, ctx: dict) -> AShareCoreState:
         sh = ctx.get("sh")
         sz = ctx.get("sz")
@@ -246,6 +265,7 @@ class Dashboard2Service:
             ))
 
         conclusions = self._build_conclusions(factors, mappings, a_share_ctx)
+        focus_strips = self._build_focus_strips(conclusions, mappings)
         a_share_core = self._build_a_share_core(a_share_ctx)
         summary_text = self._build_summary_text(conclusions, mappings)
 
@@ -254,6 +274,7 @@ class Dashboard2Service:
             snapshot_time=datetime.now().isoformat(timespec="seconds"),
             summary_text=summary_text,
             conclusions=conclusions,
+            focus_strips=focus_strips,
             a_share_core=a_share_core,
             external_factors=factors,
             mapping_insights=mappings,

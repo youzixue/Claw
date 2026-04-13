@@ -24,6 +24,15 @@
         {{ summaryText || '暂无总评' }}
       </div>
 
+      <div class="section-title">风险 / 机会聚焦</div>
+      <div class="focus-strip-grid">
+        <div v-for="item in focusStrips" :key="item.kind" class="focus-strip" :class="`focus-${item.kind} focus-tone-${item.tone || 'neutral'}`">
+          <div class="focus-kicker">{{ item.kind === 'opportunity' ? '机会方向' : '风险方向' }}</div>
+          <div class="focus-label">{{ item.label }}</div>
+          <div class="focus-detail">{{ item.detail || '--' }}</div>
+        </div>
+      </div>
+
       <div class="section-title">A股核心状态</div>
       <div class="a-share-core-card">
         <div class="core-index-grid">
@@ -134,6 +143,7 @@ const data = ref({
   snapshot_time: null,
   summary_text: '',
   conclusions: [],
+  focus_strips: [],
   a_share_core: { indices: [] },
   external_factors: [],
   mapping_insights: [],
@@ -148,6 +158,7 @@ let refreshTimer = null
 const snapshotTime = computed(() => data.value.snapshot_time)
 const summaryText = computed(() => data.value.summary_text || '')
 const conclusions = computed(() => data.value.conclusions || [])
+const focusStrips = computed(() => data.value.focus_strips || [])
 const aShareCore = computed(() => data.value.a_share_core || { indices: [] })
 const externalFactors = computed(() => data.value.external_factors || [])
 const mappingInsights = computed(() => data.value.mapping_insights || [])
@@ -245,6 +256,13 @@ onBeforeUnmount(() => {
 .time-label { color: var(--claw-text-muted, #909399); font-size: 12px; }
 .time-value { font-size: 13px; color: var(--el-text-color-primary); }
 .summary-card { background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 10px; padding: 16px; line-height: 1.8; font-size: 15px; }
+.focus-strip-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.focus-strip { border-radius: 10px; padding: 16px; border: 1px solid var(--claw-border); }
+.focus-kicker { font-size: 12px; color: var(--claw-text-muted, #909399); margin-bottom: 8px; }
+.focus-label { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+.focus-detail { color: var(--claw-text-muted, #909399); line-height: 1.6; }
+.focus-opportunity { background: rgba(103, 194, 58, 0.08); border-color: rgba(103, 194, 58, 0.35); }
+.focus-risk { background: rgba(245, 108, 108, 0.08); border-color: rgba(245, 108, 108, 0.35); }
 .a-share-core-card, .factor-group-card, .mapping-card { background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 10px; padding: 16px; }
 .core-index-grid, .factor-grid, .conclusion-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
 .core-metrics-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 16px; }
@@ -270,6 +288,6 @@ onBeforeUnmount(() => {
 .mapping-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
 .mapping-themes { display: flex; flex-wrap: wrap; gap: 8px; }
 .loading-wrapper { padding: 40px 0; }
-@media (max-width: 1200px) { .core-index-grid, .factor-grid, .conclusion-grid { grid-template-columns: repeat(2, 1fr); } .core-metrics-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 768px) { .page-head, .section-title-inline { flex-direction: column; align-items: flex-start; } .snapshot-time { align-items: flex-start; } .core-index-grid, .factor-grid, .conclusion-grid, .mapping-list, .core-metrics-grid { grid-template-columns: 1fr; } }
+@media (max-width: 1200px) { .core-index-grid, .factor-grid, .conclusion-grid { grid-template-columns: repeat(2, 1fr); } .core-metrics-grid, .focus-strip-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 768px) { .page-head, .section-title-inline { flex-direction: column; align-items: flex-start; } .snapshot-time { align-items: flex-start; } .core-index-grid, .factor-grid, .conclusion-grid, .mapping-list, .core-metrics-grid, .focus-strip-grid { grid-template-columns: 1fr; } }
 </style>
