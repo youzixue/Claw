@@ -254,3 +254,79 @@ def test_reference_hint_falls_back_to_original_copy():
     source = inspect.getsource(tenbagger._build_aggregated_anomaly_row)
     assert "_format_reference_hint(reference_factors)" in source
     assert "or \"暂无明确主驱动，先看个股盘口与量价确认\"" in source
+
+
+# ---------- 参考板块：行业优先 ----------
+
+
+def _concept(name, code=None):
+    return {"sector_name": name, "sector_type": "concept", "sector_code": code or f"pw_concept_{name}"}
+
+
+def _industry(name, code=None):
+    return {"sector_name": name, "sector_type": "industry", "sector_code": code or f"pw_industry_{name}"}
+
+
+def test_reference_selection_puts_industry_first():
+    """行业必须排首位 —— 概念有 +2.0 基础分，不做处理必然被挤出前 2。"""
+    from app.signal.anomaly_scanner import _select_reference_factors
+
+    out = _select_reference_factors([_concept("A"), _concept("B"), _industry("银行")])
+    assert out[0]["sector_type"] == "industry"
+    assert out[0]["sector_name"] == "银行"
+
+
+def test_reference_selection_moves_industry_to_front_even_when_present():
+    """行业已在列表里但不在首位时也要提前 —— 只判断「在不在」不够。"""
+    from app.signal.anomaly_scanner import _select_reference_factors
+
+    out = _select_reference_factors([_concept("A"), _industry("银行")])
+    assert [i["sector_name"] for i in out] == ["银行", "A"]
+
+
+def test_reference_selection_keeps_concepts_when_no_industry():
+    from app.signal.anomaly_scanner import _select_reference_factors
+
+    out = _select_reference_factors([_concept("A"), _concept("B")])
+    assert [i["sector_name"] for i in out] == ["A", "B"]
+
+
+def test_reference_selection_real_china_shenhua_case():
+    """真实场景：行业被两个概念挤出前 2，现在必须回到首位。"""
+    from app.signal.anomaly_scanner import _select_reference_factors
+
+    out = _select_reference_factors([
+        _concept("绿色电力"),
+        _concept("煤化工概念"),
+        _industry("煤炭-煤炭开采加工-煤炭开采"),
+    ])
+    assert out[0]["sector_name"] == "煤炭-煤炭开采加工-煤炭开采"
+    assert len(out) == 2
+
+
+def test_reference_selection_handles_empty_and_single():
+    from app.signal.anomaly_scanner import _select_reference_factors
+
+    assert _select_reference_factors([]) == []
+    assert [i["sector_name"] for i in _select_reference_factors([_industry("银行")])] == ["银行"]
+
+
+def test_hint_prefers_industry_regardless_of_order():
+    """展示层显式优先行业，不依赖上游排序。"""
+    from app.api.v1.tenbagger import _format_reference_hint
+
+    hint = _format_reference_hint([
+        _concept("跨境支付(CIPS)") | {"change_pct": -0.21, "fund_flow": -6.82},
+        _industry("银行-银行-国有大型银行") | {"change_pct": -0.73, "fund_flow": -0.98},
+    ])
+    assert "银行-银行-国有大型银行" in hint
+    assert "跨境支付" not in hint
+
+
+def test_hint_falls_back_to_concept_when_no_industry():
+    from app.api.v1.tenbagger import _format_reference_hint
+
+    hint = _format_reference_hint([
+        _concept("绿色电力") | {"change_pct": 0.88, "fund_flow": -17.8},
+    ])
+    assert "绿色电力" in hint

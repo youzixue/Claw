@@ -267,6 +267,47 @@ def _is_positive_sector_candidate(item: dict | None) -> bool:
     return _safe_float(factor.get("fund_flow")) > 0
 
 
+def _select_reference_factors(candidates: list[dict], limit: int = 2) -> list[dict]:
+    """选取「参考板块」，并**保证该股自己的行业在里面且排首位**。
+
+    背景（2026-09-17）
+    -----------------
+    `reference_candidates` 已按 `relevance_score` 降序，但打分里概念有 +2.0
+    基础分、行业只有 +0.8（见 `_build_sector_context_detail`），所以行业几乎
+    总被概念挤出前 2 名。实测 `601088 中国神华` 的
+    `煤炭-煤炭开采加工-煤炭开采`（当日 -0.25%）**完全没进参考列表**，
+    于是页面无法回答「这只票为什么没有主驱动」—— 答案恰恰是它自己的行业
+    当日没转强。
+
+    行业才是「该股所属产业当日状态」的直接答案，故提到首位；概念参考保留
+    在后。没有行业候选时维持原有顺序。
+
+    纯上下文/展示用途：不参与 `selected_sectors`（主驱动）的选取，也不影响
+    任何买点门槛。
+    """
+    if not candidates:
+        return []
+    industry = next(
+        (
+            item
+            for item in candidates
+            if str(item.get("sector_type") or "") == "industry"
+        ),
+        None,
+    )
+    if industry is None:
+        return list(candidates[:limit])
+    # 取所有概念参考后把行业插到最前；行业若已被选中也要提前（不能只判断
+    # 「在不在列表里」—— 顺序才是展示效果的来源）。
+    industry_code = str(industry.get("sector_code") or "")
+    rest = [
+        item
+        for item in candidates
+        if str(item.get("sector_code") or "") != industry_code
+    ]
+    return [industry, *rest][:limit]
+
+
 def _is_tradeable_linkage_sector(
     sector_meta: dict | None,
     persistence: SectorPersistence | None,
@@ -4272,7 +4313,7 @@ class AnomalyScanner:
         return {
             "sector_factors": selected_sectors,
             "sector_components": sector_components[:2],
-            "sector_reference_factors": reference_candidates[:2],
+            "sector_reference_factors": _select_reference_factors(reference_candidates),
         }
 
     # =========================================================================

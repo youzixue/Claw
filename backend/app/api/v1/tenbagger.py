@@ -1557,7 +1557,17 @@ def _format_reference_hint(factors: list[dict]) -> str:
     """
     if not factors:
         return ""
-    top = factors[0]
+    # 优先该股自己的行业 —— 它才是「为什么没有主驱动」的直接答案
+    # （该股所属产业当日没同步转强）。概念参考退居其次。
+    # 不依赖 `_select_reference_factors` 的排序，显式表达展示口径。
+    top = next(
+        (
+            item
+            for item in factors
+            if str(item.get("sector_type") or "") == "industry"
+        ),
+        factors[0],
+    )
     name = str(top.get("sector_name") or "").strip()
     if not name:
         return ""
