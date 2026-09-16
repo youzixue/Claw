@@ -21,7 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import settings
 from app.core.trade_calendar import trading_elapsed_seconds
-from app.models.paper import PaperShadowEvaluation, PaperShadowEvent
+from app.models.paper import (
+    MomentumRetestConsumerWatermark,
+    PaperShadowEvaluation,
+    PaperShadowEvent,
+)
 from app.models.stock import StockBlacklist, StockKline, StockTag
 
 
@@ -352,6 +356,12 @@ class MomentumRetestShadowEngine:
         self._states: dict[str, MomentumRetestState] = {}
         self._pending: dict[str, dict[str, Any]] = {}
         self._consumer_coverage_loss: dict[str, Any] | None = None
+        # P0（2026-09-17）：消费者水位 —— 「我最后一轮行情是什么时候吃到的」。
+        # 与「某只股票有没有换过状态」解耦，用作重启后首帧的 gap 基线。
+        self._consumer_watermark: datetime | None = None
+        # 本进程启动时从快照恢复、且尚未吃到新帧的股票。只有这些股票的
+        # `last_at` 才可能陈旧，水位替换基线也只对它们生效。
+        self._restored_codes: set[str] = set()
 
     @property
     def states(self) -> Mapping[str, MomentumRetestState]:
@@ -364,12 +374,28 @@ class MomentumRetestShadowEngine:
         self._states.clear()
         self._pending.clear()
         self._consumer_coverage_loss = None
+        self._consumer_watermark = None
+        self._restored_codes.clear()
 
-    def restore(self, events: Iterable[PaperShadowEvent]) -> None:
+    def restore(
+        self,
+        events: Iterable[PaperShadowEvent],
+        *,
+        consumer_watermark: datetime | None = None,
+    ) -> None:
+        """从当日事件快照恢复状态；`consumer_watermark` 为本日消费者水位。
+
+        水位用于修正**幻影缺口**：`state.last_at` 只在状态迁移时落库，重启后
+        它是陈旧的；而水位记录的是「消费者最后一轮吃到行情」的真实时点。
+        只有在本进程尚未吃到新帧的股票上才用它替换 gap 基线 —— 首帧之后
+        `last_at` 就由本进程刷新，替换条件自然失效。
+        """
         rows = list(events)
         if not rows:
             return
         self._reset_for(rows[0].trade_date)
+        if consumer_watermark is not None:
+            self._consumer_watermark = consumer_watermark
         for row in rows:
             payload = _json_loads(row.snapshot_json)
             loss = (payload.get("extra") or {}).get("consumer_coverage_loss")
@@ -387,6 +413,10 @@ class MomentumRetestShadowEngine:
             if state.stage in {"candidate", "pullback", "interrupted"}:
                 state.stage = "interrupted"
                 state.terminal_reason = "进程重启导致连续行情路径中断，不能继续证明首次回踩"
+            else:
+                # 仍存活的股票：其 last_at 来自快照（可能陈旧），本进程尚未吃到
+                # 新帧，故标记为「需用水位修正基线」。
+                self._restored_codes.add(state.code)
 
     def pending_events(self) -> list[dict[str, Any]]:
         return list(self._pending.values())
@@ -448,7 +478,15 @@ class MomentumRetestShadowEngine:
                     })
                 continue
             self.observe_quote(quote, quote_observed_at)
+        # 本轮行情已整批吃完 —— 推进消费者水位（P0 幻影缺口修正）。
+        # 放在最后：只有真正处理完这一批才算「吃到了行情」。
+        if observed_at.date() == self._trade_date:
+            self._consumer_watermark = observed_at
         return self.pending_events()
+
+    def consumer_watermark(self) -> datetime | None:
+        """供上层持久化的消费者水位；None 表示本轮之后尚无有效消费记录。"""
+        return self._consumer_watermark
 
     def observe_quote(
         self,
@@ -473,13 +511,33 @@ class MomentumRetestShadowEngine:
         if state.stage in TERMINAL_STAGES:
             return
         previous_at = state.last_at
+        # P0 幻影缺口修正（2026-09-17）：重启后首批帧里，`last_at` 来自快照，
+        # 而它只在**状态迁移**时落库，安静待在 armed 的股票会带着十几分钟前的
+        # 时间戳回来 —— 那不是行情中断，只是「没换过状态」。
+        # 消费者水位（本进程最后一轮吃到行情的时点）才是「我多久没吃到行情」的
+        # 真实度量。只对**本进程尚未吃到新帧**的恢复股生效；首帧之后
+        # `last_at` 由本进程刷新（下方 514 行），`_restored_codes` 同时移除，
+        # 替换条件自然失效，不会掩盖此后的真实缺口。
+        #
+        # 真停机场景不受影响：那时水位本身也停在停机时刻，gap 照旧超阈值。
+        baseline_at = previous_at
+        if code in self._restored_codes:
+            self._restored_codes.discard(code)
+            if (
+                self._consumer_watermark is not None
+                and (
+                    baseline_at is None
+                    or self._consumer_watermark > baseline_at
+                )
+            ):
+                baseline_at = self._consumer_watermark
         quote_gap_sec = (
             max(
                 self._trading_elapsed_seconds(observed_at)
-                - self._trading_elapsed_seconds(previous_at),
+                - self._trading_elapsed_seconds(baseline_at),
                 0.0,
             )
-            if previous_at is not None and previous_at.date() == observed_at.date()
+            if baseline_at is not None and baseline_at.date() == observed_at.date()
             else 0.0
         )
 
@@ -958,8 +1016,54 @@ async def _hydrate_engine(db: AsyncSession, trade_date: date) -> None:
         )
         .order_by(PaperShadowEvent.observed_at, PaperShadowEvent.id)
     )
-    shadow_engine.restore(result.scalars().all())
+    # 消费者水位：用于修正「重启后 last_at 陈旧」造成的幻影缺口（P0）。
+    # 读不到时传 None —— 退回原有行为（fail-closed），宁可误伤不可放行。
+    watermark_row = (
+        await db.execute(
+            select(MomentumRetestConsumerWatermark).where(
+                MomentumRetestConsumerWatermark.trade_date == trade_date
+            )
+        )
+    ).scalar_one_or_none()
+    shadow_engine.restore(
+        result.scalars().all(),
+        consumer_watermark=(
+            watermark_row.observed_at if watermark_row is not None else None
+        ),
+    )
     _hydrated_date = trade_date
+
+
+async def _persist_consumer_watermark(
+    db: AsyncSession,
+    trade_date: date,
+    observed_at: datetime,
+    round_id: str | None = None,
+) -> None:
+    """落一个消费者水位（每交易日一行）。
+
+    这是「本轮行情已整批吃完」的唯一持久化证据。与 `state.last_at` 不同，
+    它不依赖任何股票发生状态迁移，因此重启后能反映真实的消费连续性。
+    """
+    statement = sqlite_insert(MomentumRetestConsumerWatermark).values(
+        trade_date=trade_date,
+        route_id=ROUTE_ID,
+        route_version=shadow_engine.policy.version,
+        observed_at=observed_at,
+        round_id=round_id,
+        updated_at=datetime.now(),
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=["trade_date"],
+        set_={
+            "route_id": statement.excluded.route_id,
+            "route_version": statement.excluded.route_version,
+            "observed_at": statement.excluded.observed_at,
+            "round_id": statement.excluded.round_id,
+            "updated_at": statement.excluded.updated_at,
+        },
+    )
+    await db.execute(statement)
 
 
 async def _persist_shadow_events(
@@ -990,7 +1094,15 @@ async def scan_momentum_retest_shadow(
     pending = shadow_engine.observe_batch(
         quotes, observed_at, allowed_codes, coverage_loss=coverage_loss,
     )
+    # 无论本轮有没有产生事件都要落水位 —— 水位记的是「行情吃到了」，
+    # 而大多数轮次本就不产生事件。漏落会让重启后基线退回陈旧值。
+    watermarked = shadow_engine.consumer_watermark()
+    if watermarked is not None:
+        await _persist_consumer_watermark(
+            db, observed_at.date(), watermarked,
+        )
     if not pending:
+        await db.commit()
         return {"events": 0, "confirmed": 0}
     await _persist_shadow_events(db, pending)
     shadow_engine.ack(item["event_key"] for item in pending)

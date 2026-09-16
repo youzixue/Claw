@@ -755,3 +755,157 @@ async def test_settlement_is_append_only_cost_aware_and_idempotent(tmp_path):
     assert original is not None
     assert original.snapshot_json == original_snapshot
     await engine.dispose()
+
+
+# =========================================================================
+# P0 幻影缺口修正（消费者水位，2026-09-17）
+#
+# 缺陷：`state.last_at` 只在**状态迁移**时落库，安静待在 armed 的股票重启后
+# 带着十几分钟前的时间戳回来，被当成行情中断 ⇒ 全日 coverage_blocked 终态出局。
+# 2026-09-16 09:51 一次打下 2,844 只，而同期 quote_round 逐分钟都在正常提交。
+#
+# 修法：用「消费者最后一轮吃到行情的时点」（水位）作 gap 基线。
+# 下列用例同时锁定「不再误伤」与「真停机仍必须失败关闭」两侧。
+# =========================================================================
+
+
+def _drive_to_armed(engine: MomentumRetestShadowEngine, *, code: str = "600001"):
+    """把股票推到 armed（产生一次真实状态迁移事件），返回该时刻。"""
+    at = datetime(2026, 9, 16, 9, 40)
+    engine.observe_batch([_quote(10.20, 2.0, 18_000_000, code=code)], at, {code})
+    state = engine.states[code]
+    assert state.stage == "armed", state.stage
+    return at
+
+
+def _event_rows(engine: MomentumRetestShadowEngine) -> list[PaperShadowEvent]:
+    """把引擎产出的 pending 事件转成可喂给 restore 的行对象。"""
+    return [PaperShadowEvent(**item) for item in engine.pending_events()]
+
+
+def test_restart_with_continuous_quotes_does_not_block_on_phantom_gap():
+    """① 重启 + 行情连续 ⇒ **不得**产生 coverage_blocked。
+
+    水位 09:54:50、首帧 09:55:00 ⇒ gap=10s；而被修复的旧口径会拿
+    armed 时刻 09:40 当基线 ⇒ 900s ⇒ 误判为行情中断。
+    """
+    first = MomentumRetestShadowEngine(_policy())
+    armed_at = _drive_to_armed(first)
+    rows = _event_rows(first)
+    assert rows, "前置条件：armed 必须产生可恢复的事件"
+
+    restarted = MomentumRetestShadowEngine(_policy())
+    restarted.restore(rows, consumer_watermark=datetime(2026, 9, 16, 9, 54, 50))
+
+    restarted.observe_batch(
+        [_quote(10.45, 4.5, 24_000_000)], datetime(2026, 9, 16, 9, 55, 0), {"600001"}
+    )
+    events = restarted.pending_events()
+    assert not any(e["event_type"] == "coverage_blocked" for e in events), events
+    assert restarted.states["600001"].stage != "coverage_blocked"
+    assert armed_at == datetime(2026, 9, 16, 9, 40)
+
+
+def test_restart_after_real_outage_still_fails_closed():
+    """② 真停机 ⇒ **必须**仍然 coverage_blocked（水位也停在停机时刻）。
+
+    水位与首帧相隔 900s，远超 max_quote_gap_sec=90 ⇒ 不能证明期间路径连续。
+    这条锁住「水位不是放宽风控」——它只是把度量从『股票多久没换状态』
+    改成『消费者多久没吃到行情』。
+    """
+    first = MomentumRetestShadowEngine(_policy())
+    _drive_to_armed(first)
+    rows = _event_rows(first)
+
+    restarted = MomentumRetestShadowEngine(_policy())
+    # 消费者最后一次进食就是 armed 时刻之后不久 —— 与首帧相隔 15 分钟
+    restarted.restore(rows, consumer_watermark=datetime(2026, 9, 16, 9, 40, 10))
+
+    restarted.observe_batch(
+        [_quote(10.45, 4.5, 24_000_000)], datetime(2026, 9, 16, 9, 55, 0), {"600001"}
+    )
+    blocked = [e for e in restarted.pending_events() if e["event_type"] == "coverage_blocked"]
+    assert blocked, "真停机必须失败关闭"
+    assert blocked[0]["status"] == "coverage_blocked"
+
+
+def test_restart_without_watermark_keeps_legacy_fail_closed_behaviour():
+    """③ 读不到水位（旧数据/迁移前）⇒ 退回原口径，宁可误伤不可放行。"""
+    first = MomentumRetestShadowEngine(_policy())
+    _drive_to_armed(first)
+    rows = _event_rows(first)
+
+    restarted = MomentumRetestShadowEngine(_policy())
+    restarted.restore(rows)          # 不传水位
+
+    restarted.observe_batch(
+        [_quote(10.45, 4.5, 24_000_000)], datetime(2026, 9, 16, 9, 55, 0), {"600001"}
+    )
+    blocked = [e for e in restarted.pending_events() if e["event_type"] == "coverage_blocked"]
+    assert blocked, "无水位时必须保持原有 fail-closed 行为"
+
+
+def test_watermark_does_not_mask_a_later_real_gap():
+    """④ 水位只用于**重启后首帧**；首帧之后本进程的真实缺口仍须被抓住。
+
+    否则水位会变成「永远不报缺口」的漏洞。
+    """
+    first = MomentumRetestShadowEngine(_policy())
+    _drive_to_armed(first)
+    rows = _event_rows(first)
+
+    restarted = MomentumRetestShadowEngine(_policy())
+    restarted.restore(rows, consumer_watermark=datetime(2026, 9, 16, 9, 54, 50))
+
+    # 首帧：借水位通过（gap=10s）
+    restarted.observe_batch(
+        [_quote(10.30, 3.2, 20_000_000)], datetime(2026, 9, 16, 9, 55, 0), {"600001"}
+    )
+    assert restarted.states["600001"].stage != "coverage_blocked"
+
+    # 第二帧：本进程自己的 last_at 已是 09:55:00，隔 300s 必须判缺口
+    restarted.observe_batch(
+        [_quote(10.45, 4.5, 24_000_000)], datetime(2026, 9, 16, 10, 0, 0), {"600001"}
+    )
+    blocked = [e for e in restarted.pending_events() if e["event_type"] == "coverage_blocked"]
+    assert blocked, "首帧之后的真实缺口不得被水位掩盖"
+
+
+def test_watermark_never_moves_gap_baseline_backwards():
+    """⑤ 水位早于 last_at 时不得把基线往回拨（否则会凭空放大缺口）。"""
+    first = MomentumRetestShadowEngine(_policy())
+    _drive_to_armed(first)
+    rows = _event_rows(first)
+
+    restarted = MomentumRetestShadowEngine(_policy())
+    # 水位比 armed 更早 —— 不该生效
+    restarted.restore(rows, consumer_watermark=datetime(2026, 9, 16, 9, 39, 0))
+    restarted.observe_batch(
+        [_quote(10.45, 4.5, 24_000_000)], datetime(2026, 9, 16, 9, 41, 0), {"600001"}
+    )
+    blocked = [e for e in restarted.pending_events() if e["event_type"] == "coverage_blocked"]
+    assert not blocked, "水位更早时应沿用 last_at 作基线"
+
+
+def test_consumer_watermark_advances_on_every_consumed_batch():
+    """⑥ 水位必须每轮推进，且与「有没有产生事件」无关。
+
+    大多数轮次不产生事件 —— 若只在有事件时落水位，重启后基线会退回陈旧值。
+    """
+    engine = MomentumRetestShadowEngine(_policy())
+    engine.observe_batch([], datetime(2026, 9, 16, 9, 36, 0), set())
+    assert engine.consumer_watermark() == datetime(2026, 9, 16, 9, 36, 0)
+    # 这一轮什么事件都没有，水位仍须前进
+    engine.observe_batch([], datetime(2026, 9, 16, 9, 36, 15), set())
+    assert engine.consumer_watermark() == datetime(2026, 9, 16, 9, 36, 15)
+
+
+def test_consumer_watermark_model_shape():
+    """水位表：每交易日一行，主键为 trade_date。"""
+    from app.models.paper import MomentumRetestConsumerWatermark
+
+    assert MomentumRetestConsumerWatermark.__tablename__ == "momentum_retest_consumer_watermark"
+    pk = [c.name for c in MomentumRetestConsumerWatermark.__table__.primary_key]
+    assert pk == ["trade_date"]
+    for column in ("route_id", "route_version", "observed_at", "round_id", "updated_at"):
+        assert column in MomentumRetestConsumerWatermark.__table__.columns

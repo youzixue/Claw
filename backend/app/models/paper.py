@@ -179,6 +179,40 @@ class PaperShadowEvent(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class MomentumRetestConsumerWatermark(Base):
+    """A 路由影子引擎的「消费者水位」——每个交易日一行。
+
+    为什么需要它（2026-09-16 复盘，P0）
+    ----------------------------------
+    `MomentumRetestState.last_at` 在每次 `observe_quote` 都更新，但**只有发生
+    状态迁移时**才会 emit 事件、才会被持久化。一只安静待在 `armed` 的股票
+    20 分钟不迁移状态 ⇒ 落库的 `last_at` 就停在 20 分钟前。
+
+    进程重启时 `restore()` 恢复的是这个**陈旧**的 `last_at`，首个重启后帧把它
+    当连续性基线 ⇒ `gap = now - 陈旧last_at` 远超阈值 ⇒ 该股被 `coverage_blocked`
+    **全日终态出局**。2026-09-16 09:51 一次打下 2,844 只（占 A 路由可用池
+    89%~99%，近 10 日有 8 日如此），而同期 `quote_round` 实测逐分钟都在正常
+    提交、行情从未中断 —— 即报告的是**幻影缺口**。
+
+    本表记录「消费者最后一次成功吃完一轮行情」的时点。它反映的是**真实的消费
+    连续性**，与「某只股票有没有换过状态」解耦：
+
+    * 重启耗时几秒 ⇒ 水位就在重启前 ⇒ gap 很小 ⇒ **不再误伤**
+    * 真正停机 21 分钟 ⇒ 水位也停在 21 分钟前 ⇒ gap 大 ⇒ **照常失败关闭**
+
+    即严格更准确，且不放松任何 fail-closed 保证。
+    """
+
+    __tablename__ = "momentum_retest_consumer_watermark"
+
+    trade_date = Column(Date, primary_key=True)
+    route_id = Column(String(40), nullable=False)
+    route_version = Column(String(40), nullable=False)
+    observed_at = Column(DateTime, nullable=False)   # 最后成功消费的轮次时点
+    round_id = Column(String(64))
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class PaperShadowEvaluation(Base):
     """影子确认信号的追加式多周期结算，不改写原始信号事件。"""
 
