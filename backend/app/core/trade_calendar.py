@@ -26,6 +26,11 @@ TRADE_SESSIONS = {
 CLOSED_SESSIONS = {"closed", "weekend", "holiday"}
 
 
+def _seconds_of(session_time: time) -> int:
+    """当日 00:00 起算的秒数。"""
+    return session_time.hour * 3600 + session_time.minute * 60 + session_time.second
+
+
 def trading_elapsed_seconds(moment: datetime) -> float:
     """把墙钟时刻映射为「当日已流逝的交易时间（秒）」，**不封顶**。
 
@@ -37,31 +42,25 @@ def trading_elapsed_seconds(moment: datetime) -> float:
     而同一个上午的四次 run 全部正常。午休期间墙钟走 93 分钟、交易时间
     只走 0 分钟，规则原意显然是「交易期间数据不能断」。
 
-    ⚠️ **不封顶是必须的**：若在 15:00 封顶，则收盘前后的两个时刻会映射到
-    同一值，把真实缺口压缩掉 —— 例如 `15:00:10` 与 `14:50:09` 的 601 秒
-    缺口会被算成 591 秒从而误判为新鲜。初版实现有封顶，被
-    `test_main_fund_consumer_repair_20260914` 与 `test_tenbagger_push_logic`
-    的既有断言抓出，故改为不封顶。
+    ⚠️ **只有午休冻结，开盘前与盘后都按墙钟推进**。
+    若开盘前也返回 0（初版如此），则 00:00–09:30 之间任意两个时刻的交易时间
+    差都是 0，陈旧判定会整段失效 —— 该缺陷被
+    `test_tenbagger_push_logic` 的过期时钟断言抓出；若盘后冻结则会把收盘
+    前后的真实缺口压缩掉（`test_main_fund_consumer_repair_20260914` 抓出）。
+    实现取「午夜起墙钟秒数 − 已跨过的午休时长」，该式在午休处连续且全程单调。
 
     注意：交易时段内真实的超阈值缺口，在此口径下**仍然照常拦截**，
     本函数不放宽任何新鲜度阈值。
     """
-    def _at(session_time: time) -> datetime:
-        return moment.replace(
-            hour=session_time.hour, minute=session_time.minute,
-            second=session_time.second, microsecond=0,
-        )
-
-    morning_start, morning_end = (_at(t) for t in TRADE_SESSIONS["morning"])
-    afternoon_start, _afternoon_end = (_at(t) for t in TRADE_SESSIONS["afternoon"])
-    morning_seconds = (morning_end - morning_start).total_seconds()
-    if moment <= morning_start:
-        return 0.0
-    if moment <= morning_end:
-        return (moment - morning_start).total_seconds()
-    if moment < afternoon_start:
-        return morning_seconds          # 午休：交易时间冻结
-    return morning_seconds + (moment - afternoon_start).total_seconds()
+    midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    base = (moment - midnight).total_seconds()
+    lunch_start = _seconds_of(TRADE_SESSIONS["lunch_break"][0])
+    lunch_end = _seconds_of(TRADE_SESSIONS["lunch_break"][1])
+    if base <= lunch_start:
+        return base                      # 开盘前与上午：墙钟推进
+    if base < lunch_end:
+        return float(lunch_start)        # 午休：交易时间冻结
+    return base - (lunch_end - lunch_start)   # 下午与盘后：扣掉午休时长
 
 OFFICIAL_CLOSED_RANGES = (
     # 2026 年沪深北交易所节假日休市安排

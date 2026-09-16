@@ -191,7 +191,12 @@ async def test_old_candidate_name_cannot_hide_new_quote_st_risk(db_factory):
 def mock_status_fetch(monkeypatch, factory, frames):
     import app.data.scheduler as scheduler
     monkeypatch.setattr(scheduler.trade_calendar, "is_trade_day", AsyncMock(return_value=True))
-    monkeypatch.setattr("pywencai.get", lambda *, query, loop: frames[query])
+    # 2026-09-16：取数源由 pywencai 改为 WencaiStreamSource（上游改 SSE 流）。
+    class _FakeWencai:
+        async def query_async(self, question, *, perpage=50, ttl_sec=0.0):
+            return frames[question]
+
+    monkeypatch.setattr(scheduler, "WencaiStreamSource", lambda *a, **k: _FakeWencai())
     monkeypatch.setattr(scheduler, "async_session", factory)
     success, failure = AsyncMock(), AsyncMock()
     monkeypatch.setattr(scheduler.data_quality_guard, "record_success", success)
@@ -288,9 +293,11 @@ async def test_status_requires_explicit_trade_day(db_factory, monkeypatch, calen
     import app.data.scheduler as module
     scheduler, success, failure = mock_status_fetch(monkeypatch, db_factory, risk_frames())
     monkeypatch.setattr(module.trade_calendar, "is_trade_day", AsyncMock(return_value=calendar_value))
-    def unexpected_fetch(**kwargs):
-        raise AssertionError("非明确交易日不得请求")
-    monkeypatch.setattr("pywencai.get", unexpected_fetch)
+    class _UnexpectedWencai:
+        async def query_async(self, question, *, perpage=50, ttl_sec=0.0):
+            raise AssertionError("非明确交易日不得请求")
+
+    monkeypatch.setattr(module, "WencaiStreamSource", lambda *a, **k: _UnexpectedWencai())
     result = await scheduler._update_stock_status()
     assert result["status"] == "blocked"
     success.assert_not_awaited()

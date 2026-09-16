@@ -1524,10 +1524,34 @@ class DataScheduler:
                     clean[c] = val
             clean_records.append(clean)
 
-        # 逐条执行(SQLite不支持VALUES多行，但aiosqlite的execute可批量传参)
-        stmt = sa_text(sql)
-        for clean in clean_records:
-            await session.execute(stmt, clean)
+        # 2026-09-16 性能修复：原实现在这里**逐条 execute**，并注释称
+        # 「SQLite不支持VALUES多行」——该说法不成立：SQLite 自 3.7.11(2012)
+        # 起就支持多行 VALUES，本机为 3.45.1。故 N 行实际是 N 次往返，
+        # docstring 里的「单条SQL」与事实不符。
+        # 现改为真·多行 VALUES，并按 SQLITE_LIMIT_VARIABLE_NUMBER 分块
+        # （本机 32766）。分块是必须的：改多行后单条语句的绑定变量数
+        # = 列数 × 每块行数，不设上限会直接撞 too many SQL variables。
+        if not clean_records:
+            return
+        per_row = max(len(columns), 1)
+        max_vars = 32766                      # SQLITE_LIMIT_VARIABLE_NUMBER
+        chunk = max(1, min(2000, max_vars // per_row))
+        for offset in range(0, len(clean_records), chunk):
+            part = clean_records[offset:offset + chunk]
+            values_sql = ", ".join(
+                "(" + ", ".join(f":{c}_{i}" for c in columns) + ")"
+                for i in range(len(part))
+            )
+            params: dict = {}
+            for i, row in enumerate(part):
+                for c in columns:
+                    params[f"{c}_{i}"] = row.get(c)
+            chunk_sql = (
+                f"INSERT INTO {table_name} ({col_str}) "
+                f"VALUES {values_sql} "
+                f"ON CONFLICT ({conflict_str}) DO UPDATE SET {update_str}"
+            )
+            await session.execute(sa_text(chunk_sql), params)
 
     @staticmethod
     async def _upsert_sector_info(session: AsyncSession, records: list[dict]):
