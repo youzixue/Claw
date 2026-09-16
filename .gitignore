@@ -26,8 +26,12 @@ env/
 .DS_Store
 Thumbs.db
 
-# Env
+# Env —— 必须覆盖备份/变体：.env.bak-* 同样含凭据。
+# 曾出现 .env.bak-20260917-0058（含问财登录 cookie）未被忽略的情况，
+# 若被 `git add -A` 扫到即造成凭据入库。
 .env
+.env.*
+!.env.example
 
 # Node
 node_modules/
