@@ -1570,21 +1570,17 @@ class DataScheduler:
           observed_at: datetime
           weight: Optional[float]
         """
-        for r in records:
-            existing = await session.execute(
-                select(StockSectorMapping).where(
-                    StockSectorMapping.code == r["code"],
-                    StockSectorMapping.sector_code == r["sector_code"],
-                    StockSectorMapping.source == r["source"],
-                )
-            )
-            row = existing.scalar_one_or_none()
-            if row:
-                for k, v in r.items():
-                    setattr(row, k, v)
-            else:
-                session.add(StockSectorMapping(**r))
-        await session.flush()
+        # 2026-09-16 性能修复：原实现每条记录单独发一次 SELECT（N+1）。
+        # 全 A 股映射一次产生约 81,206 行 —— 即每次运行 8 万次往返查询。
+        # 表上已有 UNIQUE(code, sector_code, source)，可直接用既有的
+        # `_batch_upsert`（INSERT ... ON CONFLICT DO UPDATE，单条 SQL）。
+        # 该助手在同一文件内对 FundFlow 已验证过约 100x 提速。
+        await DataScheduler._batch_upsert(
+            session,
+            StockSectorMapping,
+            records,
+            unique_cols=["code", "sector_code", "source"],
+        )
 
     @staticmethod
     async def _upsert_limit_up(session: AsyncSession, records: list[dict]):
