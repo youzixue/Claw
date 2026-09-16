@@ -476,6 +476,16 @@ SOURCE_ALERT_REPEAT_SEC = 3600
 # 留下 fail_streak 很大但 updated_at 冻结的旧行；不按时间过滤会把
 # 「已不再探测」误报成「正在失败」。1 小时 = 12 个探测周期。
 SOURCE_ALERT_MAX_AGE_SEC = 3600
+# 「取到了但覆盖未核验」不是「端点不可用」—— 汇总告警必须排除，否则误报。
+#
+# `_update_stock_status` 在**成功路径**上也会调 `record_failure`（见该函数末尾）：
+# 它能证明的只是「正向合并了 N 只风险标的」，无法证明「来源全量覆盖 / 逐代码
+# 风险解除」，设计上拒绝把这份数据冒充全量健康，故 status 恒为 degraded/down、
+# fail_streak 只增不减。若汇总告警不排除，会**每小时误报**
+# `pywencai/stock_status 已连续失败 N 次`，而实际上风险标签一直在正常更新
+# —— 这正是本告警要消除的那类噪音。带此标记的行仍会走 `_quality_check`
+# 里既有的 stock_tags 冻结告警（`STOCK_STATUS_ALERT_MARKER`），不会漏报真故障。
+DEGRADED_COVERAGE_MARKER = "[DEGRADED-COVERAGE]"
 _SOURCE_ALERT_LAST: dict[str, float] = {}
 
 
@@ -1825,9 +1835,14 @@ class DataScheduler:
                 }
                 # 即使四个列表非空，也没有来源总量/逐代码解除的证据。
                 # record_success默认完整率=1，不能把正向合并冒充全量状态健康。
+                #
+                # 四个查询**都非空**时这是「覆盖未核验」而非「取不到数据」，
+                # 打上 DEGRADED_COVERAGE_MARKER 让汇总告警区分两者（否则每小时
+                # 误报端点不可用）。有查询为空时是真信号，不加标记照常告警。
                 await data_quality_guard.record_failure(
                     session, "pywencai", "stock_status",
-                    ("部分查询为空；" if empty_queries else "")
+                    ("" if empty_queries else DEGRADED_COVERAGE_MARKER)
+                    + ("部分查询为空；" if empty_queries else "")
                     + f"已正向合并{len(all_codes)}只风险标的；全量覆盖和风险解除未核验，禁止自动清除",
                     latency_ms=int((_time.monotonic() - t_fetch) * 1000),
                 )
@@ -3284,18 +3299,24 @@ class DataScheduler:
         早已停止探测的端点会留下一条 fail_streak 很大但时间冻结的旧行
         （如 eastmoney/health_check 停在 2026-09-02、streak=3512）。
         不按时间过滤就会把「已不再探测」误报成「正在失败」。
+
+        同时排除带 `DEGRADED_COVERAGE_MARKER` 的行：「取到了但覆盖未核验」是
+        设计上故意记的 degraded（见 `_update_stock_status` 末尾），并非端点
+        不可用；不排除会每小时误报一次。
         """
         result = await session.execute(sa_text(
             "SELECT source, api_name, status, fail_streak FROM ("
-            "  SELECT source, api_name, status, fail_streak, updated_at,"
+            "  SELECT source, api_name, status, fail_streak, updated_at, error_msg,"
             "         ROW_NUMBER() OVER (PARTITION BY source, api_name"
             "                            ORDER BY id DESC) AS rn"
             "  FROM data_source_health"
             ") WHERE rn = 1 AND fail_streak >= :threshold"
             "  AND updated_at >= :since"
+            "  AND COALESCE(error_msg, '') NOT LIKE :degraded_marker"
         ), {
             "threshold": SOURCE_ALERT_FAIL_STREAK,
             "since": datetime.now() - timedelta(seconds=SOURCE_ALERT_MAX_AGE_SEC),
+            "degraded_marker": f"{DEGRADED_COVERAGE_MARKER}%",
         })
 
         now = _time.monotonic()

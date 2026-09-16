@@ -22,7 +22,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import pytest
@@ -270,3 +270,77 @@ def test_cohort_handles_sqlalchemy_row_like_tuples():
 
 def test_cohort_empty_input():
     assert _reason_cohort_count_map([]) == {}
+
+
+# ---------- 4. 汇总告警必须区分「取到了但覆盖未核验」与「端点不可用」 ----------
+
+
+@pytest.mark.asyncio
+async def test_source_alert_skips_degraded_coverage_rows(tmp_path):
+    """`_update_stock_status` 在成功路径上也记 failure（覆盖未核验），
+    汇总告警若不排除会**每小时误报** `pywencai/stock_status 端点不可用`。"""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from app.data.scheduler import (
+        DEGRADED_COVERAGE_MARKER,
+        SOURCE_ALERT_FAIL_STREAK,
+        DataScheduler,
+    )
+    from app.db.session import Base
+    from app.models.risk import DataSourceHealth
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'alert.db'}", future=True)
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with maker() as session:
+        now = datetime.now()
+        session.add_all([
+            # 覆盖未核验 —— 必须跳过
+            DataSourceHealth(
+                source="pywencai", api_name="stock_status", status="down",
+                last_failure=now, fail_streak=SOURCE_ALERT_FAIL_STREAK + 47,
+                error_msg=f"{DEGRADED_COVERAGE_MARKER}已正向合并214只风险标的；全量覆盖和风险解除未核验",
+                updated_at=now,
+            ),
+            # 真实不可用 —— 必须照常告警
+            DataSourceHealth(
+                source="pywencai", api_name="stock_mapping", status="down",
+                last_failure=now, fail_streak=SOURCE_ALERT_FAIL_STREAK + 12,
+                error_msg="'NoneType' object has no attribute 'get'",
+                updated_at=now,
+            ),
+        ])
+        await session.commit()
+        alerted = await DataScheduler()._alert_persistently_failing_sources(session)
+        await session.rollback()
+    await engine.dispose()
+    assert alerted == 1, "只应告警真实不可用的那条"
+
+
+@pytest.mark.asyncio
+async def test_partial_empty_queries_still_alert(tmp_path):
+    """有查询为空是真信号，不得被降级标记吞掉。"""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from app.data.scheduler import SOURCE_ALERT_FAIL_STREAK, DataScheduler
+    from app.db.session import Base
+    from app.models.risk import DataSourceHealth
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'alert2.db'}", future=True)
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with maker() as session:
+        now = datetime.now()
+        session.add(DataSourceHealth(
+            source="pywencai", api_name="stock_status", status="down",
+            last_failure=now, fail_streak=SOURCE_ALERT_FAIL_STREAK + 5,
+            error_msg="部分查询为空；已正向合并214只风险标的；全量覆盖和风险解除未核验",
+            updated_at=now,
+        ))
+        await session.commit()
+        alerted = await DataScheduler()._alert_persistently_failing_sources(session)
+        await session.rollback()
+    await engine.dispose()
+    assert alerted == 1
