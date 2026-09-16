@@ -1712,8 +1712,12 @@ class DataScheduler:
         # 因此下面「四个查询均为空」的判定仍只代表「真的没有」。
         try:
             _wencai = WencaiStreamSource()
+            # perpage 必须给足：默认 50 只会取回首页 N 条，
+            # 而原 pywencai 用 loop=True 自动翻页取全。实测 ST股 204 只、
+            # *ST股 94 只，只取 50 会让合并残缺 —— 该缺陷被本函数自身的
+            # `coverage_verified` 校验抓出（status=degraded）。
             frames = await asyncio.gather(*[
-                _wencai.query_async(query) for query in queries
+                _wencai.query_async(query, perpage=2000) for query in queries
             ])
             if any(not isinstance(frame, pd.DataFrame) for frame in frames):
                 raise TypeError("问财股票状态返回类型异常")
