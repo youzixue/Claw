@@ -298,7 +298,13 @@ class PyWencaiSource(DataSourceBase):
     async def health_check(self, session: AsyncSession) -> bool:
         started = _time.monotonic()
         try:
-            df = await self.custom_query("今天涨停")
+            # 2026-09-16：改探测新流式源。本类其余方法仍走旧 pywencai 库，
+            # 而该库自 8 月下旬起已完全不可用；若这里继续用 custom_query，
+            # 会每 5 分钟产生一条失败记录（实测连续 2,639 次），
+            # 把汇总告警长期点亮、掩盖真正的新故障。
+            from app.data.sources.wencai_stream_source import WencaiStreamSource
+
+            df = await WencaiStreamSource().query_async("今天涨停", perpage=300)
             await data_quality_guard.record_success(
                 session,
                 self.source_name,
