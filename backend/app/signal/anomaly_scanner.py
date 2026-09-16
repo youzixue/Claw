@@ -228,6 +228,45 @@ def _is_causal_trade_driver_sector(item: dict | None) -> bool:
     return True
 
 
+def _is_positive_sector_candidate(item: dict | None) -> bool:
+    """板块当日是否算「正向」—— 概念与行业的资金流口径不同，门槛也不同。
+
+    概念（`sector_type == "concept"`）
+        要求**资金净流入为正 且 收涨**。`fund_flow` 是该概念板块自身的资金流，
+        是最直接的证据，两道都要。
+
+    行业（`sector_type == "industry"`）
+        只要求**收涨**（`change_pct > 0`），`fund_flow` 正负不作硬门槛。
+        原因是行业资金流不是该三级行业自己的数：
+        `scheduler._update_sector_persistence` 写入时把东财**二级行业**的
+        资金流按三级子行业数量均分
+        （``per_code_flow = round(fund_flow / len(sub_codes), 2)``），
+        三级行业拿到的是被摊薄后的份额。摊薄**不翻转符号**（除以正整数），
+        所以负值仍是二级行业真净流出 —— 但它是**聚合量**而非该板块自身量，
+        与概念口径不可比；且 1/N 后经 `round(..., 2)`，小正值会被抹成 0
+        从而误判为非正向。故行业只用价格口径。
+
+    2026-09-17 放宽的背景：银行/水电/煤炭等低波动大盘股身上，当日为正的
+    标签几乎必是 `沪股通`/`融资融券`/`高股息精选`/`中特估100`/`证金持股`
+    这类泛标签（已被 `is_excluded` 与 `NON_CAUSAL_LINKAGE_SECTOR_TOKENS`
+    排除），而产业板块又常因摊薄后的资金流为负而一并落选，使 `driver_primary`
+    退化为「暂无明确主驱动」，进而拿不到任何主驱动上下文。
+
+    注意：这里只放宽 **上下文/展示** 的候选池。真正控制买点与推送的四个门槛
+    （`_has_positive_sector_driver`、`_resolve_sector_repair_driver`、
+    `_resolve_old_hot_repair_driver`、`tenbagger._has_positive_driver_sector`）
+    仍各自要求 `fund_flow > 0`，本次未改 —— 即「显示有主驱动」不等于
+    「买点门槛放行」，二者口径本就不同（放宽前实测 120 条有主驱动的票里
+    仍有 4 条被门槛拦住）。
+    """
+    factor = item or {}
+    if _safe_float(factor.get("change_pct")) <= 0:
+        return False
+    if str(factor.get("sector_type") or "") == "industry":
+        return True
+    return _safe_float(factor.get("fund_flow")) > 0
+
+
 def _is_tradeable_linkage_sector(
     sector_meta: dict | None,
     persistence: SectorPersistence | None,
@@ -4160,10 +4199,12 @@ class AnomalyScanner:
         # 主驱动不能从任意上涨标签里挑最高分。融资融券、股通、预增等
         # 大范围属性会让完全不同主营的股票被错误归入同一热点，只保留有因果
         # 含义的同花顺产业/题材；其余仅作为页面参考，不参与买点共振。
+        #
+        # 2026-09-17：概念与行业不再共用同一个资金门槛 —— 行业资金流是二级
+        # 行业摊薄到三级的聚合量，与概念不可比，故行业只判价格口径。
+        # 判据与理由见 `_is_positive_sector_candidate`。
         positive_candidates = [
-            item for item in sectors
-            if float(item.get("fund_flow") or 0) > 0
-            and float(item.get("change_pct") or 0) > 0
+            item for item in sectors if _is_positive_sector_candidate(item)
         ]
         reference_candidates = [item for item in sectors if item not in positive_candidates]
         causal_positive_candidates = [
