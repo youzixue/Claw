@@ -1883,7 +1883,6 @@ class DataScheduler:
         logger.info("📊 盘前数据准备开始...")
         t0 = _time.monotonic()
         async with async_session() as session:
-            pw = self._sources["pywencai"]
             ak_src = self._sources["akshare"]
             sw = self._sources["shenwan"]
 
@@ -2991,7 +2990,6 @@ class DataScheduler:
             return
         logger.info("📊 盘后数据补全...")
         async with async_session() as session:
-            pw = self._sources["pywencai"]
             today = date.today()
 
             # ---- 1. 问财个股→行业+概念映射 ----
@@ -3103,9 +3101,20 @@ class DataScheduler:
             # ---- 2. pywencai 涨停池补充 ----
             # 东财盘中封板时间、连板数优先；问财盘后只补真实涨停原因。
             # 不能因东财已有记录就丢掉问财原因，否则“所属行业”会被误当涨停逻辑。
+            #
+            # 2026-09-17：`pywencai` 自 8 月下旬起完全失效（上游改 SSE 流），
+            # 本段此前每天抛错，`limit_up_reason` 退回东财「所属行业」口径
+            # —— 即上面注释警告的情形已经发生（8/25 起全是 `家居用品`/`造纸`
+            # 这类行业名）。改用 `WencaiStreamSource` 的**同一问句**。
+            # 该问句在新源下的涨停原因列名为 `涨停原因[YYYYMMDD]`（内容为
+            # `A+B+C` 题材组合），与旧列名 `涨停原因类别[YYYYMMDD]` **内容同构**
+            # —— 已用库内 903 条问财历史记录验证（如 `预重整+BIPV+建筑装饰`）；
+            # `_parse_limit_up_df` 现同时识别两者。
             try:
                 t1 = _time.monotonic()
-                df = await pw.get_limit_up_pool()
+                df = await WencaiStreamSource().query_async(
+                    "涨停 连板数", perpage=1000
+                )
                 if df is not None and len(df) > 0:
                     records = self._parse_limit_up_df(df, today, source="pywencai")
                     existing_em = await session.execute(
@@ -3325,6 +3334,11 @@ class DataScheduler:
         pywencai 涨停池列(动态日期后缀):
           股票代码, 股票简称, 连续涨停天数[YYYYMMDD], 涨停原因类别[YYYYMMDD],
           涨停封单额[YYYYMMDD], 涨停开板次数[YYYYMMDD], 几天几板[YYYYMMDD], ...
+
+          2026-09-17 起改走 `WencaiStreamSource`（问句不变 `涨停 连板数`），
+          上游把涨停原因列名从 `涨停原因类别[YYYYMMDD]` 改为
+          `涨停原因[YYYYMMDD]`，**内容同构**（均为 `A+B+C` 题材组合）。
+          两个列名都识别，`涨停原因类别` 优先。
         """
         # 预解析pywencai动态列名(带日期后缀)
         pywencai_col_map = {}
@@ -3333,7 +3347,16 @@ class DataScheduler:
                 if "连续涨停天数" in col:
                     pywencai_col_map["consecutive_days"] = col
                 elif "涨停原因类别" in col:
+                    # 旧列名。用赋值而非 setdefault：与下面的 `涨停原因`
+                    # 别名同时出现时保持 `类别` 优先，且不受列遍历顺序影响。
                     pywencai_col_map["limit_up_reason"] = col
+                elif "涨停原因" in col:
+                    # 新流式源列名，内容与 `涨停原因类别` 同构（库内 903 条
+                    # 问财历史记录验证：`预重整+BIPV+建筑装饰` 等）。
+                    # 若不识别此别名，`limit_up_reason` 会静默写成 None ——
+                    # 因为 else 分支用的是精确键 `row.get("涨停原因")`，
+                    # 匹配不到带日期后缀的真实列名。
+                    pywencai_col_map.setdefault("limit_up_reason", col)
                 elif "涨停封单额" in col:
                     pywencai_col_map["seal_amount"] = col
                 elif "涨停开板次数" in col:
@@ -3370,12 +3393,13 @@ class DataScheduler:
             turnover = _safe_float(row.get("换手率"))
 
             # 涨停时间: 取首次封板时间
-            limit_time = str(
+            # 新流式源给的是 `YYYY-MM-DD HH:MM:SS`，必须归一到库内既有的
+            # `HH:MM:SS`/`HHMMSS` 形状，否则下游字符串比较与 int 解析都会失效
+            # （详见 `_normalize_limit_up_time`）。
+            limit_time = _normalize_limit_up_time(
                 row.get(pywencai_col_map.get("limit_up_time", ""),
                         row.get("首次封板时间", row.get("涨停时间", "")))
             )
-            if limit_time == "nan":
-                limit_time = ""
 
             # 涨停原因: 
             # 东财: "所属行业"列用作原因归类
@@ -6423,6 +6447,32 @@ def _normalize_code(raw: str) -> str:
     if raw.isdigit():
         return raw.zfill(6)
     return raw
+
+
+def _normalize_limit_up_time(val) -> str:
+    """把各家「首次封板时间」统一成库内既有的时间形状。
+
+    库内历史形状（2026-09-17 实测 `limit_up_pool.limit_up_time`）：
+      * 东财 `09:30:00` 或 `093000`（7958 条）
+      * 旧问财 ` 10:23:42`（903 条，带一个前导空格）
+
+    新流式源（迁移后）给的是**带日期**的 `2026-09-16 09:37:00`。直接落库会
+    同时击穿两个下游：
+      * `app/api/v1/tenbagger.py` 的 `limit_up_time > "10:30:00"` 字符串比较
+        —— `'2' > '1'`，词序比较恒为 True，**每只票都被判成「封板时间偏晚」**
+        并阻断追板预案；
+      * `app/factors/breakout.py` 的 `map(int, v.split(":"))`
+        —— `int("2026-09-16 09")` 抛 ValueError，涨停时间因子静默不可用。
+
+    只取空格后的时间部分，即可与东财/旧问财口径一致；识别不了的形状原样
+    保留（保持可见，不静默清零）。
+    """
+    raw = str(val or "").strip()
+    if not raw or raw.lower() == "nan":
+        return ""
+    if " " in raw:
+        raw = raw.rsplit(" ", 1)[-1].strip()
+    return "" if raw.lower() == "nan" else raw
 
 
 def _safe_float(val) -> Optional[float]:

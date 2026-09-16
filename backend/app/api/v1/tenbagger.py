@@ -14008,6 +14008,57 @@ def _enrich_plan_candidates_with_direct_catalysts(
     return enriched
 
 
+_REASON_TOKEN_SPLIT = re.compile(r"[+/、，,；;\-]")
+_REASON_TOKEN_MIN_LEN = 2
+
+
+def _reason_cohort_count_map(rows) -> dict[str, int]:
+    """按**共享题材词**统计「同类涨停家数」→ {涨停原因: 家数}。
+
+    为什么不能只比字符串相等（2026-09-17 实测，见同日提交的迁移）
+    ------------------------------------------------------------
+    涨停原因的粒度取决于写入源：
+      * 东财：单一行业名（`通信设备`），字符串相等 ≈ 同行业；
+      * 问财：`A+B+C` 题材组合（`黄金珠宝+黄金涨价+年报增长`），
+        组合近乎唯一 —— 实测 2026-08-17 / 08-21 / 08-24 三天，
+        「字符串相等的同类数」**恒为 1**，`>=3` 命中率 0%；
+        而东财格式为 19%~60%。
+
+    迁移到问财源后若仍按字符串相等，`same_reason_limit_up_count >= 3`
+    （追板预案的「板块梯队」门槛，`has_board_cohort`）会永久失效。
+
+    口径：两只涨停股只要有**至少一个共同题材词**即视为同类。
+    东财格式下与旧口径**逐股等价** —— 单一行业名切分后只有一个 token，
+    交集即字符串相等：实测 09-15、09-16 命中率 21.9% / 59.6% 均不变；
+    问财格式下把 0% 恢复为 41%~55%，孤立股占比与东财格式相当
+    （28%~42% vs 25%~41%）。
+
+    计数含股票自身，与旧口径一致（同一 reason 的 N 只各自计数都是 N）。
+    空原因不入表；读取方 `reason_count_map.get(reason, 0)` 语义不变。
+    """
+    pairs: list[tuple[str, frozenset[str]]] = []
+    for _, reason in rows:
+        text = str(reason or "").strip()
+        if not text or text.lower() == "nan":
+            continue
+        tokens = frozenset(
+            token
+            for token in _REASON_TOKEN_SPLIT.split(text)
+            if len(token) >= _REASON_TOKEN_MIN_LEN
+        )
+        pairs.append((text, tokens))
+
+    counts: dict[str, int] = {}
+    for text, tokens in pairs:
+        if tokens:
+            cohort = sum(1 for _, other in pairs if other and (tokens & other))
+        else:
+            # 切不出题材词（如纯单字原因）：退化为字符串相等
+            cohort = sum(1 for other_text, _ in pairs if other_text == text)
+        counts[text] = cohort
+    return counts
+
+
 async def _load_event_limit_up_plan_candidates(
     db: AsyncSession,
     target_date: date,
@@ -14017,14 +14068,10 @@ async def _load_event_limit_up_plan_candidates(
     if not catalyst_map:
         return [], {}
     reason_count_result = await db.execute(
-        select(LimitUpPool.limit_up_reason, func.count(LimitUpPool.id))
+        select(LimitUpPool.code, LimitUpPool.limit_up_reason)
         .where(LimitUpPool.trade_date == target_date)
-        .group_by(LimitUpPool.limit_up_reason)
     )
-    reason_count_map = {
-        str(reason or ""): _safe_int(count)
-        for reason, count in reason_count_result.all()
-    }
+    reason_count_map = _reason_cohort_count_map(reason_count_result.all())
     recent_kline_result = await db.execute(
         select(
             StockKline.code,
@@ -14247,11 +14294,9 @@ async def _load_high_board_plan_candidates(
         if streak >= 3 and state.get("previous_high_board_date") is None:
             state["previous_high_board_date"] = history_date
 
-    reason_count_map: dict[str, int] = {}
-    for row in limit_up_rows:
-        reason = str(row.limit_up_reason or "").strip()
-        if reason and reason.lower() != "nan":
-            reason_count_map[reason] = reason_count_map.get(reason, 0) + 1
+    reason_count_map: dict[str, int] = _reason_cohort_count_map(
+        (row.code, row.limit_up_reason) for row in limit_up_rows
+    )
 
     catalysts = dict(catalyst_map or {})
     missing_catalyst_codes = set(codes) - set(catalysts)

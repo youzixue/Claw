@@ -40,40 +40,30 @@ class PyWencaiSource(DataSourceBase):
     query_version = "pywencai_loop_retry_v2"
 
     async def _query(self, api_name: str, query: str, *, loop: bool = True) -> pd.DataFrame:
-        """串行调用问财并重试其常见 ``None.get`` 暂态故障。"""
-        last_error: Exception | None = None
-        # 问财要求登录会话才返回数据；cookie 从 settings（即 `.env`）读取。
-        # 仅在配置了非空值时才传 —— 库的 headers() 会把 None 原样当字符串
-        # 塞进 `cookie` 头（发出去是字面量 "None"），不传反而更干净。
-        extra: dict = {}
-        cookie = str(getattr(settings, "PYWENCAI_COOKIE", "") or "").strip()
-        if cookie:
-            extra["cookie"] = cookie
-        for attempt in range(1, max(int(self.max_retries), 1) + 1):
-            try:
-                async with self._query_lock:
-                    result = await self._safe_call(
-                        api_name,
-                        pywencai.get,
-                        query=query,
-                        loop=loop,
-                        **extra,
-                    )
-                if result is None:
-                    raise AttributeError("pywencai returned None instead of DataFrame")
-                if not isinstance(result, pd.DataFrame):
-                    raise TypeError(f"pywencai returned {type(result).__name__}, expected DataFrame")
-                return result
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    f"[pywencai] {api_name} 第{attempt}/{self.max_retries}次失败: {exc}"
-                )
-                if attempt < self.max_retries:
-                    await asyncio.sleep(min(float(self.rate_limit) * attempt, 5.0))
+        """**已废弃** —— 旧 `pywencai` 库自 2026-08 下旬起完全不可用。
+
+        上游把取数方式从 `POST /customized/chart/get-robot-data`（返回 JSON）
+        改成 `POST /gateway/aime/stream-query`（返回 SSE 流），旧库的
+        「一次 POST → 解析 JSON」模型**无论怎么升级都无法工作**。
+
+        2026-09-17 审计结论：本类所有走 `_query` 的方法
+        （`get_stock_industry_mapping` / `get_limit_up_pool` / `get_limit_down_pool` /
+        `get_broken_limit_pool` / `get_consecutive_limit_up` / `get_concept_cons` /
+        `get_industry_cons` / `get_st_stocks` / `get_suspended_stocks` /
+        `get_delisting_risk_stocks` / `get_bse_st_stocks` / `custom_query` /
+        `get_sector_aggregate`）在生产中**已无调用点** —— 它们只能经
+        `collect()` 到达，而 `collect()` 全仓零调用。生产链路已全部改走
+        `app.data.sources.wencai_stream_source.WencaiStreamSource`。
+
+        因此这里**失败即报错**，而不是重试到耗尽后返回一个会被下游
+        当成「今天没有涨停股」的空结果。若将来有人重新接上这些方法，
+        应当直接改用 `WencaiStreamSource`，而不是修旧库。
+        """
         raise RuntimeError(
-            f"pywencai/{api_name} 连续{self.max_retries}次失败({self.query_version}): {last_error}"
-        ) from last_error
+            f"pywencai({self.query_version}) 已废弃：上游改为 SSE 流，旧库无法工作。"
+            f"请改用 app.data.sources.wencai_stream_source.WencaiStreamSource"
+            f"（调用点 api_name={api_name!r}, query={query!r}）"
+        )
 
     # ===== 个股映射(核心) =====
 
