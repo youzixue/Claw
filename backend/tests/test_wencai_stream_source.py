@@ -208,3 +208,85 @@ def test_headers_use_event_stream_accept():
     assert headers["accept"] == "text/event-stream"
     assert headers["cookie"] == "v=abc"
     assert headers["x-source"] == "ths_iwencai_pc_xuangu"
+
+
+# ── 缓存（性能优化） ─────────────────────────────────────────────────
+
+
+def _counting_source(monkeypatch, rows=None):
+    """装一个只调一次外部请求的源，用于验证缓存确实省掉了重复拉取。"""
+    from app.data.sources import wencai_stream_source as mod
+
+    monkeypatch.setattr(mod.settings, "PYWENCAI_COOKIE", "v=abc", raising=False)
+    calls = {"n": 0}
+    body = rows if rows is not None else [{"code": "688004", "股票简称": "博汇科技"}]
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def iter_lines(self, decode_unicode=False):
+            yield "data:" + json.dumps(_result_event(body), ensure_ascii=False)
+
+    def fake_post(*a, **k):
+        calls["n"] += 1
+        return _Resp()
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+    mod.WencaiStreamSource._cache.clear()
+    return calls
+
+
+def test_cache_avoids_second_fetch(monkeypatch):
+    """ttl>0 时第二次同问句不得再发请求 —— 这是盘前/盘后重复拉取的优化点。"""
+    calls = _counting_source(monkeypatch)
+    src = WencaiStreamSource()
+    first = src.query("全部A股 所属行业", perpage=10000, ttl_sec=3600)
+    second = src.query("全部A股 所属行业", perpage=10000, ttl_sec=3600)
+
+    assert calls["n"] == 1, "缓存未生效，仍发了第二次请求"
+    assert first.attrs["cache_hit"] is False
+    assert second.attrs["cache_hit"] is True
+    assert list(first.columns) == list(second.columns)
+
+
+def test_cache_disabled_by_default(monkeypatch):
+    """ttl=0（默认）必须每次实拉，保持既有行为不变。"""
+    calls = _counting_source(monkeypatch)
+    src = WencaiStreamSource()
+    src.query("涨停原因")
+    src.query("涨停原因")
+    assert calls["n"] == 2
+
+
+def test_cache_returns_copy_so_callers_cannot_pollute_it(monkeypatch):
+    """缓存必须返回副本：调用方改动不得污染后续命中。"""
+    _counting_source(monkeypatch)
+    src = WencaiStreamSource()
+    first = src.query("涨停原因", ttl_sec=3600)
+    first.loc[0, "股票简称"] = "被改了"
+    second = src.query("涨停原因", ttl_sec=3600)
+    assert second.loc[0, "股票简称"] == "博汇科技"
+
+
+def test_cache_key_includes_perpage(monkeypatch):
+    """不同 perpage 不得互相命中（返回的行数不同）。"""
+    calls = _counting_source(monkeypatch)
+    src = WencaiStreamSource()
+    src.query("涨停原因", perpage=50, ttl_sec=3600)
+    src.query("涨停原因", perpage=5000, ttl_sec=3600)
+    assert calls["n"] == 2
+
+
+def test_failure_never_poisones_cache(monkeypatch):
+    """失败不得写入缓存 —— 否则一次抖动会被缓存 TTL 放大成持续故障。"""
+    from app.data.sources import wencai_stream_source as mod
+
+    monkeypatch.setattr(mod.settings, "PYWENCAI_COOKIE", "v=abc", raising=False)
+    mod.WencaiStreamSource._cache.clear()
+    monkeypatch.setattr(mod.requests, "post",
+                        lambda *a, **k: _FakeResponse(status_code=401))
+    src = WencaiStreamSource()
+    with pytest.raises(WencaiStreamError):
+        src.query("涨停原因", ttl_sec=3600)
+    assert mod.WencaiStreamSource._cache == {}, "失败被写进了缓存"

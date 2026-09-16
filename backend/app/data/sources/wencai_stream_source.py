@@ -162,13 +162,35 @@ class WencaiStreamSource:
 
     source_name = "wencai_stream"
 
+    # 同进程内的按问句缓存。
+    # 为什么需要：全 A 股映射（5574 行）实测耗时 9~14 秒，而**盘前与盘后各拉
+    # 一次完全相同的映射**；行业/概念归属变化很慢（周级），重复拉取纯属浪费。
+    # 实测 perpage 调优**无效**（5574/6000/10000 -> 11.2/9.1/9.3 秒，属噪声）：
+    # 这段时间花在服务端聚合全 A 股，客户端改不了。
+    _cache: dict[str, tuple[float, pd.DataFrame]] = {}
+
     def __init__(self, *, timeout: float = 40.0) -> None:
         self.timeout = float(timeout)
 
     # ---- 同步核心 ----
 
-    def query(self, question: str, *, perpage: int = DEFAULT_PERPAGE) -> pd.DataFrame:
-        """按问句取选股结果。失败抛 `WencaiStreamError`，不返回空表。"""
+    def query(
+        self, question: str, *, perpage: int = DEFAULT_PERPAGE, ttl_sec: float = 0.0,
+    ) -> pd.DataFrame:
+        """按问句取选股结果。失败抛 `WencaiStreamError`，不返回空表。
+
+        `ttl_sec > 0` 时启用同进程缓存；命中直接返回**副本**，避免调用方
+        改动缓存内容。缓存只在成功时写入 —— 失败绝不落缓存。
+        """
+        cache_key = f"{question}\x00{int(perpage)}"
+        if ttl_sec > 0:
+            hit = self._cache.get(cache_key)
+            if hit is not None and (_time.monotonic() - hit[0]) < ttl_sec:
+                frame = hit[1].copy()
+                frame.attrs.update(hit[1].attrs)
+                frame.attrs["cache_hit"] = True
+                logger.info("[wencai] {} -> 命中缓存 {} 行", question, len(frame))
+                return frame
         cookie = str(getattr(settings, "PYWENCAI_COOKIE", "") or "").strip()
         if not cookie:
             raise WencaiStreamError(
@@ -209,6 +231,10 @@ class WencaiStreamSource:
                 f"上游协议改版，或问题无法解析）；已收到 {len(chunks)} 行 SSE"
             )
         frame = _to_frame(data)
+        if ttl_sec > 0:
+            # 只在成功时写缓存；失败已在上方抛错，故不会污染缓存。
+            self._cache[cache_key] = (_time.monotonic(), frame.copy())
+        frame.attrs["cache_hit"] = False
         logger.info(
             "[wencai] {} -> {} 行 / code_count={} ({:.1f}s)",
             question, len(frame), frame.attrs.get("code_count"),
@@ -216,11 +242,13 @@ class WencaiStreamSource:
         )
         return frame
 
-    async def query_async(self, question: str, *, perpage: int = DEFAULT_PERPAGE) -> pd.DataFrame:
+    async def query_async(
+        self, question: str, *, perpage: int = DEFAULT_PERPAGE, ttl_sec: float = 0.0,
+    ) -> pd.DataFrame:
         """异步包装：阻塞 IO 放到线程池，避免堵塞事件循环（与项目既有用法一致）。"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None, lambda: self.query(question, perpage=perpage)
+            None, lambda: self.query(question, perpage=perpage, ttl_sec=ttl_sec)
         )
 
 

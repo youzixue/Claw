@@ -1855,8 +1855,11 @@ class DataScheduler:
             # 全 A 股约 5600 只，perpage 必须给足，否则只拿到首页 N 条。
             try:
                 t1 = _time.monotonic()
+                # ttl=12h：盘前与盘后拉的是同一份映射，实测每次 9~14 秒，
+                # 而行业/概念归属是周级变化。缓存让盘后那次基本免费。
                 df_mapping = await WencaiStreamSource().query_async(
                     "全部A股 所属同花顺行业 所属概念", perpage=10000,
+                    ttl_sec=12 * 3600,
                 )
                 if df_mapping is not None and len(df_mapping) > 0:
                     # 1a. 提取行业板块(三级全名"医药生物-中药-中药Ⅲ", 与collect_pywencai_sectors.py一致)
@@ -2960,6 +2963,7 @@ class DataScheduler:
                 t0 = _time.monotonic()
                 df = await WencaiStreamSource().query_async(
                     "全部A股 所属同花顺行业 所属概念", perpage=10000,
+                    ttl_sec=12 * 3600,
                 )
                 # pywencai.get("全部A股 所属同花顺行业 所属概念") 返回列:
                 #   股票代码, 股票简称, 所属同花顺行业, 所属概念(多个逗号分隔)
