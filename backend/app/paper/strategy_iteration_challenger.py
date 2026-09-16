@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import date, datetime, time
 from typing import Any, Iterable
 
+from loguru import logger
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +43,18 @@ from app.paper.momentum_retest_shadow import (
 # freezes new fills/add-ons, but must not turn the next opening quote into a
 # synthetic liquidation signal.
 _UNSAFE_POSITION_VERSION_PREFIXES = ("abcdef_shape_v1:",)
+# 版本隔离强制退出的原因文案 —— **生产与台账检测共用同一常量**，避免漂移。
+#
+# 2026-09-17：原先这里只有字面量、且生产文案（`_legacy_challenger_exit_reasons`）
+# 与检测处的字面量各写一份。本次放宽（空版本不再强平）时文案必须改准确，
+# 若只改一处，历史强平卖出会掉出版本隔离台账、被错记到新版本 PnL。
+# 因此抽成常量，并**同时认历史文案**（库里已存的卖出记录用的是旧文案）。
+VERSION_ISOLATION_EXIT_REASON = "已知不合格单帧版本仓位隔离退出"
+# 历史文案，检测侧必须继续识别。
+_LEGACY_VERSION_EXIT_MARKERS = (
+    "旧版或未标版本仓位隔离退出",
+    VERSION_ISOLATION_EXIT_REASON,
+)
 
 
 ROUTE_META = {
@@ -238,7 +251,10 @@ async def _current_version_execution_summary(
     across their original versions rather than charged to the new version's PnL.
     """
 
-    legacy_exit_marker = "旧版或未标版本仓位隔离退出"
+    def _is_version_isolation_exit(reason: Any) -> bool:
+        text = str(reason or "")
+        return any(marker in text for marker in _LEGACY_VERSION_EXIT_MARKERS)
+
     rows = list(
         (
             await db.scalars(
@@ -249,7 +265,10 @@ async def _current_version_execution_summary(
                         PaperTradeLog.strategy_version == strategy_version,
                         and_(
                             PaperTradeLog.trade_type == "sell",
-                            PaperTradeLog.reason.contains(legacy_exit_marker),
+                            or_(*[
+                                PaperTradeLog.reason.contains(marker)
+                                for marker in _LEGACY_VERSION_EXIT_MARKERS
+                            ]),
                         ),
                     ),
                 )
@@ -260,7 +279,7 @@ async def _current_version_execution_summary(
     forced_legacy_exits = [
         row
         for row in rows
-        if row.trade_type == "sell" and legacy_exit_marker in str(row.reason or "")
+        if row.trade_type == "sell" and _is_version_isolation_exit(row.reason)
     ]
     forced_exit_ids = {row.id for row in forced_legacy_exits}
     scoped_rows = [
@@ -723,13 +742,20 @@ async def _legacy_challenger_exit_reasons(
     position_versions: dict[str, str],
     expected_strategy_version: str,
 ) -> dict[str, str]:
-    """Quarantine only unversioned or explicitly unsafe Challenger positions.
+    """Quarantine **only explicitly unsafe** Challenger positions.
 
     A normal immutable route upgrade must freeze old queued fills and prevent
     cross-version add-ons, but the holding keeps its original version and follows
     the account's ordinary sell rules.  Forcing every superseded version out at
     the next opening quote bypasses the opening-noise guard and creates a
     deterministic sell-low path.
+
+    2026-09-17（用户授权「避免踏空」）：**空版本持仓也不再强平**。
+    原判据自相矛盾 —— 「已知版本不同」走 `continue` 保留（理由同上），而
+    「版本未知」却强平；但未知并不比已知不同更该清仓，两者都不是期望版本，
+    版本隔离同样由执行路径保证。实测 2026-09-16 有 8 笔因此被强平。
+    真正该清的只有 `_UNSAFE_POSITION_VERSION_PREFIXES`（已知不合格单帧版本），
+    那是有依据的安全性判断，与版本隔离无关。
     """
 
     codes = {str(code) for code in position_versions if str(code)}
@@ -768,22 +794,30 @@ async def _legacy_challenger_exit_reasons(
             recorded_version.startswith(prefix)
             for prefix in _UNSAFE_POSITION_VERSION_PREFIXES
         )
-        if recorded_version and not explicitly_unsafe:
-            # Keep the immutable entry version on the holding.  The executor has
-            # no scale-in path for an already-held code, while the shared paper
-            # broker separately rejects stale queued fills, so liquidation is
-            # neither required nor a valid substitute for version isolation.
+        if not explicitly_unsafe:
+            # 2026-09-17（用户授权「避免踏空」）：空版本不再强制清仓。
+            #
+            # 原判据**自相矛盾**：上面那条已经把「已知版本不同」的持仓放行保留
+            # （理由见其注释：执行器对已持有代码没有加仓路径、共享 broker 另会
+            # 拒绝陈旧排队成交，故清仓既非必要也非版本隔离的有效替代），
+            # 而「版本未知」却被强平 —— 但「未知」并不比「已知不同」更该清仓：
+            # 两者都不是期望版本，版本隔离同样由执行路径保证。
+            # 实测 2026-09-16 有 8 笔持仓因此被强制清仓。
+            #
+            # **已知不合格单帧版本**（`_UNSAFE_POSITION_VERSION_PREFIXES`）仍然
+            # 清仓 —— 那是有依据的安全性判断，与版本隔离无关，不在本次放宽范围。
+            if not recorded_version:
+                logger.warning(
+                    f"空版本持仓保留不清仓: code={code} account_id={account_id} "
+                    f"当前版本={expected_strategy_version}；"
+                    "版本隔离由执行路径（无加仓 + 拒绝陈旧排队成交）保证，"
+                    "清仓既非必要也非有效替代"
+                )
             continue
-        unsafe_label = (
-            "known_unsafe_single_frame"
-            if explicitly_unsafe
-            else "legacy_unversioned"
-        )
         reasons[code] = (
-            "旧版或未标版本仓位隔离退出："
-            f"持仓版本={recorded_version or unsafe_label}，"
-            f"当前版本={expected_strategy_version}；"
-            "仅未标版本或已知不合格单帧版本强制退出"
+            f"{VERSION_ISOLATION_EXIT_REASON}："
+            f"持仓版本={recorded_version}，"
+            f"当前版本={expected_strategy_version}"
         )
     return reasons
 

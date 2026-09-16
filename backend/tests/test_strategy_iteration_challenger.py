@@ -464,7 +464,7 @@ async def test_superseded_single_frame_position_exits_next_sellable_session(
     ]
     assert open_count == 0
     assert sell_trade is not None
-    assert "旧版或未标版本仓位隔离退出" in sell_trade.reason
+    assert "已知不合格单帧版本仓位隔离退出" in sell_trade.reason
     assert execution_summary["trade_count"] == 0
     assert execution_summary["forced_legacy_exit_count"] == 1
 
@@ -562,7 +562,7 @@ async def test_superseded_multiframe_position_is_grandfathered_to_normal_exit_ru
     assert sell_trade is None
     assert any(log.action == "hold" for log in management_logs)
     assert all(
-        "旧版或未标版本仓位隔离退出" not in str(log.reason or "")
+        "仓位隔离退出" not in str(log.reason or "")
         for log in management_logs
     )
 
