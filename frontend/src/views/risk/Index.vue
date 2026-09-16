@@ -3,11 +3,11 @@
     <div class="page-shell risk-page">
       <div class="page-hero">
       <div>
-        <h2 class="page-title">🛡️ 风控中心</h2>
+        <h2 class="page-title"><el-icon class="title-icon"><Lock /></el-icon>风控中心</h2>
         <div class="page-subtitle">规则链、检查流程、解禁预警与情绪熔断的统一风险面板</div>
       </div>
       <div class="hero-chip">
-        <el-icon><Shield /></el-icon>
+        <el-icon><Lock /></el-icon>
         <span>交易前风险拦截</span>
       </div>
     </div>
@@ -123,9 +123,10 @@
 <script setup>
 import { defineAsyncComponent, ref, computed, onMounted } from 'vue'
 const VChart = defineAsyncComponent(() => import('vue-echarts'))
-import { ensureEChartsRegistered } from '@/composables/echarts'
-ensureEChartsRegistered()
+import { ensureLineChartsRegistered } from '@/composables/echarts/line'
 import { getRiskRules, checkRisk, toggleRiskRule, getLockupUpcoming, getSentimentState, getSentimentHistory } from '@/api'
+
+ensureLineChartsRegistered()
 
 const activeTab = ref('rules')
 const rules = ref([])

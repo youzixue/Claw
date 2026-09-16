@@ -3,7 +3,7 @@
     <div class="page-shell sentiment-page">
       <div class="page-hero">
       <div>
-        <h2 class="page-title">☀️ 情绪面</h2>
+        <h2 class="page-title"><el-icon class="title-icon"><Sunny /></el-icon>情绪面</h2>
         <div class="page-subtitle">情绪周期、仓位建议与历史波动的统一观察面板</div>
       </div>
       <div class="hero-chip">
@@ -12,53 +12,63 @@
       </div>
     </div>
 
-      <div class="gauge-row">
-        <div class="chart-card panel-card gauge-card">
-        <div class="card-head">
-          <div class="card-title"><el-icon><Odometer /></el-icon>情绪周期仪表盘</div>
-        </div>
-        <v-chart :option="gaugeOption" style="height: 280px; flex: 1" autoresize />
-      </div>
+      <section class="section-block">
+        <div class="gauge-row">
+          <div class="chart-card panel-card gauge-card">
+            <div class="card-head">
+              <div class="card-title"><el-icon><Odometer /></el-icon>情绪周期仪表盘</div>
+            </div>
+            <v-chart :option="gaugeOption" style="height: 280px; flex: 1" autoresize />
+          </div>
 
-        <div class="advice-card panel-card">
-        <div class="advice-block">
-          <div class="section-title"><el-icon><Coin /></el-icon>仓位建议</div>
-          <div class="advice-text">{{ sentimentData.position_advice || '暂无建议' }}</div>
+          <div class="advice-card panel-card">
+            <div class="advice-block">
+              <div class="advice-kicker"><el-icon><Coin /></el-icon><span>仓位建议</span></div>
+              <div class="advice-text">{{ sentimentData.position_advice || '暂无建议' }}</div>
+            </div>
+            <div class="advice-block">
+              <div class="advice-kicker"><el-icon><Opportunity /></el-icon><span>操作建议</span></div>
+              <div class="advice-text">{{ sentimentData.suggestion || '暂无' }}</div>
+            </div>
+          </div>
         </div>
-        <div class="advice-block">
-          <div class="section-title"><el-icon><Opportunity /></el-icon>操作建议</div>
-          <div class="advice-text">{{ sentimentData.suggestion || '暂无' }}</div>
-        </div>
-      </div>
-    </div>
+      </section>
 
-      <div class="stat-row">
-      <div class="stat-card sentiment-stat-card">
-        <div class="metric-head"><el-icon><Sunny /></el-icon><span>情绪周期</span></div>
-        <div class="stat-value" :style="{ color: sentimentCycleColor(sentimentData.cycle) }">
-          {{ sentimentCycleLabel(sentimentData.cycle) }}
+      <section class="section-block">
+        <div class="section-title">情绪核心指标</div>
+        <div class="metrics-panel sentiment-metrics-panel">
+          <div class="stat-row">
+            <div class="stat-card sentiment-stat-card">
+              <div class="metric-head"><el-icon><Sunny /></el-icon><span>情绪周期</span></div>
+              <div class="stat-value" :style="{ color: sentimentCycleColor(sentimentData.cycle) }">
+                {{ sentimentCycleLabel(sentimentData.cycle) }}
+              </div>
+            </div>
+            <div class="stat-card sentiment-stat-card">
+              <div class="metric-head"><el-icon><Top /></el-icon><span>涨停数</span></div>
+              <div class="stat-value text-red">{{ stats.limit_up_count ?? '--' }}</div>
+            </div>
+            <div class="stat-card sentiment-stat-card">
+              <div class="metric-head"><el-icon><Bottom /></el-icon><span>跌停数</span></div>
+              <div class="stat-value text-green">{{ stats.limit_down_count ?? '--' }}</div>
+            </div>
+            <div class="stat-card sentiment-stat-card">
+              <div class="metric-head"><el-icon><Finished /></el-icon><span>封板率</span></div>
+              <div class="stat-value">{{ stats.seal_rate != null ? stats.seal_rate.toFixed(1) + '%' : '--' }}</div>
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="stat-card sentiment-stat-card">
-        <div class="metric-head"><el-icon><Top /></el-icon><span>涨停数</span></div>
-        <div class="stat-value text-red">{{ stats.limit_up_count ?? '--' }}</div>
-      </div>
-      <div class="stat-card sentiment-stat-card">
-        <div class="metric-head"><el-icon><Bottom /></el-icon><span>跌停数</span></div>
-        <div class="stat-value text-green">{{ stats.limit_down_count ?? '--' }}</div>
-      </div>
-      <div class="stat-card sentiment-stat-card">
-        <div class="metric-head"><el-icon><Finished /></el-icon><span>封板率</span></div>
-        <div class="stat-value">{{ stats.seal_rate != null ? stats.seal_rate.toFixed(1) + '%' : '--' }}</div>
-      </div>
-    </div>
+      </section>
 
-      <div class="chart-card panel-card history-card">
-      <div class="card-head">
-        <div class="card-title"><el-icon><TrendCharts /></el-icon>情绪历史趋势</div>
-      </div>
-      <v-chart :option="historyChartOption" style="height: 320px" autoresize />
-    </div>
+      <section class="section-block">
+        <div class="section-title">情绪历史趋势</div>
+        <div class="chart-card panel-card history-card">
+          <div class="card-head">
+            <div class="card-title"><el-icon><TrendCharts /></el-icon>情绪历史趋势</div>
+          </div>
+          <v-chart :option="historyChartOption" style="height: 320px" autoresize />
+        </div>
+      </section>
     </div>
   </div>
 </template>
@@ -66,10 +76,13 @@
 <script setup>
 import { defineAsyncComponent, ref, computed, onMounted } from 'vue'
 const VChart = defineAsyncComponent(() => import('vue-echarts'))
-import { ensureEChartsRegistered } from '@/composables/echarts'
-ensureEChartsRegistered()
+import { ensureGaugeChartsRegistered } from '@/composables/echarts/gauge'
+import { ensureLineBarChartsRegistered } from '@/composables/echarts/line-bar'
 import { getSentimentCycle, getSentimentStats, getSentimentHistory } from '@/api'
 import { sentimentCycleLabel, sentimentCycleColor } from '@/composables/useUtils'
+
+ensureGaugeChartsRegistered()
+ensureLineBarChartsRegistered()
 
 const sentimentData = ref({})
 const stats = ref({})
@@ -136,21 +149,22 @@ onMounted(async () => {
 <style scoped lang="scss">
 .sentiment-page { display: flex; flex-direction: column; gap: 18px; }
 .gauge-row { display: flex; gap: 16px; }
+.sentiment-metrics-panel { padding: 4px; }
 .sentiment-stat-card { background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 14px; box-shadow: var(--claw-shadow-sm); }
 .gauge-card { flex: 1; padding: 14px 16px 8px; }
 .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .card-title, .section-title, .metric-head { display: inline-flex; align-items: center; gap: 8px; }
 .card-title { font-size: 14px; font-weight: 600; color: var(--claw-text); }
 .advice-card { flex: 0 0 320px; padding: 16px; display: flex; flex-direction: column; gap: 18px; }
-.advice-block { padding: 2px 0; }
+.advice-block { padding: 12px; border-radius: 12px; background: rgba(245, 247, 250, 0.82); border: 1px solid var(--claw-border-light); }
+.advice-kicker { display: inline-flex; align-items: center; gap: 8px; color: var(--claw-text-secondary); font-size: 13px; font-weight: 600; }
 .advice-text { color: var(--claw-text-secondary); font-size: 13px; line-height: 1.7; margin-top: 10px; }
-.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 4px; }
+.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 0; }
 .sentiment-stat-card { padding: 16px; }
 .metric-head { color: var(--claw-text-muted); font-size: 13px; margin-bottom: 10px; }
 .history-card { padding: 14px 16px 8px; }
 @media (max-width: 768px) {
-  .page-hero, .gauge-row { flex-direction: column; align-items: stretch; }
-  .hero-chip { align-self: flex-start; }
+  .gauge-row { flex-direction: column; align-items: stretch; }
   .advice-card { flex: 1 1 auto; width: 100%; }
   .stat-row { grid-template-columns: repeat(2, 1fr); }
 }

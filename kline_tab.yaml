@@ -1,0 +1,171 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e6]:
+      - generic [ref=e7]: 🦅
+      - generic [ref=e8]: Claw
+    - navigation [ref=e9]:
+      - generic [ref=e10]: 行情
+      - link "行情总览" [ref=e11] [cursor=pointer]:
+        - /url: /
+        - img [ref=e13]
+        - generic [ref=e15]: 行情总览
+      - link "板块营地" [ref=e16] [cursor=pointer]:
+        - /url: /sectors
+        - img [ref=e18]
+        - generic [ref=e21]: 板块营地
+      - link "牛股雷达" [ref=e22] [cursor=pointer]:
+        - /url: /tenbagger
+        - img [ref=e24]
+        - generic [ref=e27]: 牛股雷达
+      - link "晋级预测" [ref=e28] [cursor=pointer]:
+        - /url: /promotion
+        - img [ref=e30]
+        - generic [ref=e33]: 晋级预测
+      - generic [ref=e34]: 分析
+      - link "情绪面" [ref=e35] [cursor=pointer]:
+        - /url: /sentiment
+        - img [ref=e37]
+        - generic [ref=e39]: 情绪面
+      - link "竞价分析" [ref=e40] [cursor=pointer]:
+        - /url: /auction
+        - img [ref=e42]
+        - generic [ref=e45]: 竞价分析
+      - link "融资融券" [ref=e46] [cursor=pointer]:
+        - /url: /margin
+        - img [ref=e48]
+        - generic [ref=e52]: 融资融券
+      - link "新闻面" [ref=e53] [cursor=pointer]:
+        - /url: /news
+        - img [ref=e55]
+        - generic [ref=e57]: 新闻面
+      - generic [ref=e58]: 系统
+      - link "风控中心" [ref=e59] [cursor=pointer]:
+        - /url: /risk
+        - img [ref=e61]
+        - generic [ref=e64]: 风控中心
+      - link "因子引擎" [ref=e65] [cursor=pointer]:
+        - /url: /factors
+        - img [ref=e67]
+        - generic [ref=e70]: 因子引擎
+      - link "绩效中心" [ref=e71] [cursor=pointer]:
+        - /url: /performance
+        - img [ref=e73]
+        - generic [ref=e75]: 绩效中心
+      - link "模拟盘" [ref=e76] [cursor=pointer]:
+        - /url: /paper
+        - img [ref=e78]
+        - generic [ref=e82]: 模拟盘
+      - link "回测引擎" [ref=e83] [cursor=pointer]:
+        - /url: /backtest
+        - img [ref=e85]
+        - generic [ref=e89]: 回测引擎
+      - link "数据治理" [ref=e90] [cursor=pointer]:
+        - /url: /governance
+        - img [ref=e92]
+        - generic [ref=e94]: 数据治理
+    - img [ref=e97] [cursor=pointer]
+  - generic [ref=e99]:
+    - banner [ref=e100]:
+      - generic [ref=e101]:
+        - img [ref=e103] [cursor=pointer]
+        - generic [ref=e105]: 板块营地
+      - generic [ref=e106]:
+        - generic [ref=e108]: 离线
+        - generic [ref=e111]: ⚪ 非交易日
+        - generic [ref=e172]: 📊 盘后
+    - main [ref=e112]:
+      - generic [ref=e113]:
+        - heading "📊 板块营地" [level=2] [ref=e114]
+        - generic [ref=e115]:
+          - radiogroup "radio-group" [ref=e116]:
+            - generic [ref=e117]:
+              - radio "🔥 概念板块" [checked] [ref=e118]
+              - generic [ref=e119] [cursor=pointer]: 🔥 概念板块
+            - generic [ref=e120]:
+              - radio "🏭 行业板块" [ref=e121]
+              - generic [ref=e122] [cursor=pointer]: 🏭 行业板块
+          - generic [ref=e123]: 共 392 个概念
+        - generic [ref=e124]:
+          - generic [ref=e127]:
+            - generic [ref=e128]: 概念总数
+            - generic [ref=e129]: "392"
+          - generic [ref=e132]:
+            - generic [ref=e133]: 🔥 热门(资金流入>10亿)
+            - generic [ref=e134]: "62"
+          - generic [ref=e137]:
+            - generic [ref=e138]: 💰 资金净流入
+            - generic [ref=e139]: "-1832.2亿"
+          - generic [ref=e142]:
+            - generic [ref=e143]: 📅 数据日期
+            - generic [ref=e144]: 2026-04-10
+        - generic [ref=e145]:
+          - tablist [ref=e149]:
+            - tab "生命周期" [ref=e151]
+            - tab "轮动日历" [ref=e152]
+            - tab "主线追踪" [ref=e153]
+            - tab "板块强弱" [ref=e154]
+            - tab "板块轮动" [ref=e155]
+            - tab "板块持续性" [ref=e156]
+            - tab "板块K线" [active] [selected] [ref=e157] [cursor=pointer]
+          - tabpanel "板块K线" [ref=e173]:
+            - generic [ref=e174]:
+              - generic [ref=e176]:
+                - generic:
+                  - combobox [ref=e178]
+                  - generic [ref=e179]: 搜索板块名称...
+              - radiogroup "radio-group" [ref=e180]:
+                - generic [ref=e181]:
+                  - radio "30天" [ref=e182]
+                  - generic [ref=e183] [cursor=pointer]: 30天
+                - generic [ref=e184]:
+                  - radio "60天" [checked] [ref=e185]
+                  - generic [ref=e186] [cursor=pointer]: 60天
+                - generic [ref=e187]:
+                  - radio "120天" [ref=e188]
+                  - generic [ref=e189] [cursor=pointer]: 120天
+                - generic [ref=e190]:
+                  - radio "250天" [ref=e191]
+                  - generic [ref=e192] [cursor=pointer]: 250天
+            - generic [ref=e193]:
+              - generic [ref=e194]: 选择板块查看K线
+              - generic [ref=e195]:
+                - generic [ref=e197] [cursor=pointer]:
+                  - generic [ref=e198]: 动力电池回收
+                  - generic [ref=e199]:
+                    - generic [ref=e201]: 概念
+                    - generic [ref=e202]: +2.81%
+                - generic [ref=e204] [cursor=pointer]:
+                  - generic [ref=e205]: 钠离子电池
+                  - generic [ref=e206]:
+                    - generic [ref=e208]: 概念
+                    - generic [ref=e209]: +2.50%
+                - generic [ref=e211] [cursor=pointer]:
+                  - generic [ref=e212]: 固态电池
+                  - generic [ref=e213]:
+                    - generic [ref=e215]: 概念
+                    - generic [ref=e216]: +2.16%
+                - generic [ref=e218] [cursor=pointer]:
+                  - generic [ref=e219]: 宁德时代概念
+                  - generic [ref=e220]:
+                    - generic [ref=e222]: 概念
+                    - generic [ref=e223]: +1.80%
+                - generic [ref=e225] [cursor=pointer]:
+                  - generic [ref=e226]: 同花顺果指数
+                  - generic [ref=e227]:
+                    - generic [ref=e229]: 概念
+                    - generic [ref=e230]: +1.80%
+                - generic [ref=e232] [cursor=pointer]:
+                  - generic [ref=e233]: 锂电池概念
+                  - generic [ref=e234]:
+                    - generic [ref=e236]: 概念
+                    - generic [ref=e237]: +1.65%
+                - generic [ref=e239] [cursor=pointer]:
+                  - generic [ref=e240]: 同花顺出海50
+                  - generic [ref=e241]:
+                    - generic [ref=e243]: 概念
+                    - generic [ref=e244]: +1.42%
+                - generic [ref=e246] [cursor=pointer]:
+                  - generic [ref=e247]: 人形机器人
+                  - generic [ref=e248]:
+                    - generic [ref=e250]: 概念
+                    - generic [ref=e251]: +1.39%

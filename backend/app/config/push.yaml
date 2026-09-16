@@ -1,0 +1,38 @@
+# Claw 推送配置
+
+feishu:
+  # Webhook 机器人
+  webhook_url: ""           # 从环境变量 FEISHU_WEBHOOK_URL 覆盖
+  
+  # 推送频道
+  channels:
+    # 异动推送
+    anomaly:
+      enabled: true
+      min_score: 60            # 评分60以下不推
+      throttle_seconds: 300    # 同股5分钟去重
+      hourly_limit: 30         # 每小时上限
+      
+    # 时段复盘
+    review:
+      enabled: true
+      schedule:
+        - name: "早盘复盘"
+          cron: "30 11 * * 1-5"
+        - name: "全天复盘"
+          cron: "5 15 * * 1-5"
+        - name: "盘后深度"
+          cron: "0 20 * * 1-5"
+        - name: "早盘预览"
+          cron: "30 8 * * 1-5"
+          
+    # 风控预警
+    risk_alert:
+      enabled: true
+      no_throttle: true        # 风控不限频
+
+# WebSocket 通道
+websocket:
+  enabled: true
+  max_connections: 100
+  heartbeat_interval: 30      # 秒

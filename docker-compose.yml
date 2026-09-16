@@ -1,0 +1,83 @@
+# === Claw 鹰爪量化交易系统 — Docker Compose ===
+# 用法: docker compose up -d
+
+services:
+  # === 后端 ===
+  backend:
+    build:
+      context: ../backend
+      dockerfile: ../docker/backend.Dockerfile
+    container_name: claw-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../backend/.env
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./claw.db
+      # 生产环境切换PostgreSQL:
+      # - DATABASE_URL=postgresql+asyncpg://claw:claw123@db:5432/claw
+    volumes:
+      - backend-data:/app/claw.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - claw-net
+
+  # === 前端 ===
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../docker/frontend.Dockerfile
+    container_name: claw-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - claw-net
+
+  # === Redis (推送限流+缓存) ===
+  redis:
+    image: redis:7-alpine
+    container_name: claw-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - claw-net
+
+  # === PostgreSQL (生产环境，默认不启用) ===
+  # 取消注释 + 后端DATABASE_URL切换即可启用
+  # db:
+  #   image: postgres:16-alpine
+  #   container_name: claw-db
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5432:5432"
+  #   environment:
+  #     POSTGRES_DB: claw
+  #     POSTGRES_USER: claw
+  #     POSTGRES_PASSWORD: claw123
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+  #   networks:
+  #     - claw-net
+
+volumes:
+  backend-data:
+  redis-data:
+  # pg-data:
+
+networks:
+  claw-net:
+    driver: bridge

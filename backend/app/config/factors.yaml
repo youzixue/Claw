@@ -1,0 +1,90 @@
+# Claw 因子配置
+
+# 因子权重 — 强势评分器使用
+scorer_weights:
+  capital: 0.30       # 资金面 30%
+  sector: 0.25        # 板块面 25%
+  sentiment: 0.20     # 情绪面 20%
+  technical: 0.15     # 技术面 15%
+  fundamental: 0.10   # 基本面 10%
+
+# 评级阈值
+score_levels:
+  ten_bagger: 90      # 🚀 十倍候选
+  strong: 75          # ⚡ 强势跟踪
+  watch: 60           # 🔶 值得关注
+
+# 因子衰减检测
+factor_decay:
+  ic_window: 20       # IC计算窗口(交易日)
+  ir_window: 60       # IR计算窗口
+  decay_threshold: 0.05  # IC连续下降阈值
+
+# 各因子详细配置
+factors:
+  # 技术因子
+  technical:
+    ma_trend:
+      periods: [5, 10, 20, 60]
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+    rsi:
+      period: 14
+      overbought: 80
+      oversold: 20
+    kdj:
+      k_period: 9
+      d_period: 3
+    bollinger:
+      period: 20
+      std_dev: 2
+    volume_price:
+      volume_ratio_window: 20
+
+  # 资金因子
+  capital:
+    big_order_threshold: 500000  # 大单阈值50万
+    consecutive_days: 3
+    concentration_window: 10
+
+  # 情绪因子
+  sentiment:
+    limit_up_window: 5
+    board_height_max: 10
+    seal_rate_window: 10
+
+  # 板块因子
+  sector:
+    strength_window: 5
+    persistence_min_days: 3
+
+  # 基本面因子
+  fundamental:
+    pe_range: [0, 100]
+    pb_range: [0, 20]
+
+  # 宏观因子
+  macro:
+    sp500_weight: 0.5
+    commodity_weight: 0.3
+
+  # 爆发因子
+  breakout:
+    volume_surge_ratio: 3.0
+    first_board_time_strong: "10:00"
+
+  # 晋级因子
+  promotion:
+    history_window: 750  # 3年历史
+
+  # 生命周期因子
+  lifecycle:
+    turnover_surge_ratio: 3.0
+    volume_top_ratio: 0.9
+
+  # 新闻因子
+  news_factor:
+    hot_window_hours: 1
+    hot_window_days: 1

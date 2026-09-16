@@ -1,8 +1,10 @@
 """行情总览 API — 大盘指数+情绪+大盘资金流"""
 
-from datetime import date
+from datetime import date, datetime
+import json
 
 from fastapi import APIRouter, Depends
+from loguru import logger
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +48,93 @@ async def _get_latest_trade_date(db: AsyncSession) -> date | None:
         )
     )
     return result.scalar_one_or_none()
+
+
+def _dashboard_v2_fallback_snapshot() -> dict:
+    """overview-v2 兜底响应，保障前端在异常时可稳定渲染。"""
+    return {
+        "trade_date": None,
+        "snapshot_time": None,
+        "summary_text": "暂无总评数据，系统正在分析市场状态...",
+        "conclusions": [],
+        "focus_strips": [],
+        "a_share_core": {
+            "indices": [],
+            "sentiment_cycle": None,
+            "limit_up_count": 0,
+            "limit_down_count": 0,
+            "seal_rate": 0,
+            "board_height": 0,
+            "main_net_inflow": 0,
+        },
+        "external_factors": [],
+        "mapping_insights": [],
+    }
+
+
+def _normalize_json_payload(payload: dict) -> dict:
+    """确保返回 payload 为标准 JSON 数值，避免 NaN/Inf 引发 500。"""
+    try:
+        return json.loads(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+    except Exception:
+        return payload
+
+
+def _is_incomplete_dashboard_v2_snapshot(payload: dict) -> bool:
+    """识别明显异常/陈旧快照，触发实时重建。"""
+    if not payload:
+        return True
+    indices = ((payload.get("a_share_core") or {}).get("indices")) or []
+    if not indices:
+        return True
+    prices = [float(item.get("price") or 0) for item in indices if isinstance(item, dict)]
+    if not prices:
+        return True
+    if (payload.get("trade_date") in (None, "")) and all(v == 0 for v in prices):
+        return True
+
+    # 外部关键因子异常值识别：命中则强制走实时重建
+    factors = payload.get("external_factors") or []
+    factor_map = {
+        str(x.get("key")): x for x in factors if isinstance(x, dict) and x.get("key")
+    }
+    rates_10y = factor_map.get("rates_us10y")
+    if rates_10y:
+        try:
+            if float(rates_10y.get("price") or 0) <= 0:
+                return True
+        except Exception:
+            return True
+
+    # 外部关键指数时间过旧也触发重建，避免长期命中陈旧快照
+    for k in ["us_nasdaq", "us_sp500", "china_adr", "a50"]:
+        factor = factor_map.get(k)
+        if not factor:
+            continue
+        t = str(factor.get("trade_time") or "")
+        if not t:
+            return True
+        try:
+            d = datetime.fromisoformat(t.replace("T", " ")).date()
+        except Exception:
+            try:
+                d = date.fromisoformat(t[:10])
+            except Exception:
+                return True
+        if (date.today() - d).days > 3:
+            return True
+
+    # 旧版快照会把情绪周期写成英文枚举，命中则强制重建
+    conclusions = payload.get("conclusions") or []
+    mood_card = next(
+        (item for item in conclusions if isinstance(item, dict) and item.get("key") == "a_share_mood"),
+        None,
+    )
+    mood_note = str((mood_card or {}).get("note") or "")
+    if any(token in mood_note for token in ["recovery", "climax", "divergence", "freezing", "pending"]):
+        return True
+
+    return False
 
 
 @router.get("/overview")
@@ -145,6 +234,7 @@ async def dashboard_overview(db: AsyncSession = Depends(get_db)):
             "score": sentiment_state.score,
             "limit_up_count": lu_count,
             "limit_down_count": sentiment_state.limit_down_count,
+            "broken_limit_count": sentiment_state.broken_limit_count,
             "seal_rate": sentiment_state.seal_rate,
             "board_height": sentiment_state.board_height,
             "max_position_pct": sentiment_state.max_position_pct,
@@ -157,8 +247,18 @@ async def dashboard_overview(db: AsyncSession = Depends(get_db)):
 @router.get("/overview-v2")
 async def dashboard_overview_v2(db: AsyncSession = Depends(get_db)):
     """总览 2.0 聚合接口，优先读取后台快照"""
-    cached = await dashboard_snapshot_cache.latest(db)
-    if cached:
-        return cached
-    snapshot = (await dashboard2_service.build_snapshot(db)).model_dump()
-    return snapshot
+    try:
+        cached = await dashboard_snapshot_cache.latest(db)
+        if cached and not _is_incomplete_dashboard_v2_snapshot(cached):
+            return cached
+        if cached:
+            logger.warning("overview-v2 检测到不完整缓存，切换实时重建")
+    except Exception as e:
+        logger.exception(f"overview-v2 读取快照失败，降级实时构建: {e}")
+
+    try:
+        snapshot = (await dashboard2_service.build_snapshot(db)).model_dump()
+        return _normalize_json_payload(snapshot)
+    except Exception as e:
+        logger.exception(f"overview-v2 实时构建失败，返回兜底结构: {e}")
+        return _dashboard_v2_fallback_snapshot()

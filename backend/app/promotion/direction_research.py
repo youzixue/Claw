@@ -1,0 +1,120 @@
+"""Independent close-up research rankings; never a production execution signal.
+
+Only newly emitted candidates are annotated. Historical snapshots without this
+contract stay unavailable: no reconstruction from outcomes or today's scores.
+"""
+from __future__ import annotations
+
+import math
+
+DIRECTION_LABEL_VERSION = "next_day_close_up_v1"
+DIRECTION_RESEARCH_VERSION = "direction_rank_research_v1"
+DIRECTION_RANK_LIMIT = 12
+DIRECTION_TARGET_PRECISION = 0.80
+
+
+def valid_probability(value) -> bool:
+    return (type(value) in (int, float) and 0 <= value <= 1
+            and math.isfinite(value))
+
+
+def annotate_direction_research(candidates: list[dict], *, limit: int = DIRECTION_RANK_LIMIT) -> tuple[list[dict], dict]:
+    """Keep the existing eligible universe and every Champion field unchanged.
+
+    One missing eligible score blocks the entire research ranking instead of
+    selectively dropping that stock. Stable code ties never depend on outcomes.
+    """
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("direction rank limit must be a positive integer")
+    lane = [item for item in candidates if item.get("target_board", 1) == 1]
+    codes = [str(item.get("code") or "").strip() for item in lane]
+    error = "duplicate_or_missing_code" if (not all(type(item.get("code")) is str
+        and item["code"] == code and len(code) == 6 and code.isascii() and code.isdigit()
+        for item, code in zip(lane, codes)) or len(set(codes)) != len(codes)) else ""
+    eligible = [item for item in lane
+                if (item.get("probability_factors") or {}).get("prediction_rank_eligible") is True]
+    missing = sum(not valid_probability(item.get("direction_probability")) for item in eligible)
+    if missing and not error:
+        error = "eligible_direction_probability_missing"
+    ordered = sorted(eligible, key=lambda item: (-item["direction_probability"], item["code"])) if not error else []
+    positions = {item["code"]: index for index, item in enumerate(ordered[:limit], 1)}
+    annotated = []
+    for item in candidates:
+        if item.get("target_board", 1) != 1:
+            annotated.append(item)
+            continue
+        factors = item.get("probability_factors") or {}
+        probability = item.get("direction_probability")
+        proof = {
+            "version": DIRECTION_RESEARCH_VERSION,
+            "label_version": DIRECTION_LABEL_VERSION,
+            "scope": "research_only",
+            "probability": probability if valid_probability(probability) else None,
+            "probability_method": str(factors.get("learning_direction_probability_method") or "unknown"),
+            "eligible": factors.get("prediction_rank_eligible") is True,
+            "selected": item.get("code") in positions,
+            "rank_position": positions.get(item.get("code")),
+            "rank_limit": limit,
+            "candidate_count": len(lane),
+            "eligible_count": len(eligible),
+            "selected_count": len(positions),
+            "rank_contract_complete": not bool(error),
+            "error": error or None,
+        }
+        annotated.append({**item, "probability_factors": {**factors, "direction_research": proof}})
+    selected = sorted([item for item in annotated if item.get("code") in positions
+                       and item.get("target_board", 1) == 1], key=lambda item: positions[item["code"]])
+    metadata = {
+        "version": DIRECTION_RESEARCH_VERSION, "label_version": DIRECTION_LABEL_VERSION,
+        "scope": "research_only", "rank_limit": limit,
+        "target_precision": DIRECTION_TARGET_PRECISION,
+        "candidate_count": len(lane), "eligible_count": len(eligible),
+        "missing_probability_count": missing, "selected_count": len(selected),
+        "status": "blocked" if error else "available" if len(selected) == limit else "insufficient_candidates",
+        "reason": error or None,
+        "candidates": selected,
+        "production_unchanged": True, "manual_review_eligible": False,
+        "notes": ["按独立次日收涨概率排序，不按涨停经验分排序；当前概率来源保持原样，非新模型已获验证",
+                  "仅研究观察，不替换正式涨停榜、不生成订单；缺少冻结证据不得回补旧榜"],
+    }
+    return annotated, metadata
+
+
+def frozen_direction_probability(factors: dict) -> float:
+    """Read a frozen, versioned directional baseline, never the limit-up score."""
+    proof = factors.get("direction_research")
+    if (not isinstance(proof, dict)
+            or proof.get("version") != DIRECTION_RESEARCH_VERSION
+            or proof.get("label_version") != DIRECTION_LABEL_VERSION
+            or proof.get("scope") != "research_only"
+            or proof.get("rank_contract_complete") is not True
+            or not valid_probability(proof.get("probability"))):
+        raise ValueError("frozen_direction_contract_missing_or_invalid")
+    return float(proof["probability"])
+
+
+def validate_frozen_direction_universe(entries: list[tuple[str, dict]]) -> None:
+    """Require the complete frozen ranking contract before selecting eligible rows."""
+    proofs = {code: factors["direction_research"] for code, factors in entries}
+    if len(proofs) != len(entries):
+        raise ValueError("direction_frozen_universe_duplicate")
+    eligible = []
+    for code, factors in entries:
+        probability = frozen_direction_probability(factors)
+        proof = proofs[code]
+        if (type(proof.get("eligible")) is not bool
+                or proof["eligible"] != (factors.get("prediction_rank_eligible") is True)):
+            raise ValueError("direction_frozen_eligibility_mismatch")
+        if proof["eligible"]:
+            eligible.append((code, probability))
+    eligible.sort(key=lambda item: (-item[1], item[0]))
+    positions = {code: index for index, (code, _) in enumerate(eligible[:DIRECTION_RANK_LIMIT], 1)}
+    for code, proof in proofs.items():
+        if (type(proof.get("candidate_count")) is not int or proof["candidate_count"] != len(entries)
+                or type(proof.get("eligible_count")) is not int or proof["eligible_count"] != len(eligible)
+                or type(proof.get("selected_count")) is not int or proof["selected_count"] != len(positions)
+                or type(proof.get("rank_limit")) is not int or proof["rank_limit"] != DIRECTION_RANK_LIMIT
+                or type(proof.get("selected")) is not bool or proof["selected"] != (code in positions)
+                or (code in positions and type(proof.get("rank_position")) is not int)
+                or proof.get("rank_position") != positions.get(code)):
+            raise ValueError("direction_frozen_universe_incomplete_or_rank_mismatch")

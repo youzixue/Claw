@@ -3,7 +3,7 @@
     <div class="page-shell margin-page">
       <div class="page-hero">
       <div>
-        <h2 class="page-title">💰 融资融券</h2>
+        <h2 class="page-title"><el-icon class="title-icon"><Coin /></el-icon>融资融券</h2>
         <div class="page-subtitle">统一查看杠杆情绪、异动列表与个股融资融券明细</div>
       </div>
       <div class="hero-chip">
@@ -12,23 +12,27 @@
       </div>
     </div>
 
-      <div class="gauge-row">
-        <div class="panel-card gauge-card">
-          <div class="panel-title"><el-icon><Odometer /></el-icon>杠杆情绪指数</div>
-          <v-chart :option="gaugeOption" style="height: 260px; flex: 1" autoresize />
-        </div>
-        <div class="metrics-panel margin-metrics-panel index-cards-wrap">
-          <div class="index-cards">
-            <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><Wallet /></el-icon><span>融资余额(亿)</span></div><div class="stat-value">{{ indexData.total_margin_balance_yi?.toFixed(0) || '--' }}</div></div>
-            <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><Tickets /></el-icon><span>融券余额(亿)</span></div><div class="stat-value">{{ indexData.total_short_balance_yi?.toFixed(0) || '--' }}</div></div>
-            <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><TrendCharts /></el-icon><span>环比变化</span></div><div class="stat-value" :class="changeColorClass(indexData.margin_change_pct)">{{ formatChange(indexData.margin_change_pct) }}</div></div>
-            <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><Compass /></el-icon><span>杠杆情绪</span></div><div class="stat-value">{{ indexData.sentiment_label || '--' }}</div></div>
+      <section class="section-block">
+        <div class="gauge-row">
+          <div class="panel-card gauge-card">
+            <div class="panel-title"><el-icon><Odometer /></el-icon>杠杆情绪指数</div>
+            <v-chart :option="gaugeOption" style="height: 260px; flex: 1" autoresize />
+          </div>
+          <div class="metrics-panel margin-metrics-panel index-cards-wrap">
+            <div class="index-cards">
+              <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><Wallet /></el-icon><span>融资余额(亿)</span></div><div class="stat-value">{{ indexData.total_margin_balance_yi?.toFixed(0) || '--' }}</div></div>
+              <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><Tickets /></el-icon><span>融券余额(亿)</span></div><div class="stat-value">{{ indexData.total_short_balance_yi?.toFixed(0) || '--' }}</div></div>
+              <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><TrendCharts /></el-icon><span>环比变化</span></div><div class="stat-value" :class="changeColorClass(indexData.margin_change_pct)">{{ formatChange(indexData.margin_change_pct) }}</div></div>
+              <div class="stat-card margin-stat-card"><div class="metric-head"><el-icon><Compass /></el-icon><span>杠杆情绪</span></div><div class="stat-value">{{ indexData.sentiment_label || '--' }}</div></div>
+            </div>
           </div>
         </div>
-      </div>
+      </section>
 
+      <section class="section-block">
+      <div class="section-title">融资融券异动</div>
       <div class="panel-card">
-      <div class="panel-title"><el-icon><Histogram /></el-icon>融资融券异动</div>
+      <div class="mobile-table-wrap">
       <el-table :data="anomalies" stripe size="small" empty-text="暂无数据">
         <el-table-column prop="code" label="代码" width="80" />
         <el-table-column prop="name" label="名称" width="80" />
@@ -49,10 +53,13 @@
         </el-table-column>
         <el-table-column prop="detail" label="详情" min-width="200" show-overflow-tooltip />
       </el-table>
+      </div>
     </div>
+      </section>
 
-      <div class="panel-card">
-        <div class="panel-title"><el-icon><Search /></el-icon>个股融资融券</div>
+      <section class="section-block">
+        <div class="section-title">个股融资融券</div>
+      <div class="panel-card query-panel">
         <div class="query-row">
           <el-input v-model="queryCode" placeholder="输入股票代码" style="width: 220px" @keyup.enter="queryDetail" />
           <el-button type="primary" @click="queryDetail" :loading="querying">查询</el-button>
@@ -65,6 +72,7 @@
           </el-descriptions-item>
         </el-descriptions>
       </div>
+      </section>
     </div>
   </div>
 </template>
@@ -72,10 +80,11 @@
 <script setup>
 import { defineAsyncComponent, ref, computed, onMounted } from 'vue'
 const VChart = defineAsyncComponent(() => import('vue-echarts'))
-import { ensureEChartsRegistered } from '@/composables/echarts'
-ensureEChartsRegistered()
+import { ensureGaugeChartsRegistered } from '@/composables/echarts/gauge'
 import { getMarginAnomalies, getMarginIndex, getMarginDetail } from '@/api'
 import { formatChange, changeColorClass, formatAmount } from '@/composables/useUtils'
+
+ensureGaugeChartsRegistered()
 
 const anomalies = ref([])
 const indexData = ref({})

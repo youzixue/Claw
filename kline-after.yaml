@@ -1,0 +1,164 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e6]:
+      - img [ref=e8]
+      - generic [ref=e12]:
+        - generic [ref=e13]: Claw Quant
+        - generic [ref=e14]: A股量化交易
+    - navigation [ref=e15]:
+      - generic [ref=e16]: 行情中心
+      - link "行情总览" [ref=e17] [cursor=pointer]:
+        - /url: /
+        - img [ref=e20]
+        - generic [ref=e22]: 行情总览
+      - link "板块营地" [ref=e23] [cursor=pointer]:
+        - /url: /sectors
+        - img [ref=e26]
+        - generic [ref=e29]: 板块营地
+      - link "牛股雷达" [ref=e30] [cursor=pointer]:
+        - /url: /tenbagger
+        - img [ref=e33]
+        - generic [ref=e36]: 牛股雷达
+      - link "晋级预测" [ref=e37] [cursor=pointer]:
+        - /url: /promotion
+        - img [ref=e40]
+        - generic [ref=e43]: 晋级预测
+      - generic [ref=e44]: 分析工具
+      - link "情绪面" [ref=e45] [cursor=pointer]:
+        - /url: /sentiment
+        - img [ref=e48]
+        - generic [ref=e50]: 情绪面
+      - link "竞价分析" [ref=e51] [cursor=pointer]:
+        - /url: /auction
+        - img [ref=e54]
+        - generic [ref=e57]: 竞价分析
+      - link "融资融券" [ref=e58] [cursor=pointer]:
+        - /url: /margin
+        - img [ref=e61]
+        - generic [ref=e65]: 融资融券
+      - link "新闻面" [ref=e66] [cursor=pointer]:
+        - /url: /news
+        - img [ref=e69]
+        - generic [ref=e71]: 新闻面
+      - generic [ref=e72]: 交易系统
+      - link "风控中心" [ref=e73] [cursor=pointer]:
+        - /url: /risk
+        - img [ref=e76]
+        - generic [ref=e79]: 风控中心
+      - link "因子引擎" [ref=e80] [cursor=pointer]:
+        - /url: /factors
+        - img [ref=e83]
+        - generic [ref=e86]: 因子引擎
+      - link "绩效中心" [ref=e87] [cursor=pointer]:
+        - /url: /performance
+        - img [ref=e90]
+        - generic [ref=e92]: 绩效中心
+      - link "模拟盘" [ref=e93] [cursor=pointer]:
+        - /url: /paper
+        - img [ref=e96]
+        - generic [ref=e100]: 模拟盘
+      - link "回测引擎" [ref=e101] [cursor=pointer]:
+        - /url: /backtest
+        - img [ref=e104]
+        - generic [ref=e108]: 回测引擎
+      - link "数据治理" [ref=e109] [cursor=pointer]:
+        - /url: /governance
+        - img [ref=e112]
+        - generic [ref=e114]: 数据治理
+    - generic [ref=e115]:
+      - generic [ref=e116]:
+        - generic [ref=e118]: 离线
+        - generic [ref=e119]: 休市
+        - generic [ref=e120]: 交易日
+      - img [ref=e123] [cursor=pointer]
+  - main [ref=e126]:
+    - generic [ref=e264]:
+      - generic [ref=e265]:
+        - generic [ref=e266]:
+          - heading "平安银行 000001 +0.90%" [level=2] [ref=e267]:
+            - text: 平安银行 000001
+            - generic [ref=e269]: +0.90%
+          - generic [ref=e270]:
+            - generic [ref=e271]: 最新 11.17
+            - generic [ref=e272]: 换手 0.26%
+            - generic [ref=e273]: 量比 0.85
+            - generic [ref=e274]: PE 5.08
+            - generic [ref=e275]: 增速 +8.11%
+        - generic [ref=e276]:
+          - generic [ref=e277]:
+            - generic [ref=e278]: 短线
+            - generic [ref=e279]: "35.2"
+            - generic [ref=e281]: D
+          - generic [ref=e282]:
+            - generic [ref=e283]: 十倍
+            - generic [ref=e284]: "55"
+            - generic [ref=e286]: B
+      - generic [ref=e287]:
+        - tablist [ref=e291]:
+          - tab "概况" [selected] [ref=e293]
+          - tab "K线" [ref=e294] [cursor=pointer]
+          - tab "资金流" [ref=e295]
+          - tab "信号评分" [ref=e296]
+          - tab "板块共振" [ref=e297]
+          - tab "概念关联" [ref=e298]
+          - tab "明日预案" [ref=e299]
+        - tabpanel "概况" [ref=e301]:
+          - generic [ref=e304]:
+            - generic [ref=e305]: 实时行情
+            - table [ref=e308]:
+              - rowgroup [ref=e309]:
+                - row "最新价 11.17 昨收 11.07" [ref=e310]:
+                  - cell "最新价" [ref=e311]
+                  - cell "11.17" [ref=e312]
+                  - cell "昨收" [ref=e313]
+                  - cell "11.07" [ref=e314]
+                - row "开盘 11.07 最高 11.17" [ref=e315]:
+                  - cell "开盘" [ref=e316]
+                  - cell "11.07" [ref=e317]
+                  - cell "最高" [ref=e318]
+                  - cell "11.17" [ref=e319]
+                - row "最低 11.07 涨停 12.18" [ref=e320]:
+                  - cell "最低" [ref=e321]
+                  - cell "11.07" [ref=e322]
+                  - cell "涨停" [ref=e323]
+                  - cell "12.18" [ref=e324]
+                - row "跌停 9.96 涨跌幅 +0.90%" [ref=e325]:
+                  - cell "跌停" [ref=e326]
+                  - cell "9.96" [ref=e327]
+                  - cell "涨跌幅" [ref=e328]
+                  - cell "+0.90%" [ref=e329]
+                - row "振幅 0.9% 5分钟涨跌 -2.10%" [ref=e330]:
+                  - cell "振幅" [ref=e331]
+                  - cell "0.9%" [ref=e332]
+                  - cell "5分钟涨跌" [ref=e333]
+                  - cell "-2.10%" [ref=e334]
+                - row "成交量 50万 成交额 0.06亿" [ref=e335]:
+                  - cell "成交量" [ref=e336]
+                  - cell "50万" [ref=e337]
+                  - cell "成交额" [ref=e338]
+                  - cell "0.06亿" [ref=e339]
+                - row "换手率 0.26% 量比 0.85" [ref=e340]:
+                  - cell "换手率" [ref=e341]
+                  - cell "0.26%" [ref=e342]
+                  - cell "量比" [ref=e343]
+                  - cell "0.85" [ref=e344]
+                - row "主力净流入 -0.00亿 委比 -53.59%" [ref=e345]:
+                  - cell "主力净流入" [ref=e346]
+                  - cell "-0.00亿" [ref=e347]
+                  - cell "委比" [ref=e348]
+                  - cell "-53.59%" [ref=e349]
+                - row "流通市值 0.0亿 PE(TTM) 5.08" [ref=e350]:
+                  - cell "流通市值" [ref=e351]
+                  - cell "0.0亿" [ref=e352]
+                  - cell "PE(TTM)" [ref=e353]
+                  - cell "5.08" [ref=e354]
+                - row "PB 0.48 股息率 5.35%" [ref=e355]:
+                  - cell "PB" [ref=e356]
+                  - cell "0.48" [ref=e357]
+                  - cell "股息率" [ref=e358]
+                  - cell "5.35%" [ref=e359]
+                - row "净利润增速 +8.11% 均价VWAP 11.12" [ref=e360]:
+                  - cell "净利润增速" [ref=e361]
+                  - cell "+8.11%" [ref=e362]
+                  - cell "均价VWAP" [ref=e363]
+                  - cell "11.12" [ref=e364]

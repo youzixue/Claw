@@ -1,0 +1,136 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e6]:
+      - img [ref=e8]
+      - generic [ref=e12]:
+        - generic [ref=e13]: Claw Quant
+        - generic [ref=e14]: A股量化交易
+    - navigation [ref=e15]:
+      - generic [ref=e16]: 行情中心
+      - link "行情总览" [ref=e17] [cursor=pointer]:
+        - /url: /
+        - img [ref=e20]
+        - generic [ref=e22]: 行情总览
+      - link "板块营地" [ref=e23] [cursor=pointer]:
+        - /url: /sectors
+        - img [ref=e26]
+        - generic [ref=e29]: 板块营地
+      - link "牛股雷达" [ref=e30] [cursor=pointer]:
+        - /url: /tenbagger
+        - img [ref=e33]
+        - generic [ref=e36]: 牛股雷达
+      - link "晋级预测" [ref=e37] [cursor=pointer]:
+        - /url: /promotion
+        - img [ref=e40]
+        - generic [ref=e43]: 晋级预测
+      - generic [ref=e44]: 分析工具
+      - link "情绪面" [ref=e45] [cursor=pointer]:
+        - /url: /sentiment
+        - img [ref=e48]
+        - generic [ref=e50]: 情绪面
+      - link "竞价分析" [ref=e51] [cursor=pointer]:
+        - /url: /auction
+        - img [ref=e54]
+        - generic [ref=e57]: 竞价分析
+      - link "融资融券" [ref=e58] [cursor=pointer]:
+        - /url: /margin
+        - img [ref=e61]
+        - generic [ref=e65]: 融资融券
+      - link "新闻面" [ref=e66] [cursor=pointer]:
+        - /url: /news
+        - img [ref=e69]
+        - generic [ref=e71]: 新闻面
+      - generic [ref=e72]: 交易系统
+      - link "风控中心" [ref=e73] [cursor=pointer]:
+        - /url: /risk
+        - img [ref=e76]
+        - generic [ref=e79]: 风控中心
+      - link "因子引擎" [ref=e80] [cursor=pointer]:
+        - /url: /factors
+        - img [ref=e83]
+        - generic [ref=e86]: 因子引擎
+      - link "绩效中心" [ref=e87] [cursor=pointer]:
+        - /url: /performance
+        - img [ref=e90]
+        - generic [ref=e92]: 绩效中心
+      - link "模拟盘" [ref=e93] [cursor=pointer]:
+        - /url: /paper
+        - img [ref=e96]
+        - generic [ref=e100]: 模拟盘
+      - link "回测引擎" [ref=e101] [cursor=pointer]:
+        - /url: /backtest
+        - img [ref=e104]
+        - generic [ref=e108]: 回测引擎
+      - link "数据治理" [ref=e109] [cursor=pointer]:
+        - /url: /governance
+        - img [ref=e112]
+        - generic [ref=e114]: 数据治理
+    - generic [ref=e115]:
+      - generic [ref=e116]:
+        - generic [ref=e118]: 离线
+        - generic [ref=e119]: 休市
+        - generic [ref=e120]: 交易日
+      - img [ref=e123] [cursor=pointer]
+  - main [ref=e126]:
+    - generic [ref=e127]:
+      - generic [ref=e128]:
+        - generic [ref=e129]:
+          - heading "平安银行 000001 +0.90%" [level=2] [ref=e214]:
+            - text: 平安银行 000001
+            - generic [ref=e216]: +0.90%
+          - generic [ref=e217]:
+            - generic [ref=e218]: 最新 11.17
+            - generic [ref=e219]: 换手 0.26%
+            - generic [ref=e220]: 量比 0.85
+            - generic [ref=e221]: PE 5.08
+            - generic [ref=e222]: 增速 +8.11%
+        - generic [ref=e223]:
+          - generic [ref=e224]:
+            - generic [ref=e225]: 短线
+            - generic [ref=e226]: "35.2"
+            - generic [ref=e228]: D
+          - generic [ref=e229]:
+            - generic [ref=e230]: 十倍
+            - generic [ref=e231]: "55"
+            - generic [ref=e233]: B
+      - generic [ref=e131]:
+        - tablist [ref=e135]:
+          - tab "概况" [ref=e137]
+          - tab "K线" [active] [selected] [ref=e138] [cursor=pointer]
+          - tab "资金流" [ref=e139]
+          - tab "信号评分" [ref=e140]
+          - tab "板块共振" [ref=e141]
+          - tab "概念关联" [ref=e142]
+          - tab "明日预案" [ref=e143]
+        - tabpanel "K线" [ref=e234]:
+          - generic [ref=e235]:
+            - generic [ref=e236]:
+              - generic [ref=e237]: "主图指标:"
+              - radiogroup "radio-group" [ref=e238]:
+                - generic [ref=e239]:
+                  - radio "MA均线" [checked] [ref=e240]
+                  - generic [ref=e241] [cursor=pointer]: MA均线
+                - generic [ref=e242]:
+                  - radio "BOLL" [ref=e243]
+                  - generic [ref=e244] [cursor=pointer]: BOLL
+                - generic [ref=e245]:
+                  - radio "隐藏" [ref=e246]
+                  - generic [ref=e247] [cursor=pointer]: 隐藏
+            - generic [ref=e248]:
+              - generic [ref=e249]: "副图指标:"
+              - radiogroup "radio-group" [ref=e250]:
+                - generic [ref=e251]:
+                  - radio "MACD" [checked] [ref=e252]
+                  - generic [ref=e253] [cursor=pointer]: MACD
+                - generic [ref=e254]:
+                  - radio "RSI" [ref=e255]
+                  - generic [ref=e256] [cursor=pointer]: RSI
+                - generic [ref=e257]:
+                  - radio "KDJ" [ref=e258]
+                  - generic [ref=e259] [cursor=pointer]: KDJ
+                - generic [ref=e260]:
+                  - radio "隐藏" [ref=e261]
+                  - generic [ref=e262] [cursor=pointer]: 隐藏
+            - generic [ref=e263]:
+              - generic [ref=e264]: "MA20: 11.1655"
+              - generic [ref=e265]: "DIF: -0.1026 DEA: -0.1152 MACD: 0.0252"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股每日复盘"
+  short_description: "基于本地冻结数据执行A股三阶段复盘、归因与模型治理"
+  default_prompt: "使用 $ashare-daily-review 基于本地冻结快照完成今日复盘，并区分事实、假设和模型决策。"

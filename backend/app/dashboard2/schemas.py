@@ -49,6 +49,9 @@ class AShareCoreState(BaseModel):
     seal_rate: float = 0
     board_height: int = 0
     main_net_inflow: float = 0
+    # V2.2融合: 大盘环境
+    market_environment: Optional[str] = None  # strong/neutral/weak
+    buy_threshold: float = 0.0               # 动态买入阈值
 
 
 class Dashboard2Snapshot(BaseModel):

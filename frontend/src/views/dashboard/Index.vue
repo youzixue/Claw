@@ -2,168 +2,61 @@
   <div class="page-container">
     <div class="page-shell overview-v2-page">
       <div class="page-hero page-head">
-      <div>
-        <h2 class="page-title">🦅 Dashboard 2.0</h2>
-        <div class="page-subtitle">跨市场联动总览，自动读取后台快照</div>
+        <div>
+          <h2 class="page-title">行情总览</h2>
+          <div class="page-subtitle">跨市场联动总览，实时把握A股脉搏</div>
+        </div>
+        <div class="snapshot-time">
+          <span class="time-label">数据更新</span>
+          <span class="time-value">{{ formatDate(snapshotTime, 'MM-DD HH:mm:ss') }}</span>
+        </div>
       </div>
-      <div class="snapshot-time">
-        <span class="time-label">快照时间</span>
-        <span class="time-value">{{ formatDate(snapshotTime, 'MM-DD HH:mm:ss') }}</span>
-      </div>
-    </div>
 
       <div v-if="loading" class="loading-wrapper panel-card">
-      <el-skeleton :rows="10" animated />
-    </div>
-
-    <template v-else>
-      <section class="section-block summary-block">
-        <div class="section-title section-title-inline">
-          <span>总评摘要</span>
-          <span class="refresh-status" :class="refreshStatusClass">
-            <el-icon><RefreshRight /></el-icon>
-            {{ refreshStatusText }}
-          </span>
-        </div>
-        <div class="summary-card summary-card-hero">
-          <div class="summary-icon-wrap">
-            <el-icon><DataAnalysis /></el-icon>
-          </div>
-          <div class="summary-content">
-            {{ summaryText || '暂无总评' }}
-          </div>
-        </div>
-      </section>
-
-      <section class="section-block">
-        <div class="section-title">风险 / 机会聚焦</div>
-        <div class="focus-strip-grid">
-          <div v-for="item in focusStrips" :key="item.kind" class="focus-strip" :class="`focus-${item.kind} focus-tone-${item.tone || 'neutral'}`">
-            <div class="focus-kicker">
-              <el-icon v-if="item.kind === 'opportunity'"><Opportunity /></el-icon>
-              <el-icon v-else><Warning /></el-icon>
-              {{ item.kind === 'opportunity' ? '机会方向' : '风险方向' }}
-            </div>
-            <div class="focus-label">{{ item.label }}</div>
-            <div class="focus-detail">{{ item.detail || '--' }}</div>
-          </div>
-        </div>
-      </section>
-
-      <section class="section-block">
-        <div class="section-title">A股核心状态</div>
-        <div class="a-share-core-card">
-        <div class="core-index-grid">
-          <div v-for="item in aShareCore.indices || []" :key="item.code" class="stat-card factor-card">
-            <div class="stat-label">{{ item.label }}</div>
-            <div class="stat-value big" :class="changeColorClass(item.change_pct)">
-              {{ item.price != null ? Number(item.price).toFixed(2) : '--' }}
-            </div>
-            <div class="stat-sub" :class="changeColorClass(item.change_pct)">
-              {{ formatChange(item.change_pct) }}
-            </div>
-          </div>
-        </div>
-        <div class="core-metrics-grid">
-          <div class="metric-item">
-            <span class="metric-label"><el-icon><Sunny /></el-icon>情绪周期</span>
-            <span class="metric-value">{{ sentimentCycleLabel(aShareCore.sentiment_cycle) }}</span>
-          </div>
-          <div class="metric-item">
-            <span class="metric-label"><el-icon><Histogram /></el-icon>涨停 / 跌停</span>
-            <span class="metric-value"><span class="text-red">{{ aShareCore.limit_up_count ?? '--' }}</span> / <span class="text-green">{{ aShareCore.limit_down_count ?? '--' }}</span></span>
-          </div>
-          <div class="metric-item">
-            <span class="metric-label"><el-icon><Finished /></el-icon>封板率</span>
-            <span class="metric-value">{{ aShareCore.seal_rate != null ? Number(aShareCore.seal_rate).toFixed(1) + '%' : '--' }}</span>
-          </div>
-          <div class="metric-item">
-            <span class="metric-label"><el-icon><Top /></el-icon>最高连板</span>
-            <span class="metric-value">{{ aShareCore.board_height ?? '--' }}</span>
-          </div>
-          <div class="metric-item metric-item-wide">
-            <span class="metric-label"><el-icon><Coin /></el-icon>主力净流入</span>
-            <span class="metric-value" :class="changeColorClass(aShareCore.main_net_inflow)">{{ formatAmountYi(aShareCore.main_net_inflow) }}</span>
-          </div>
-        </div>
+        <el-skeleton :rows="10" animated />
       </div>
 
-      </section>
+      <template v-else>
+        <OverviewPrimarySections
+          :summary-text="summaryText"
+          :refresh-status-text="refreshStatusText"
+          :refresh-status-class="refreshStatusClass"
+          :focus-strips="focusStrips"
+          :a-share-core="aShareCore"
+          :change-color-class="changeColorClass"
+          :format-change="formatChange"
+          :format-amount-yi="formatAmountYi"
+          :sentiment-cycle-label="sentimentCycleLabel"
+          :sentiment-cycle-class="sentimentCycleClass"
+        />
 
-      <section class="section-block">
-        <div class="section-title section-title-inline">
-          <span>结论卡片</span>
-          <span class="auto-refresh-tip">每 45 秒自动刷新</span>
-        </div>
-        <div class="conclusion-grid">
-          <div v-for="item in conclusions" :key="item.key" class="conclusion-card" :class="`tone-${item.tone || 'neutral'}`">
-            <div class="stat-label">{{ item.label }}</div>
-            <div class="conclusion-value">{{ item.value }}</div>
-            <div class="mapping-note">{{ item.note || '--' }}</div>
-          </div>
-        </div>
-      </section>
+        <OverviewSecondarySections
+          v-if="showSecondarySections"
+          :conclusions="conclusions"
+          :factor-rows="factorRows"
+          :mapping-insights="mappingInsights"
+          :mapping-status-label="mappingStatusLabel"
+          :mapping-status-type="mappingStatusType"
+          :format-factor-value="formatFactorValue"
+          :format-factor-time="formatFactorTime"
+          :format-change="formatChange"
+          :change-color-class="changeColorClass"
+        />
+      </template>
 
-      <section class="section-block">
-        <div class="section-title">外部联动因子</div>
-        <div class="factor-groups">
-        <div v-for="group in groupedFactors" :key="group.key" class="factor-group-card">
-          <div class="group-title">{{ group.label }}</div>
-          <div class="factor-grid">
-            <div v-for="item in group.items" :key="item.key" class="stat-card factor-card">
-              <div class="stat-label">{{ item.label }}</div>
-              <div class="stat-value big" :class="changeColorClass(item.change_pct)">
-                {{ item.price != null ? Number(item.price).toFixed(2) : '--' }}
-              </div>
-              <div class="stat-sub" :class="changeColorClass(item.change_pct)">
-                {{ formatChange(item.change_pct) }}
-              </div>
-              <div class="factor-meta">
-                <span class="market-tag">{{ item.market || '--' }}</span>
-                <span class="stat-date">{{ item.trade_time || '--' }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-        <el-empty v-if="externalFactors.length === 0" description="暂无外部联动数据" :image-size="40" />
-      </div>
-
-      </section>
-
-      <section class="section-block">
-        <div class="section-title">外盘主题 → A股映射</div>
-        <div class="mapping-list">
-          <div v-for="item in mappingInsights" :key="item.source_key" class="mapping-card">
-          <div class="mapping-head">
-            <div>
-              <div class="mapping-title">{{ item.source_label }}</div>
-              <div class="mapping-themes">
-                <el-tag v-for="theme in item.a_share_themes" :key="theme" size="small" effect="plain" class="theme-tag">
-                  {{ theme }}
-                </el-tag>
-              </div>
-            </div>
-            <el-tag :type="mappingStatusType(item.status)" round>
-              {{ mappingStatusLabel(item.status) }}
-            </el-tag>
-          </div>
-          <div class="mapping-note">{{ item.note || '--' }}</div>
-        </div>
-          <el-empty v-if="mappingInsights.length === 0" description="暂无映射判断" :image-size="40" />
-        </div>
-      </section>
-    </template>
-
-    <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" style="margin-top: 16px" />
+      <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" style="margin-top: 16px" />
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from 'vue'
 import dayjs from 'dayjs'
 import { getDashboardOverviewV2 } from '@/api'
 import { changeColorClass, formatChange, formatDate, sentimentCycleLabel } from '@/composables/useUtils'
+
+const OverviewPrimarySections = defineAsyncComponent(() => import('./components/OverviewPrimarySections.vue'))
+const OverviewSecondarySections = defineAsyncComponent(() => import('./components/OverviewSecondarySections.vue'))
 
 const REFRESH_MS = 45 * 1000
 
@@ -179,6 +72,7 @@ const data = ref({
 const loading = ref(true)
 const error = ref('')
 const refreshing = ref(false)
+const showSecondarySections = ref(false)
 const lastRefreshAt = ref(null)
 const lastRefreshFailedAt = ref(null)
 let refreshTimer = null
@@ -216,14 +110,17 @@ const factorGroupMeta = {
   FX: { key: 'fx', label: '汇率' },
 }
 
-const groupedFactors = computed(() => {
-  const groups = new Map()
-  externalFactors.value.forEach((item) => {
-    const meta = factorGroupMeta[item.market] || { key: 'other', label: '其他' }
-    if (!groups.has(meta.key)) groups.set(meta.key, { ...meta, items: [] })
-    groups.get(meta.key).items.push(item)
-  })
-  return Array.from(groups.values())
+const factorRows = computed(() => {
+  const order = Object.values(factorGroupMeta).reduce((acc, cur, idx) => {
+    acc[cur.key] = idx
+    return acc
+  }, {})
+  return (externalFactors.value || [])
+    .map((item) => {
+      const meta = factorGroupMeta[item.market] || { key: 'other', label: '其他' }
+      return { ...item, group_key: meta.key, group_label: meta.label, group_order: order[meta.key] ?? 999 }
+    })
+    .sort((a, b) => a.group_order - b.group_order)
 })
 
 const mappingStatusLabel = (status) => {
@@ -236,9 +133,47 @@ const mappingStatusType = (status) => {
   return map[status] || 'info'
 }
 
+const sentimentCycleClass = (cycle) => {
+  const map = {
+    freezing: 'text-down',
+    divergence: 'text-warning',
+    recovery: 'text-up',
+    climax: 'text-warning',
+    pending: 'text-secondary',
+    冰点: 'text-down',
+    低迷: 'text-secondary',
+    复苏: 'text-up',
+    活跃: 'text-up',
+    狂热: 'text-warning',
+  }
+  return map[cycle] || ''
+}
+
 const formatAmountYi = (val) => {
   if (val == null || Number.isNaN(Number(val))) return '--'
-  return `${Number(val).toFixed(2)} 亿`
+  const num = Number(val)
+  const abs = Math.abs(num)
+  const sign = num >= 0 ? '+' : '-'
+  if (abs >= 100) return `${sign}${abs.toFixed(1)}亿`
+  if (abs >= 1) return `${sign}${abs.toFixed(2)}亿`
+  if (abs >= 0.01) return `${sign}${(abs * 10000).toFixed(0)}万`
+  return `${sign}${abs.toFixed(4)}亿`
+}
+
+const formatFactorValue = (item) => {
+  const val = item?.price
+  if (val == null || Number.isNaN(Number(val))) return '--'
+  const num = Number(val)
+  if (item?.market === 'FX') return num.toFixed(4)
+  if (item?.market === 'US_RATE') return num.toFixed(3)
+  return num.toFixed(2)
+}
+
+const formatFactorTime = (item) => {
+  const raw = item?.trade_time || snapshotTime.value
+  if (!raw) return '--'
+  const t = dayjs(String(raw).replace('T', ' '))
+  return t.isValid() ? t.format('MM-DD HH:mm') : String(raw)
 }
 
 const loadData = async ({ silent = false } = {}) => {
@@ -252,7 +187,7 @@ const loadData = async ({ silent = false } = {}) => {
     lastRefreshAt.value = dayjs()
     lastRefreshFailedAt.value = null
   } catch (e) {
-    if (!silent) error.value = 'Dashboard 2.0 加载失败'
+    if (!silent) error.value = '行情总览加载失败'
     lastRefreshFailedAt.value = dayjs()
     console.error('overview-v2 数据加载失败:', e)
   } finally {
@@ -263,6 +198,14 @@ const loadData = async ({ silent = false } = {}) => {
 
 onMounted(async () => {
   await loadData()
+  const scheduleSecondary = () => {
+    showSecondarySections.value = true
+  }
+  if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+    window.requestIdleCallback(scheduleSecondary, { timeout: 400 })
+  } else {
+    window.setTimeout(scheduleSecondary, 180)
+  }
   refreshTimer = window.setInterval(() => {
     loadData({ silent: true })
   }, REFRESH_MS)
@@ -277,50 +220,105 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped lang="scss">
-.overview-v2-page { display: flex; flex-direction: column; gap: 20px; }
-.page-head { align-items: flex-end; }
-.section-block { display: flex; flex-direction: column; gap: 12px; }
-.summary-block { gap: 10px; }
-.snapshot-time { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
-.time-label { color: var(--claw-text-muted, #909399); font-size: 12px; }
-.time-value { font-size: 13px; color: var(--el-text-color-primary); }
-.summary-card { background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 10px; padding: 16px; line-height: 1.8; font-size: 15px; }
-.summary-card-hero { display: flex; gap: 14px; align-items: flex-start; }
-.summary-icon-wrap { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; border-radius: 12px; background: rgba(0,122,255,0.1); color: var(--claw-primary); border: 1px solid rgba(0,122,255,0.08); flex-shrink: 0; }
-.summary-content { flex: 1; }
-.focus-strip-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
-.focus-strip { border-radius: 10px; padding: 16px; border: 1px solid var(--claw-border); }
-.focus-kicker { font-size: 12px; color: var(--claw-text-muted, #909399); margin-bottom: 8px; display: inline-flex; align-items: center; gap: 6px; }
-.focus-label { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
-.focus-detail { color: var(--claw-text-muted, #909399); line-height: 1.6; }
-.focus-opportunity { background: rgba(103, 194, 58, 0.08); border-color: rgba(103, 194, 58, 0.35); }
-.focus-risk { background: rgba(245, 108, 108, 0.08); border-color: rgba(245, 108, 108, 0.35); }
-.a-share-core-card, .factor-group-card, .mapping-card { background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 10px; padding: 16px; }
-.core-index-grid, .factor-grid, .conclusion-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
-.core-metrics-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 16px; }
-.metric-item { display: flex; flex-direction: column; gap: 6px; padding: 12px; border-radius: 8px; background: rgba(127,127,127,.08); }
-.metric-item-wide { grid-column: span 1; }
-.metric-label, .stat-date, .mapping-note, .auto-refresh-tip { color: var(--claw-text-muted, #909399); }
-.metric-label { display: inline-flex; align-items: center; gap: 6px; }
-.metric-value { font-size: 16px; font-weight: 700; }
-.refresh-status { font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
-.status-ok { color: #67c23a; }
-.status-refreshing { color: #409eff; }
-.status-failed { color: #e6a23c; }
-.conclusion-card { border-radius: 10px; padding: 16px; border: 1px solid var(--claw-border); background: var(--claw-bg-card); }
-.conclusion-value { font-size: 20px; font-weight: 700; margin: 8px 0 10px; }
-.tone-positive { border-color: rgba(103, 194, 58, 0.35); background: rgba(103, 194, 58, 0.08); }
-.tone-negative { border-color: rgba(245, 108, 108, 0.35); background: rgba(245, 108, 108, 0.08); }
-.tone-warning { border-color: rgba(230, 162, 60, 0.35); background: rgba(230, 162, 60, 0.08); }
-.factor-groups { display: flex; flex-direction: column; gap: 16px; }
-.group-title, .mapping-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; color: var(--el-text-color-primary); }
-.section-title-inline { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.factor-card { min-height: 132px; }
-.factor-meta, .mapping-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-.market-tag { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; background: rgba(64, 158, 255, 0.12); color: #409eff; font-size: 12px; }
-.mapping-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
-.mapping-themes { display: flex; flex-wrap: wrap; gap: 8px; }
-.loading-wrapper { padding: 40px 0; }
-@media (max-width: 1200px) { .core-index-grid, .factor-grid, .conclusion-grid { grid-template-columns: repeat(2, 1fr); } .core-metrics-grid, .focus-strip-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 768px) { .page-head, .section-title-inline { flex-direction: column; align-items: flex-start; } .snapshot-time { align-items: flex-start; } .summary-card-hero { flex-direction: column; } .core-index-grid, .factor-grid, .conclusion-grid, .mapping-list, .core-metrics-grid, .focus-strip-grid { grid-template-columns: 1fr; } }
+.overview-v2-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.08;
+  font-weight: 800;
+  letter-spacing: 0;
+  color: var(--claw-text-primary);
+}
+
+.page-subtitle {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--claw-text-secondary);
+}
+
+.snapshot-time {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--claw-bg-card);
+  border: 1px solid var(--claw-border);
+  box-shadow: var(--claw-shadow-sm);
+}
+
+.time-label {
+  font-size: 12px;
+  color: var(--claw-text-muted, #909399);
+}
+
+.time-value {
+  font-size: 13px;
+  color: var(--claw-text-primary);
+}
+
+.separator {
+  color: #94a3b8;
+  margin: 0 4px;
+}
+
+.auto-refresh-tip,
+.refresh-status {
+  color: var(--claw-text-muted, #909399);
+  font-size: 12px;
+}
+
+.loading-wrapper {
+  padding: 40px 0;
+}
+
+.focus-strip,
+.conclusion-card,
+.mapping-card,
+.index-card,
+.signal-card,
+.metric-item,
+.factor-list-row {
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.focus-strip:hover,
+.conclusion-card:hover,
+.mapping-card:hover,
+.index-card:hover,
+.signal-card:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+}
+
+@media (max-width: 1365px) {
+}
+
+@media (max-width: 768px) {
+  .page-head,
+  .section-title-inline {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .snapshot-time {
+    align-items: flex-start;
+  }
+  .page-title {
+    font-size: 22px;
+  }
+}
 </style>

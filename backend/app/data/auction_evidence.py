@@ -1,0 +1,111 @@
+"""Auction provenance: receipt labels and positive spot fields are not proof.
+
+Legacy rows remain unknown. This contract does not assert that any currently
+configured public adapter supplies indicative matched price/quantity.
+"""
+from datetime import datetime, time
+import math
+
+from numpy import bool_
+
+from app.config.settings import settings
+from app.data.fund_flow_clock import local_clock
+
+
+def auction_context_complete(context) -> bool:
+    """Only accept a derived context stamped by the current provenance gate.
+
+    Older persisted 'complete=true' or missing flags cannot regain executable
+    status during ranking; this never substitutes for validating source rows.
+    """
+    return bool(
+        isinstance(context, dict)
+        and context.get("auction_feed_complete") is True
+        and context.get("auction_evidence_status") == "ok"
+        and context.get("auction_evidence_contract") == "auction_provenance_v1"
+    )
+
+
+def positive_number(value) -> bool:
+    if isinstance(value, (bool, bool_)):
+        return False
+    try:
+        return math.isfinite(float(value)) and float(value) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def volume_in_shares(value, unit) -> float | None:
+    """Convert declared units only; never infer hands/shares from magnitude."""
+    if not positive_number(value) or not isinstance(unit, str):
+        return None
+    multiplier = {"share": 1, "lot100": 100}.get(unit)
+    if multiplier is None:
+        return None
+    shares = float(value) * multiplier
+    return shares if math.isfinite(shares) else None
+
+
+def auction_evidence_status(row, *, decision_at=None, require_ratio=True) -> str:
+    """Validate original same-day provenance, also for historical read-only use.
+
+    Freshness is measured at original observation, not against today's clock.
+    A decision cutoff still rejects any evidence unavailable at that decision.
+    """
+    if row is None:
+        return "unknown"
+    source, receipt, observed = (
+        local_clock(getattr(row, key, None))
+        for key in ("source_quote_at", "received_at", "observed_at")
+    )
+    decision = local_clock(decision_at if decision_at is not None else datetime.now())
+    if decision is None:
+        return "unknown"
+    if any(value is not None and value > decision for value in (source, receipt, observed)):
+        return "future"
+    if any(value is None for value in (source, receipt, observed)):
+        return "unknown"
+    if not getattr(row, "source", None) or not getattr(row, "source_version", None):
+        return "unknown"
+    trade_date = getattr(row, "trade_date", None)
+    if (
+        any(value.date() != trade_date for value in (source, receipt, observed))
+        or not source <= receipt <= observed
+        or any(not time(9, 15) <= value.time() <= time(9, 25, 30)
+               for value in (source, receipt, observed))
+        or getattr(row, "auction_time", None) != observed.strftime("%H:%M:%S")
+    ):
+        return "invalid_clock"
+    max_age = settings.AUCTION_SOURCE_MAX_AGE_SEC
+    if not positive_number(max_age) or (observed - source).total_seconds() > max_age:
+        return "stale_source"
+    price_basis = getattr(row, "price_basis", None)
+    volume_basis = getattr(row, "volume_basis", None)
+    basis_ok = (
+        price_basis == "indicative_match"
+        and volume_basis == "indicative_matched"
+        and source.time() < time(9, 25)
+    ) or (
+        price_basis == "auction_opening"
+        and volume_basis == "auction_matched"
+        and source.time() >= time(9, 25)
+    )
+    if not basis_ok:
+        return "unverified_basis"
+    volume_unit = getattr(row, "volume_unit", None)
+    if (
+        not isinstance(volume_unit, str)
+        or volume_unit not in {"share", "lot100"}
+        or getattr(row, "amount_unit", None) != "CNY"
+    ):
+        return "unknown_unit"
+    fields = ["auction_price", "prev_close", "auction_volume", "auction_amount"]
+    if require_ratio:
+        fields.append("volume_ratio")
+    if not all(positive_number(getattr(row, key, None)) for key in fields):
+        return "incomplete_values"
+    # The quantity consumed by a path must remain finite after unit conversion.
+    # A positive raw lot count alone does not establish a usable share count.
+    if volume_in_shares(getattr(row, "auction_volume", None), volume_unit) is None:
+        return "incomplete_values"
+    return "ok"

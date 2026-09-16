@@ -1,0 +1,38 @@
+# === Claw 鹰爪量化交易系统 ===
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# 环境
+.env
+.env.*
+
+# 数据库
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# 日志
+*.log
+logs/
+
+# Git
+.git/
+.gitignore
+
+# 文档
+*.md
+!README.md
+
+# 工作目录
+.workbuddy/

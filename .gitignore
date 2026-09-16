@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+
+# Node
+node_modules/
+frontend/dist/
+
+# Logs and generated runtime market archives
+*.log
+logs/
+runtime/quote_rounds/
+
+# Coverage
+htmlcov/
+.coverage
+
+# ── 2026-09-16 建立 git 基线时补全 ──────────────────────────────────────
+# 原规则只写了 *.db / *.sqlite3，漏掉了同样属于「运行数据而非源码」的东西：
+#   * SQLite 旁挂文件（WAL/SHM）：活库 claw.db-wal 曾达 80MB，绝不能入库
+#   * *.sqlite：冻结复盘库 evidence.sqlite 有 803MB
+#   * outputs/：复盘证据与演练产物，单次可达 GB 级，不属于源码基线
+#   * 前端调试截图：tmp-*.png 累计十余 MB
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 运行数据 / 证据 / 临时产物
+outputs/
+.tmp/
+temp_test/
+test-results/
+.playwright-cli/
+tmp/
+
+# 调试截图
+frontend/tmp-*.png
+**/tmp-*.png
+/*.png
+kline-*.png
+sectors_*.png
+
+# 生成的缓存（非源码；.workbuddy/memory/ 等仍应入库）
+.workbuddy/stock_list_cache.json

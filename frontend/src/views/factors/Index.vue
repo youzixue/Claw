@@ -3,7 +3,7 @@
     <div class="page-shell factors-page">
       <div class="page-hero">
       <div>
-        <h2 class="page-title">⚙️ 因子引擎</h2>
+        <h2 class="page-title"><el-icon class="title-icon"><Cpu /></el-icon>因子引擎</h2>
         <div class="page-subtitle">统一查看因子概览、评估表现、实时计算结果与报告输出</div>
       </div>
       <div class="hero-chip">
@@ -28,7 +28,7 @@
             <el-table-column prop="name" label="因子名" min-width="150" />
             <el-table-column prop="direction" label="方向" width="80" align="center">
               <template #default="{ row }">
-                <el-tag :type="row.direction === 'positive' ? 'danger' : 'success'" size="small">{{ row.direction === 'positive' ? '正向' : '反向' }}</el-tag>
+                <el-tag :type="row.direction === 1 ? 'danger' : row.direction === -1 ? 'success' : 'info'" size="small">{{ row.direction === 1 ? '正向' : row.direction === -1 ? '反向' : '未知' }}</el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="description" label="描述" min-width="250" />
@@ -39,8 +39,12 @@
       <el-tab-pane label="因子评估" name="evaluate">
         <div class="panel-card">
           <div class="panel-title"><el-icon><DataAnalysis /></el-icon>因子评估</div>
-          <el-table :data="evalList" stripe size="small" empty-text="暂无数据">
+          <el-alert title="真实IC为因子与下一交易日收益的秩相关；旧排名自相关不再当作IC。结果仅供研究，不自动调权或晋级。" type="info" :closable="false" show-icon />
+          <div class="query-row"><el-button @click="refreshEvaluation" :loading="evaluating">刷新报告</el-button><el-button type="primary" @click="runEvaluation" :loading="evaluating">运行研究评估</el-button></div>
+          <el-table class="factor-eval-table" :data="evalList" stripe size="small" empty-text="暂无数据">
             <el-table-column prop="factor_name" label="因子" min-width="150" />
+            <el-table-column label="评估口径" min-width="130"><template #default="{ row }">{{ evaluationStatus(row.status) }}</template></el-table-column>
+            <el-table-column prop="sample_count" label="有效日期数" width="100" />
             <el-table-column prop="ic_mean" label="IC均值" width="90" align="right">
               <template #default="{ row }"><span :class="changeColorClass(row.ic_mean)">{{ row.ic_mean?.toFixed(4) || '--' }}</span></template>
             </el-table-column>
@@ -50,13 +54,13 @@
             <el-table-column prop="ir" label="IR" width="80" align="right">
               <template #default="{ row }"><span :class="row.ir >= 0.5 ? 'text-red' : ''">{{ row.ir?.toFixed(3) || '--' }}</span></template>
             </el-table-column>
-            <el-table-column prop="win_rate" label="胜率" width="80" align="center">
-              <template #default="{ row }">{{ row.win_rate ? (row.win_rate * 100).toFixed(1) + '%' : '--' }}</template>
+            <el-table-column prop="win_rate" label="IC正值占比" width="110" align="center">
+              <template #default="{ row }">{{ formatPercent(row.win_rate) }}</template>
             </el-table-column>
             <el-table-column prop="is_decaying" label="衰减" width="70" align="center">
               <template #default="{ row }">
-                <el-tag v-if="row.is_decaying" type="danger" size="small">⚠ 衰减</el-tag>
-                <span v-else class="text-gray">正常</span>
+                <el-tag v-if="row.is_decaying === true" type="danger" size="small">衰减</el-tag>
+                <span v-else class="text-gray">{{ row.is_decaying === false ? '正常' : '待评估' }}</span>
               </template>
             </el-table-column>
           </el-table>
@@ -77,11 +81,12 @@
             </el-table-column>
             <el-table-column prop="rank" label="排名" width="80" align="center" />
             <el-table-column prop="pct" label="百分位" width="80" align="center">
-              <template #default="{ row }"><span :class="row.pct >= 70 ? 'text-red' : row.pct <= 30 ? 'text-green' : ''">{{ row.pct?.toFixed(1) || '--' }}</span></template>
+              <template #default="{ row }"><span :class="Number.isFinite(row.pct) ? (row.pct >= 0.7 ? 'text-red' : row.pct <= 0.3 ? 'text-green' : '') : ''">{{ formatPercent(row.pct) }}</span></template>
             </el-table-column>
-            <el-table-column prop="confidence" label="置信度" width="80" align="center">
-              <template #default="{ row }">{{ row.confidence ? (row.confidence * 100).toFixed(0) + '%' : '--' }}</template>
+            <el-table-column prop="confidence" label="计算置信度" width="100" align="center">
+              <template #default="{ row }">{{ formatPercent(row.confidence, 0) }}</template>
             </el-table-column>
+            <el-table-column label="数据说明" min-width="200"><template #default="{ row }">{{ (row.meta?.input_issues || []).map(issue => `${issue.field}: ${issue.code}`).join('；') || (row.value == null ? '数据不足' : '计算有效，不代表预测概率') }}</template></el-table-column>
           </el-table>
         </div>
       </el-tab-pane>
@@ -104,7 +109,8 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { getFactorCategories, evaluateFactors, computeFactors, getFactorReport } from '@/api'
+import { getFactorCategories, evaluateFactors, computeFactors, getFactorReport, runDailyEvaluation } from '@/api'
+import { ElMessage } from 'element-plus'
 import { changeColorClass } from '@/composables/useUtils'
 
 const activeTab = ref('summary')
@@ -115,6 +121,45 @@ const computeCode = ref('')
 const computing = ref(false)
 const computeResult = ref([])
 const report = ref(null)
+const evaluating = ref(false)
+
+function formatPercent(value, digits = 1) {
+  return Number.isFinite(value) ? (value * 100).toFixed(digits) + '%' : '--'
+}
+function evaluationStatus(status) {
+  return ({ research_only: '真实收益IC·仅研究', legacy_not_ic: '旧排名自相关·非IC', insufficient_data: '样本不足' })[status] || '未评估'
+}
+function applyEvaluations(response) {
+  evalList.value = Object.entries(response?.results || {}).map(([name, result]) => ({
+    factor_name: name, status: result.status,
+    ...(result.ic_summary || {}),
+    win_rate: result.ic_summary?.ic_positive_rate,
+    is_decaying: result.decay?.is_decaying,
+  }))
+}
+async function refreshEvaluation() {
+  evaluating.value = true
+  try {
+    const [evaluations, latestReport] = await Promise.all([evaluateFactors(), getFactorReport()])
+    applyEvaluations(evaluations)
+    report.value = latestReport
+  } catch {
+    ElMessage.error('评估报告读取失败，未更改数据')
+  } finally {
+    evaluating.value = false
+  }
+}
+async function runEvaluation() {
+  evaluating.value = true
+  try {
+    await runDailyEvaluation()
+    await refreshEvaluation()
+  } catch {
+    ElMessage.error('研究评估失败，请检查数据与迁移状态')
+  } finally {
+    evaluating.value = false
+  }
+}
 
 const filteredFactors = computed(() => {
   if (!selectedCategory.value) return categories.value.flatMap(c => c.factors || [])
@@ -129,7 +174,10 @@ async function doCompute() {
     const res = await computeFactors(computeCode.value)
     const factors = res.factors || {}
     computeResult.value = Object.entries(factors).map(([name, v]) => ({ name, ...v }))
-  } catch { /* ignore */ }
+  } catch {
+    computeResult.value = []
+    ElMessage.error('因子计算失败，请检查股票代码和数据')
+  }
   computing.value = false
 }
 
@@ -137,7 +185,8 @@ onMounted(async () => {
   try {
     const [c, e, r] = await Promise.allSettled([getFactorCategories(), evaluateFactors(), getFactorReport()])
     if (c.status === 'fulfilled') categories.value = c.value.categories || []
-    if (e.status === 'fulfilled') evalList.value = Array.isArray(e.value) ? e.value : []
+    if (e.status === 'fulfilled') applyEvaluations(e.value)
+    else ElMessage.error('评估报告读取失败')
     if (r.status === 'fulfilled') report.value = r.value
   } catch { /* ignore */ }
 })
@@ -153,7 +202,9 @@ onMounted(async () => {
 .metric-head { color: var(--claw-text-muted); font-size: 13px; margin-bottom: 10px; }
 .panel-card { padding: 16px; }
 .panel-title { font-size: 14px; font-weight: 600; color: var(--claw-text); margin-bottom: 14px; }
-.query-row { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.query-row { display: flex; gap: 12px; margin-block: 12px 16px; flex-wrap: wrap; }
+:deep(.factor-eval-table .el-table__cell) { padding-inline: 0; }
+:deep(.factor-eval-table .cell) { white-space: nowrap; word-break: normal; padding-inline: 10px; }
 .report-panel { min-height: 220px; }
 .inner-report-card { border-radius: 12px; }
 .report-row { margin-bottom: 10px; line-height: 1.7; }

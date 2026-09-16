@@ -3,7 +3,7 @@
     <div class="page-shell performance-page">
       <div class="page-hero">
       <div>
-        <h2 class="page-title">🏆 绩效中心</h2>
+        <h2 class="page-title"><el-icon class="title-icon"><Trophy /></el-icon>绩效中心</h2>
         <div class="page-subtitle">统一查看信号统计、因子质量与单笔信号归因结果</div>
       </div>
       <div class="hero-chip">
@@ -44,8 +44,9 @@
       <el-tab-pane label="因子评估" name="factor-eval">
         <div class="panel-card">
           <div class="panel-title"><el-icon><Cpu /></el-icon>因子评估</div>
-          <el-table :data="factorEvalList" stripe size="small" empty-text="暂无数据">
+          <el-table class="factor-eval-table" :data="factorEvalList" stripe size="small" empty-text="暂无数据">
             <el-table-column prop="factor_name" label="因子" min-width="150" />
+            <el-table-column label="口径" min-width="130"><template #default="{ row }">{{ row.status === 'legacy_not_ic' ? '旧排名自相关·非IC' : row.status === 'research_only' ? '真实收益IC·仅研究' : '样本不足' }}</template></el-table-column>
             <el-table-column prop="ic_mean" label="IC" width="80" align="right">
               <template #default="{ row }">{{ row.ic_mean?.toFixed(4) || '--' }}</template>
             </el-table-column>
@@ -53,7 +54,7 @@
               <template #default="{ row }">{{ row.ir?.toFixed(3) || '--' }}</template>
             </el-table-column>
             <el-table-column prop="is_decaying" label="衰减" width="70" align="center">
-              <template #default="{ row }"><el-tag v-if="row.is_decaying" type="danger" size="small">是</el-tag><span v-else class="text-gray">否</span></template>
+              <template #default="{ row }"><el-tag v-if="row.is_decaying === true" type="danger" size="small">是</el-tag><span v-else class="text-gray">{{ row.is_decaying === false ? '否' : '待评估' }}</span></template>
             </el-table-column>
           </el-table>
         </div>
@@ -81,10 +82,11 @@
 <script setup>
 import { defineAsyncComponent, ref, computed, onMounted } from 'vue'
 const VChart = defineAsyncComponent(() => import('vue-echarts'))
-import { ensureEChartsRegistered } from '@/composables/echarts'
-ensureEChartsRegistered()
+import { ensurePieChartsRegistered } from '@/composables/echarts/pie'
 import { getSignalStats, getFactorEval, getSignalAttribution } from '@/api'
 import { formatChange, changeColorClass } from '@/composables/useUtils'
+
+ensurePieChartsRegistered()
 
 const activeTab = ref('distribution')
 const signalStats = ref({})
@@ -131,6 +133,8 @@ onMounted(async () => {
 .perf-stat-card { padding: 16px; background: var(--claw-bg-card); border: 1px solid var(--claw-border); border-radius: 14px; box-shadow: var(--claw-shadow-sm); }
 .metric-head { color: var(--claw-text-muted); font-size: 13px; margin-bottom: 10px; }
 .chart-panel { min-height: 390px; }
+:deep(.factor-eval-table .el-table__cell) { padding-inline: 0; }
+:deep(.factor-eval-table .cell) { white-space: nowrap; word-break: normal; padding-inline: 10px; }
 .query-row { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 :deep(.el-tabs__header) { margin-bottom: 18px; }
 :deep(.el-tabs__nav-wrap::after) { background: var(--claw-border-light); }
