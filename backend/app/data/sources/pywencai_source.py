@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.sources.base import DataSourceBase
 from app.core.data_quality import data_quality_guard
+from app.config.settings import settings
 
 import pywencai
 
@@ -41,6 +42,13 @@ class PyWencaiSource(DataSourceBase):
     async def _query(self, api_name: str, query: str, *, loop: bool = True) -> pd.DataFrame:
         """串行调用问财并重试其常见 ``None.get`` 暂态故障。"""
         last_error: Exception | None = None
+        # 问财要求登录会话才返回数据；cookie 从 settings（即 `.env`）读取。
+        # 仅在配置了非空值时才传 —— 库的 headers() 会把 None 原样当字符串
+        # 塞进 `cookie` 头（发出去是字面量 "None"），不传反而更干净。
+        extra: dict = {}
+        cookie = str(getattr(settings, "PYWENCAI_COOKIE", "") or "").strip()
+        if cookie:
+            extra["cookie"] = cookie
         for attempt in range(1, max(int(self.max_retries), 1) + 1):
             try:
                 async with self._query_lock:
@@ -49,6 +57,7 @@ class PyWencaiSource(DataSourceBase):
                         pywencai.get,
                         query=query,
                         loop=loop,
+                        **extra,
                     )
                 if result is None:
                     raise AttributeError("pywencai returned None instead of DataFrame")

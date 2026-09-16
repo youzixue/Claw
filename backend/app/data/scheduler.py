@@ -1657,9 +1657,17 @@ class DataScheduler:
         loop = asyncio.get_event_loop()
         queries = ("ST股", "停牌", "*ST股", "北交所ST股")
         import pywencai as _pw
+        # 问财自 2026-08 下旬起要求登录会话；cookie 从 settings（`.env`）读取。
+        # 仅在非空时才传：库的 headers() 会把 None 原样当字符串写进 cookie 头。
+        _pw_extra = {}
+        _pw_cookie = str(getattr(settings, "PYWENCAI_COOKIE", "") or "").strip()
+        if _pw_cookie:
+            _pw_extra["cookie"] = _pw_cookie
         try:
             frames = await asyncio.gather(*[
-                loop.run_in_executor(None, lambda q=q: _pw.get(query=q, loop=True))
+                loop.run_in_executor(
+                    None, lambda q=q: _pw.get(query=q, loop=True, **_pw_extra)
+                )
                 for q in queries
             ])
             if any(not isinstance(frame, pd.DataFrame) for frame in frames):

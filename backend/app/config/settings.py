@@ -103,6 +103,12 @@ class Settings(BaseSettings):
     FUND_FLOW_CONCEPT_WAIT_TIMEOUT_SEC: float = 1.0
     # pywencai
     PYWENCAI_RATE_LIMIT: float = 2.0
+    # 问财自 2026-08 下旬起要求**登录会话**才返回数据：未登录时接口返回
+    # 401+captcha_url 或 403 Access Denied，库随即在 `params.get('data')`
+    # 抛出 `'NoneType' object has no attribute 'get'`。
+    # pywencai.get() 支持 `cookie=` 并会写进请求头，故这里透传登录后的 cookie 串。
+    # 凭据只放 `.env`（已 gitignore），不得写进仓库、日志或测试。
+    PYWENCAI_COOKIE: str = ""
     # 申万
     SW_RATE_LIMIT: float = 0.2
     # 新浪
