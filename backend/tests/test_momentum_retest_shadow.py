@@ -909,3 +909,161 @@ def test_consumer_watermark_model_shape():
     assert pk == ["trade_date"]
     for column in ("route_id", "route_version", "observed_at", "round_id", "updated_at"):
         assert column in MomentumRetestConsumerWatermark.__table__.columns
+
+
+# =========================================================================
+# 放宽风控（2026-09-17，用户授权「避免踏空行情」）
+#
+# 原语义：`coverage_blocked` 是**当日终态** —— 一次缺口/重启/开盘前已强势
+# 就整天出局。实测 09-16 有 2,821 条 quote_gap（幻影占 84%，已由水位修复），
+# 09-15 另有 79 条「09:35 前已进 3% 强势区」与 29 条 91~111 秒真缺口。
+#
+# 新语义：解除需**同时**满足「连续性已恢复」+「重新观察到武装低点」，
+# 并丢弃缺口前全部路径证据、重走完整链路。下列用例钉住两侧。
+# =========================================================================
+
+
+def _to_coverage_blocked(*, code: str = "600001"):
+    """把股票推到 coverage_blocked（靠一次超阈值缺口），返回引擎与阻断时刻。"""
+    engine = MomentumRetestShadowEngine(_policy())
+    engine.observe_batch([_quote(10.20, 2.0, 18_000_000, code=code)],
+                         datetime(2026, 9, 16, 9, 40), {code})
+    blocked_at = datetime(2026, 9, 16, 9, 50)   # 与上帧隔 600s > 180s
+    engine.observe_batch([_quote(10.20, 2.0, 18_000_000, code=code)], blocked_at, {code})
+    assert engine.states[code].stage == "coverage_blocked", engine.states[code].stage
+    return engine, blocked_at
+
+
+def test_coverage_blocked_is_released_after_fresh_rearm():
+    """① 连续性恢复 + 观察到武装低点 ⇒ 解除，且当天可继续参与。"""
+    engine, blocked_at = _to_coverage_blocked()
+    # 释放帧距阻断帧 60s < 90s（测试策略阈值）—— 连续性已恢复
+    engine.observe_batch(
+        [_quote(10.15, 1.5, 18_000_000)], blocked_at + timedelta(seconds=60), {"600001"}
+    )
+    state = engine.states["600001"]
+    assert state.stage != "coverage_blocked", "应已解除"
+    events = engine.pending_events()
+    released = [e for e in events if e["event_type"] == "coverage_block_rearm"]
+    assert released, events
+    # 解除事件发出时状态为 unseen（同帧内随后才依据武装线转为 armed）——
+    # 故断言最终状态，而不是解除事件的瞬时 status。
+    assert state.stage == "armed", state.stage
+    assert any(e["event_type"] == "armed" for e in events), events
+    assert state.terminal_reason == ""
+
+
+def test_coverage_blocked_is_not_released_by_rising_without_rearm():
+    """② **关键保证**：只上涨、没有重新武装观察 ⇒ 不得解除。
+
+    否则「缺口期间已发生的首次回踩」会被后续回踩冒充 —— 正是原设计要防的。
+    """
+    engine, blocked_at = _to_coverage_blocked()
+    engine.observe_batch(
+        [_quote(10.55, 5.5, 25_000_000)], blocked_at + timedelta(seconds=60), {"600001"}
+    )
+    assert engine.states["600001"].stage == "coverage_blocked"
+    assert not any(e["event_type"] == "coverage_block_rearm" for e in engine.pending_events())
+
+
+def test_coverage_blocked_is_not_released_while_continuity_still_broken():
+    """③ 连续性仍未恢复（本帧同样超阈值）⇒ 不得解除。"""
+    engine, blocked_at = _to_coverage_blocked()
+    engine.observe_batch(
+        [_quote(10.15, 1.5, 18_000_000)],
+        blocked_at + timedelta(seconds=1800),      # 又断了 30 分钟
+        {"600001"},
+    )
+    assert engine.states["600001"].stage == "coverage_blocked"
+
+
+def test_coverage_block_release_can_be_disabled_to_restore_original_semantics():
+    """④ 开关关闭 ⇒ 回到原「当日永久终态」语义（可回滚）。"""
+    policy = _policy()
+    object.__setattr__(policy, "allow_coverage_block_rearm", False)
+    engine = MomentumRetestShadowEngine(policy)
+    engine.observe_batch([_quote(10.20, 2.0, 18_000_000)], datetime(2026, 9, 16, 9, 40), {"600001"})
+    engine.observe_batch([_quote(10.20, 2.0, 18_000_000)], datetime(2026, 9, 16, 9, 50), {"600001"})
+    assert engine.states["600001"].stage == "coverage_blocked"
+    engine.observe_batch([_quote(10.15, 1.5, 18_000_000)], datetime(2026, 9, 16, 9, 52), {"600001"})
+    assert engine.states["600001"].stage == "coverage_blocked", "开关关闭时必须保持终态"
+
+
+def test_release_discards_path_evidence_from_before_the_gap():
+    """⑤ 解除必须**丢弃**缺口前证据 —— 不能拿旧峰值/旧轨迹继续证明。"""
+    engine, blocked_at = _to_coverage_blocked()
+    state = engine.states["600001"]
+    assert state.quote_history                       # 缺口前有轨迹
+    engine.observe_batch(
+        [_quote(10.15, 1.5, 18_000_000)], blocked_at + timedelta(seconds=60), {"600001"}
+    )
+    state = engine.states["600001"]
+    assert len(state.quote_history) == 1, "只应保留解除当帧，旧轨迹须清空"
+    assert state.observation_count == 1
+    assert state.saw_below_rearm is True
+    assert state.band_seen_before_start is False
+
+
+def test_band_before_route_start_block_is_also_releasable():
+    """⑥ E3：09:35 前已进 3% 强势区不再当日永久出局，同样靠重新武装解除。
+
+    注意必须逐帧喂满 09:30→09:35：测试策略阈值 90s，跨 5 分钟会先触发
+    quote_gap 而非 band 阻断，那样测的就不是这条分支了。
+    """
+    engine = MomentumRetestShadowEngine(_policy())
+    code = "600001"
+    base = datetime(2026, 9, 16, 9, 30)
+    # 09:30 起就在 3~6% 带内，每 80s 一帧（<90s 阈值），全部早于 09:35
+    for offset in (0, 80, 160, 240):
+        engine.observe_batch(
+            [_quote(10.40, 4.0, 22_000_000, code=code)],
+            base + timedelta(seconds=offset),
+            {code},
+        )
+    assert engine.states[code].band_seen_before_start is True
+    # 09:35:20 首次过 09:35 -> 触发「09:35前已进强势区」终态阻断
+    engine.observe_batch([_quote(10.42, 4.2, 23_000_000, code=code)],
+                         base + timedelta(seconds=320), {code})
+    assert engine.states[code].stage == "coverage_blocked"
+    assert engine.states[code].terminal_reason.startswith("09:35前")
+
+    # 70s 后回落到武装线下方 -> 重新武装并解除
+    engine.observe_batch([_quote(10.10, 1.0, 18_000_000, code=code)],
+                         base + timedelta(seconds=390), {code})
+    assert engine.states[code].stage == "armed", engine.states[code].stage
+
+
+def test_gap_threshold_default_is_widened_to_180():
+    """⑦ E4：阈值默认放宽到 180s（实测盘中抖动可达 91~111s）。"""
+    from app.config.settings import settings
+    from app.paper.momentum_retest_shadow import MomentumRetestPolicy
+
+    assert settings.PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC == 180
+    assert MomentumRetestPolicy.from_settings().max_quote_gap_sec == 180
+
+
+def test_release_default_is_enabled_and_configurable():
+    from app.config.settings import settings
+    from app.paper.momentum_retest_shadow import MomentumRetestPolicy
+
+    assert settings.PAPER_MOMENTUM_RETEST_ALLOW_COVERAGE_BLOCK_REARM is True
+    assert MomentumRetestPolicy.from_settings().allow_coverage_block_rearm is True
+
+
+def test_other_terminal_states_still_ignore_subsequent_frames():
+    """⑧ 行为保持：把终态判定挪到 gap 计算之后，不得让 confirmed 等开始更新状态。
+
+    原先判定在 gap 计算之前、且在 `last_at`/`observation_count` 赋值之前
+    （即直接丢弃后续帧）；本次重构后仍必须如此。
+    """
+    engine = _run_confirmed_path()
+    state = engine.states["600001"]
+    assert state.stage == "confirmed", state.stage
+    before = (state.last_at, state.observation_count, len(state.quote_history))
+
+    later = state.last_at + timedelta(minutes=3)
+    engine.observe_batch([_quote(10.90, 9.0, 60_000_000)], later, {"600001"})
+
+    assert state.stage == "confirmed"
+    assert (state.last_at, state.observation_count, len(state.quote_history)) == before, \
+        "终态不得被后续帧改写"

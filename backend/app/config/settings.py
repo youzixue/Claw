@@ -372,7 +372,16 @@ class Settings(BaseSettings):
     PAPER_MOMENTUM_RETEST_MIN_ORDERBOOK_IMBALANCE: float = -0.2
     PAPER_MOMENTUM_RETEST_MAX_WITHDRAWAL_RATIO: float = 0.5
     PAPER_MOMENTUM_RETEST_MAX_VWAP_BREAK_PCT: float = 0.2
-    PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC: int = 90
+    # 2026-09-17：90 -> 180。实测各交易日 `quote_round` 相邻轮次间隔中位 30s，
+    # 但盘中确有 91~111s 的真实抖动（09-09 有 17 次 >90s、09-15 有 29 次
+    # 91~111s 的 quote_gap 阻断）。90s 只容 3 轮，刚好卡在这些正常抖动之外；
+    # 180s 容 6 轮，覆盖实测最大值且留余量。用户授权「放宽风控避免踏空」。
+    # 注意交易时段边界（09:24→09:30 的 361s、午休 11:29→13:00）不属此类：
+    # 午休已在 `trading_elapsed_seconds` 里冻结，开盘边界由引擎的窗口判定处理。
+    PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC: int = 180
+    # 允许 `coverage_blocked` 在「连续性恢复 + 重新观察到武装低点」时解除，
+    # 不再当日永久出局。置 False 回到原终态语义。
+    PAPER_MOMENTUM_RETEST_ALLOW_COVERAGE_BLOCK_REARM: bool = True
     # 仅缓存前向采集的A2证据帧；超过上限必须显式阻断路径，不能静默合并。
     PAPER_MOMENTUM_RETEST_QUOTE_INBOX_MAX_BATCHES: int = 6
     PAPER_MOMENTUM_RETEST_MIN_TRACK_SEC: int = 60

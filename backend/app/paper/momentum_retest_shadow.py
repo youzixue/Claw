@@ -146,6 +146,10 @@ class MomentumRetestPolicy:
     min_track_sec: int
     max_track_sec: int
     max_confirm_wait_sec: int
+    # 2026-09-17 新增（用户授权「放宽风控避免踏空」）：允许 `coverage_blocked`
+    # 在「连续性恢复且重新观察到武装低点」时解除。默认 True；置 False 即回到
+    # 原先的当日永久终态。见 `_maybe_release_coverage_block`。
+    allow_coverage_block_rearm: bool = True
 
     @classmethod
     def from_settings(cls) -> "MomentumRetestPolicy":
@@ -224,6 +228,9 @@ class MomentumRetestPolicy:
             max_quote_gap_sec=max(
                 int(settings.PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC),
                 1,
+            ),
+            allow_coverage_block_rearm=bool(
+                settings.PAPER_MOMENTUM_RETEST_ALLOW_COVERAGE_BLOCK_REARM
             ),
             min_track_sec=max(
                 int(settings.PAPER_MOMENTUM_RETEST_MIN_TRACK_SEC),
@@ -488,6 +495,67 @@ class MomentumRetestShadowEngine:
         """供上层持久化的消费者水位；None 表示本轮之后尚无有效消费记录。"""
         return self._consumer_watermark
 
+    def _maybe_release_coverage_block(
+        self,
+        state: MomentumRetestState,
+        quote: Mapping[str, Any],
+        observed_at: datetime,
+        change_pct: float,
+        quote_gap_sec: float,
+    ) -> bool:
+        """`coverage_blocked` 是否可在本帧解除；返回 True 表示继续走状态机。
+
+        背景（2026-09-17，用户授权「放宽风控避免踏空」）
+        ------------------------------------------------
+        原先 `coverage_blocked` 是**当日终态**：一只股票一旦因缺口/重启/开盘前
+        已强势而被记一次，就整天出局。实测 2026-09-16 有 2,821 条 `quote_gap`
+        阻断（其中幻影缺口占 84%，已由消费者水位修复），2026-09-15 另有
+        79 条 `entered_band_before_route_start` 与 29 条 91~111 秒的真缺口。
+
+        **解除条件刻意很严**，两个都要满足：
+        1. 本帧涨幅 ≤ 重新武装线（`rearm_max_change_pct`）—— 即真实观察到一次
+           「还没起来」的低点；
+        2. 本帧连续性通过（`quote_gap_sec <= max_quote_gap_sec`）。
+
+        满足后**丢弃缺口前的全部路径证据**（`quote_history`、
+        `saw_below_rearm`、`band_seen_before_start`），并重置为 `unseen`，
+        使解除后必须重走「武装 → 进 3~6% 带 → 回踩 → 收复」完整链路。
+
+        **为什么这不算把「首次」放水**：解除后确认的首次回踩，其武装低点就发生
+        在本帧；任何在缺口期间发生的回踩都在这次武装观察**之前**，因此不可能被
+        后续回踩冒充 —— 正是代码原先要防的那件事。代价是**缺口期间那一次机会
+        确实错过**（本来就观察不到），换来的是**当天后续仍可参与**。
+
+        与 `_hydrate_engine` 的 `restore()` 也不冲突：重启后 `candidate/pullback`
+        仍被置为 `interrupted` 并立即阻断，只有重新武装才解除。
+        """
+        if state.stage != "coverage_blocked":
+            return False
+        if not self.policy.allow_coverage_block_rearm:
+            return False
+        if quote_gap_sec > self.policy.max_quote_gap_sec:
+            return False
+        if change_pct > self.policy.rearm_max_change_pct:
+            return False
+
+        blocked_reason = state.terminal_reason
+        state.stage = "unseen"
+        state.terminal_reason = ""
+        state.saw_below_rearm = True
+        state.band_seen_before_start = False
+        state.quote_history.clear()
+        state.observation_count = 0
+        # 允许重新武装 —— 但保留已发过的 coverage_blocked（不重复记）。
+        state.event_types.discard("armed")
+        self._emit(state, quote, observed_at, "coverage_block_rearm", extra={
+            "reason": "连续性已恢复且重新观察到武装低点，解除当日终态并重置路径证据",
+            "released_from": blocked_reason,
+            "rearm_change_pct": change_pct,
+            "quote_gap_sec": _round(quote_gap_sec, 1),
+            "max_quote_gap_sec": self.policy.max_quote_gap_sec,
+        })
+        return True
+
     def observe_quote(
         self,
         quote: Mapping[str, Any],
@@ -507,8 +575,6 @@ class MomentumRetestShadowEngine:
             state = MomentumRetestState(code=code, name=name, trade_date=observed_at.date())
             self._states[code] = state
         if state.last_at is not None and observed_at <= state.last_at:
-            return
-        if state.stage in TERMINAL_STAGES:
             return
         previous_at = state.last_at
         # P0 幻影缺口修正（2026-09-17）：重启后首批帧里，`last_at` 来自快照，
@@ -540,6 +606,16 @@ class MomentumRetestShadowEngine:
             if baseline_at is not None and baseline_at.date() == observed_at.date()
             else 0.0
         )
+
+        # 终态判定放在 gap 计算之后：`coverage_blocked` 需要知道连续性是否已恢复
+        # 才能决定是否解除（见 `_maybe_release_coverage_block`）。其他终态
+        # （confirmed/invalidated/expired）仍与原来一样直接返回，且**不**更新
+        # `last_at`/`observation_count`（返回点在下方赋值之前），行为不变。
+        if state.stage in TERMINAL_STAGES:
+            if not self._maybe_release_coverage_block(
+                state, quote, observed_at, change_pct, quote_gap_sec
+            ):
+                return
 
         state.name = name
         state.observation_count += 1
