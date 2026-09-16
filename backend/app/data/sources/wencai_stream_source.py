@@ -35,7 +35,8 @@ pywencai 的模型是「一次 POST → 解析 JSON → DataFrame」，因此**�
   `_update_stock_status` 既有的「列表缺席不是风险解除证据」语义一致。
 * 只读：本模块不写任何业务表、不下单、不调用交易接口。
 * 列名保持**原始中文 key**（含日期后缀列），由上层解析器决定如何映射，
-  避免在本层固化易变的上游字段名。
+  避免在本层固化易变的上游字段名；但**值的形状**必须还原成旧 pywencai 的
+  字符串契约（见 `normalize_list_columns`），否则下游 `str(list)` 会静默写脏数据。
 """
 from __future__ import annotations
 
@@ -60,6 +61,14 @@ AGENT_NAME = ""
 DEFAULT_PERPAGE = 50
 # 形如 `涨停原因[20260916]` —— 列名带交易日后缀，逐日变化
 _DATED_COLUMN = re.compile(r"\[(\d{8})\]$")
+# 多值列连接符：必须与旧 pywencai 契约逐字一致（下游按 `;` 切分概念）。
+_LIST_SEPARATOR = ";"
+# 同花顺三级行业用 `-` 连接（`医药生物-中药-中药Ⅲ`），与 SectorInfo 口径一致。
+_INDUSTRY_SEPARATOR = "-"
+_INDUSTRY_COLUMN = "所属同花顺行业"
+_CONCEPT_COLUMN = "所属概念"
+# 上游/历史数据里的占位值，一律不得成为板块名（库内曾有 `pw_concept_None`）。
+_PLACEHOLDER_VALUES = frozenset({"", "none", "nan", "null", "nat", "n/a", "-"})
 
 
 class WencaiStreamError(RuntimeError):
@@ -143,6 +152,83 @@ def extract_table(stream_text: str) -> dict[str, Any] | None:
     return None
 
 
+def _clean_part(item: Any) -> str:
+    """清洗多值字段的单个元素，剔除上游占位值。
+
+    历史教训：旧路径用 ``str(row.get("所属概念"))`` 直接落库，把 Python ``None``
+    写成了概念名 ``None``（``stock_sector_mapping`` 内实存 16 条
+    ``pw_concept_None``）。这类占位值必须在此拦截，不能进下游板块池。
+    """
+    if item is None:
+        return ""
+    if isinstance(item, float) and pd.isna(item):
+        return ""
+    text = str(item).strip()
+    return "" if text.lower() in _PLACEHOLDER_VALUES else text
+
+
+def _join_multi(value: Any, separator: str = _LIST_SEPARATOR) -> Any:
+    """把上游数组型多值字段连接成字符串；非数组原样返回。"""
+    if isinstance(value, (list, tuple, set)):
+        return separator.join(part for part in map(_clean_part, value) if part)
+    return value
+
+
+def normalize_list_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """把上游的数组型多值列还原成**旧 pywencai 的字符串契约**。
+
+    为什么必须还原（2026-09-17 实测，见 tests/test_wencai_field_contract.py）：
+      * 上游把 `所属同花顺行业` / `所属概念` 作为 JSON 数组返回，经 pandas 变成
+        Python ``list``；旧 pywencai 返回的是**字符串**。
+      * 下游 scheduler 用 ``str(row.get("所属同花顺行业"))`` 直接拼
+        ``f"pw_industry_{...}"`` 当作 ``sector_code``。拿到 list 时会得到
+        ``pw_industry_['机械设备', '专用设备', '能源及重型设备']`` ——
+        **每股一个唯一 sector_code**，把 264 个行业炸成 5574 个假板块，
+        并同时污染 ``stock_sector_mapping`` 与 ``SectorInfo``。
+      * 概念同理：旧契约以 ``;`` 分隔、下游 ``split(";")``，list 不会被切分。
+
+    行业：``['机械设备','专用设备','能源及重型设备']`` →
+    ``机械设备-专用设备-能源及重型设备``
+    概念：剔除上游**掺入的行业三级名**后以 ``;`` 连接。剔除依据：7.5 万条历史
+    映射实测旧契约「概念集 ∩ 行业集 = 0」（行业 L3 257 个同样 0 交集）。
+    """
+    if frame.empty:
+        return frame
+    industry_drop: list[set[str]] = []
+    if _INDUSTRY_COLUMN in frame.columns:
+        for value in frame[_INDUSTRY_COLUMN]:
+            industry_drop.append(
+                {_clean_part(part) for part in value} - {""}
+                if isinstance(value, (list, tuple, set))
+                else set()
+            )
+        frame[_INDUSTRY_COLUMN] = pd.Series(
+            [_join_multi(v, _INDUSTRY_SEPARATOR) for v in frame[_INDUSTRY_COLUMN]],
+            index=frame.index,
+        )
+    if _CONCEPT_COLUMN in frame.columns:
+        cleaned = []
+        for position, value in enumerate(frame[_CONCEPT_COLUMN]):
+            if not isinstance(value, (list, tuple, set)):
+                cleaned.append(value)
+                continue
+            drop = industry_drop[position] if position < len(industry_drop) else set()
+            cleaned.append(
+                _join_multi([c for c in value if _clean_part(c) not in drop])
+            )
+        frame[_CONCEPT_COLUMN] = pd.Series(cleaned, index=frame.index)
+    # 兜底：上游新增的其它数组型列，同样连接成字符串，避免下游拿到 list 的 repr。
+    for column in frame.columns:
+        if column in (_INDUSTRY_COLUMN, _CONCEPT_COLUMN):
+            continue
+        values = frame[column]
+        if any(isinstance(v, (list, tuple, set)) for v in values):
+            frame[column] = pd.Series(
+                [_join_multi(v) for v in values], index=frame.index
+            )
+    return frame
+
+
 def _to_frame(data: dict[str, Any]) -> pd.DataFrame:
     rows = data.get("datas") or []
     frame = pd.DataFrame(rows)
@@ -151,6 +237,8 @@ def _to_frame(data: dict[str, Any]) -> pd.DataFrame:
     # 读的也是它；这里补一列以维持同一契约，避免每个调用方各自适配。
     if "股票代码" not in frame.columns and "code" in frame.columns:
         frame["股票代码"] = frame["code"]
+    # 值的形状也必须还原成旧契约（上游多值字段是数组）——否则下游静默写脏数据。
+    frame = normalize_list_columns(frame)
     frame.attrs["code_count"] = int(data.get("code_count") or 0)
     frame.attrs["row_count"] = int(data.get("row_count") or len(rows))
     frame.attrs["chunks_info"] = data.get("chunks_info") or ""
