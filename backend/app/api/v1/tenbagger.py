@@ -1540,6 +1540,35 @@ def _format_sector_line(sector: dict) -> str:
     )
 
 
+def _format_reference_hint(factors: list[dict]) -> str:
+    """无因果主驱动时，把最强参考板块压成一行，供单元格直接显示。
+
+    参考板块此前只经 `reference_driver_lines` 进入前端 **hover tooltip**，
+    表格里那格只写「暂无明确主驱动」—— 看不出该股所属板块当日是涨是跌、
+    资金是进是出。银行/水电/煤炭这类低波动大盘股常年落在这条分支上
+    （产业板块当日没同步转强），单元格就长期只有一句无信息量的占位文案。
+
+    这里只补**提示文本**：
+    * 不改变 `driver_primary` 的语义（仍是「没有因果主驱动」）；
+    * 不参与任何买点/推送门槛（那四个门槛各自要求 `fund_flow > 0`，见
+      `tenbagger._has_positive_driver_sector` 等）；
+    * 参考板块本来就已排除泛标签（`is_excluded=1`）与申万数字代码，
+      所以这里显示的一定是产业/题材板块，不会是「沪股通」这类。
+    """
+    if not factors:
+        return ""
+    top = factors[0]
+    name = str(top.get("sector_name") or "").strip()
+    if not name:
+        return ""
+    return (
+        f"无因果主驱动 · 参考：{name} "
+        f"{_safe_float(top.get('change_pct')):+.2f}%／"
+        f"资金{_safe_float(top.get('fund_flow')):+.2f}亿"
+        + (f"（共{len(factors)}个，悬停查看）" if len(factors) > 1 else "")
+    )
+
+
 def _format_sector_peer_line(item: dict) -> str:
     leaders = item.get("leaders") or []
     if not leaders:
@@ -1684,7 +1713,12 @@ def _build_aggregated_anomaly_row(items: list[dict]) -> dict:
         f"资金{('+' if _safe_float(driver_primary.get('fund_flow')) >= 0 else '')}{_safe_float(driver_primary.get('fund_flow')):.2f}亿 · "
         f"强度{round(_safe_float(driver_primary.get('strength_score')))}"
         if driver_primary
-        else "暂无明确主驱动，先看个股盘口与量价确认"
+        # 无因果主驱动时，把最强参考板块提到副标题 —— 否则单元格只有一句
+        # 「暂无明确主驱动」，看不出该股所属板块当日到底什么状态（参考板块
+        # 此前只出现在 hover tooltip 的 `reference_driver_lines` 里）。
+        # 纯展示：`driver_primary` 语义不变，也不参与任何买点门槛。
+        else _format_reference_hint(reference_factors)
+        or "暂无明确主驱动，先看个股盘口与量价确认"
     )
     driver_peer_summary = _format_sector_peer_line(sector_components[0]) if sector_components else ""
 

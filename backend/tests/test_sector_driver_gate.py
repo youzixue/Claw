@@ -195,3 +195,62 @@ def test_scanner_and_gate_deliberately_differ():
     from app.api.v1.tenbagger import _has_positive_driver_sector
 
     assert _has_positive_driver_sector({"sector_factors": [industry_up_but_outflow]}) is False
+
+
+# ---------- 无主驱动时单元格必须仍有信息量 ----------
+
+
+@pytest.mark.parametrize(
+    "factors,expected_fragment",
+    [
+        (
+            [
+                {"sector_name": "跨境支付(CIPS)", "change_pct": -0.21, "fund_flow": -6.82},
+                {"sector_name": "银行-银行-国有大型银行", "change_pct": -0.73, "fund_flow": -0.98},
+            ],
+            "跨境支付(CIPS) -0.21%／资金-6.82亿",
+        ),
+        (
+            [{"sector_name": "绿色电力", "change_pct": 0.88, "fund_flow": -17.8}],
+            "绿色电力 +0.88%／资金-17.80亿",
+        ),
+    ],
+)
+def test_reference_hint_shows_sector_state(factors, expected_fragment):
+    """无因果主驱动时，副标题要给出参考板块的涨跌与资金，而不是只有占位文案。"""
+    from app.api.v1.tenbagger import _format_reference_hint
+
+    out = _format_reference_hint(factors)
+    assert expected_fragment in out
+    assert out.startswith("无因果主驱动 · 参考：")
+
+
+def test_reference_hint_mentions_more_when_multiple():
+    from app.api.v1.tenbagger import _format_reference_hint
+
+    two = [
+        {"sector_name": "A概念", "change_pct": 1.0, "fund_flow": -1.0},
+        {"sector_name": "B概念", "change_pct": 0.5, "fund_flow": -2.0},
+    ]
+    assert "共2个" in _format_reference_hint(two)
+    assert "共" not in _format_reference_hint(two[:1])
+
+
+def test_reference_hint_empty_when_nothing_to_show():
+    """没有参考板块、或参考板块无名字时返回空串，让调用方保留原文案。"""
+    from app.api.v1.tenbagger import _format_reference_hint
+
+    assert _format_reference_hint([]) == ""
+    assert _format_reference_hint([{"sector_name": "", "change_pct": 1.0}]) == ""
+    assert _format_reference_hint(None) == ""
+
+
+def test_reference_hint_falls_back_to_original_copy():
+    """副标题表达式：有主驱动用指标串，无主驱动优先参考板块，最后才是原文案。"""
+    import inspect
+
+    from app.api.v1 import tenbagger
+
+    source = inspect.getsource(tenbagger._build_aggregated_anomaly_row)
+    assert "_format_reference_hint(reference_factors)" in source
+    assert "or \"暂无明确主驱动，先看个股盘口与量价确认\"" in source
