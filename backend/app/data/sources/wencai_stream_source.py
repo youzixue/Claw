@@ -168,10 +168,24 @@ def _clean_part(item: Any) -> str:
 
 
 def _join_multi(value: Any, separator: str = _LIST_SEPARATOR) -> Any:
-    """把上游数组型多值字段连接成字符串；非数组原样返回。"""
-    if isinstance(value, (list, tuple, set)):
-        return separator.join(part for part in map(_clean_part, value) if part)
-    return value
+    """把上游数组型多值字段连接成字符串；非数组原样返回。
+
+    **去重**（保持首次出现顺序）。行业/概念是集合语义 —— 库内本就有
+    ``UNIQUE(code, sector_code, source)``，一只股票不会"两次属于"同一概念。
+    上游确实会给出行内重复：实测 5574 行中 149 行有重复元素
+    （如 ``601208.SH`` 的 27 个概念含 1 个重复）。不去重会让下游
+    ``concept_counts[c] += 1`` 重复计数，抬高 ``SectorInfo.stock_count``。
+    """
+    if not isinstance(value, (list, tuple, set)):
+        return value
+    seen: set[str] = set()
+    parts: list[str] = []
+    for item in value:
+        part = _clean_part(item)
+        if part and part not in seen:
+            seen.add(part)
+            parts.append(part)
+    return separator.join(parts)
 
 
 def normalize_list_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -187,6 +201,14 @@ def normalize_list_columns(frame: pd.DataFrame) -> pd.DataFrame:
         并同时污染 ``stock_sector_mapping`` 与 ``SectorInfo``。
       * 概念同理：旧契约以 ``;`` 分隔、下游 ``split(";")``，list 不会被切分。
 
+    一对一 / 一对多语义：
+      * `所属同花顺行业` 是该股**唯一**的一级/二级/三级分类，恒为 3 元
+        （实测 5574/5574 精确 3 元，无嵌套）。故不是"多行业"字段；
+        长度偏离即上游口径变更，抛错而不是拼出 ``A-B-C-D-E-F`` 假板块名。
+      * `所属概念` 是**一对多**：每股平均 13.6 个，剔除行业名并去重后
+        以 ``;`` 连接，下游按 ``;`` 切分后为每个概念生成一条
+        ``stock_sector_mapping`` 记录（全 A 股约 7.5 万条）。
+
     行业：``['机械设备','专用设备','能源及重型设备']`` →
     ``机械设备-专用设备-能源及重型设备``
     概念：剔除上游**掺入的行业三级名**后以 ``;`` 连接。剔除依据：7.5 万条历史
@@ -196,12 +218,21 @@ def normalize_list_columns(frame: pd.DataFrame) -> pd.DataFrame:
         return frame
     industry_drop: list[set[str]] = []
     if _INDUSTRY_COLUMN in frame.columns:
-        for value in frame[_INDUSTRY_COLUMN]:
-            industry_drop.append(
-                {_clean_part(part) for part in value} - {""}
-                if isinstance(value, (list, tuple, set))
-                else set()
-            )
+        for position, value in enumerate(frame[_INDUSTRY_COLUMN]):
+            if not isinstance(value, (list, tuple, set)):
+                industry_drop.append(set())
+                continue
+            parts = [part for part in map(_clean_part, value) if part]
+            if parts and len(parts) != 3:
+                # 拒绝放行：下游只会用「一个」行业字符串生成一条记录，
+                # 长度 >3 时会被拼成 `A-B-C-D-E-F` 这种不存在的板块名并写进
+                # SectorInfo（同类污染 2026-09-17 已发生过一次）。
+                raise WencaiStreamError(
+                    f"{_INDUSTRY_COLUMN} 应为 1 个三级分类(3 元)，实际 {len(parts)} 元"
+                    f"（第 {position} 行: {parts[:6]}）；上游分类口径可能已变更，"
+                    f"拒绝写入垃圾板块名"
+                )
+            industry_drop.append(set(parts))
         frame[_INDUSTRY_COLUMN] = pd.Series(
             [_join_multi(v, _INDUSTRY_SEPARATOR) for v in frame[_INDUSTRY_COLUMN]],
             index=frame.index,

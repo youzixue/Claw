@@ -31,6 +31,7 @@ from app.data.sources.wencai_stream_source import (
     _INDUSTRY_COLUMN,
     _LIST_SEPARATOR,
     _to_frame,
+    WencaiStreamError,
     normalize_list_columns,
 )
 
@@ -60,9 +61,9 @@ def test_industry_string_passthrough_unchanged():
 
 
 def test_industry_parts_are_stripped():
-    frame = _frame(**{_INDUSTRY_COLUMN: [[" 计算机 ", " IT服务 ", ""]]})
+    frame = _frame(**{_INDUSTRY_COLUMN: [[" 计算机 ", " IT服务 ", " IT服务Ⅲ "]]})
     out = normalize_list_columns(frame)
-    assert out[_INDUSTRY_COLUMN].iloc[0] == "计算机-IT服务"
+    assert out[_INDUSTRY_COLUMN].iloc[0] == "计算机-IT服务-IT服务Ⅲ"
 
 
 def test_industry_none_and_nan_preserved():
@@ -97,9 +98,10 @@ def test_placeholder_elements_are_dropped():
 
 
 def test_placeholder_in_industry_is_dropped():
-    frame = _frame(**{_INDUSTRY_COLUMN: [["电子", None, "半导体材料"]]})
+    """占位值被清洗掉，剩下的 3 个真实层级仍然通过 3 元守卫。"""
+    frame = _frame(**{_INDUSTRY_COLUMN: [["电子", None, "半导体", "半导体材料"]]})
     out = normalize_list_columns(frame)
-    assert out[_INDUSTRY_COLUMN].iloc[0] == "电子-半导体材料"
+    assert out[_INDUSTRY_COLUMN].iloc[0] == "电子-半导体-半导体材料"
 
 
 # ---------- 概念：list -> 剔除行业三级 -> ";" 连接 ----------
@@ -175,6 +177,94 @@ def test_multi_row_industry_drop_is_row_aligned():
     assert out[_CONCEPT_COLUMN].iloc[0] == "芯片概念;中药"
     # 第 1 行：只剔除「医药生物」；「电子」属于第 0 行行业，必须保留
     assert out[_CONCEPT_COLUMN].iloc[1] == "创新药;电子"
+
+
+# ---------- 一对多 / 去重 / 行业层级守卫 ----------
+
+
+def test_concept_duplicates_are_deduped_order_preserving():
+    """上游确有行内重复（5574 行中 149 行）；不去重会让 stock_count 重复计数。"""
+    frame = _frame(**{_CONCEPT_COLUMN: [["融资融券", "芯片概念", "融资融券", "军工"]]})
+    out = normalize_list_columns(frame)
+    assert out[_CONCEPT_COLUMN].iloc[0] == "融资融券;芯片概念;军工"
+    assert out[_CONCEPT_COLUMN].iloc[0].split(";").count("融资融券") == 1
+
+
+def test_industry_duplicates_are_deduped():
+    frame = _frame(**{_INDUSTRY_COLUMN: [["电子", "半导体", "半导体"]]})
+    out = normalize_list_columns(frame)
+    assert out[_INDUSTRY_COLUMN].iloc[0] == "电子-半导体"
+
+
+def test_one_stock_maps_to_many_concepts():
+    """1:N —— N 个概念必须产出 N 条映射记录，不能被截断。"""
+    concepts = [f"概念{i}" for i in range(30)]
+    frame = _frame(
+        **{
+            _INDUSTRY_COLUMN: [["电子", "半导体", "半导体材料"]],
+            _CONCEPT_COLUMN: [concepts],
+        }
+    )
+    out = normalize_list_columns(frame)
+    parts = [c for c in out[_CONCEPT_COLUMN].iloc[0].split(";") if c]
+    assert len(parts) == 30
+    assert parts == concepts
+
+
+def test_multi_stock_multi_concept_row_alignment():
+    """多股票 × 多概念：每行的概念数必须与自己的一致，不得错行。"""
+    frame = _frame(
+        **{
+            _INDUSTRY_COLUMN: [
+                ["电子", "半导体", "半导体材料"],
+                ["医药生物", "中药", "中药Ⅲ"],
+                ["计算机", "IT服务", "IT服务Ⅲ"],
+            ],
+            _CONCEPT_COLUMN: [
+                ["A", "B"],
+                ["C", "D", "E", "F"],
+                ["G"],
+            ],
+        }
+    )
+    out = normalize_list_columns(frame)
+    counts = [len([c for c in str(v).split(";") if c]) for v in out[_CONCEPT_COLUMN]]
+    assert counts == [2, 4, 1]
+
+
+def test_industry_multiple_hierarchies_raises_instead_of_garbage():
+    """6 元（= 2 个三级层级）说明上游口径变了，必须抛错而不是拼成 A-B-C-D-E-F。"""
+    frame = _frame(
+        **{
+            _INDUSTRY_COLUMN: [
+                ["电子", "半导体", "半导体材料", "计算机", "IT服务", "IT服务Ⅲ"]
+            ]
+        }
+    )
+    with pytest.raises(WencaiStreamError, match="三级分类"):
+        normalize_list_columns(frame)
+
+
+@pytest.mark.parametrize("bad", [["电子"], ["电子", "半导体"], ["a", "b", "c", "d"]])
+def test_industry_non_three_length_raises(bad):
+    frame = _frame(**{_INDUSTRY_COLUMN: [bad]})
+    with pytest.raises(WencaiStreamError):
+        normalize_list_columns(frame)
+
+
+def test_industry_empty_list_is_allowed():
+    """空行业 = 该股无行业分类，应降级为空串而不是抛错。"""
+    frame = _frame(**{_INDUSTRY_COLUMN: [[]], _CONCEPT_COLUMN: [["A"]]})
+    out = normalize_list_columns(frame)
+    assert out[_INDUSTRY_COLUMN].iloc[0] == ""
+    assert out[_CONCEPT_COLUMN].iloc[0] == "A"
+
+
+def test_industry_all_placeholders_is_allowed():
+    """全占位值清洗后为空 -> 视为无行业，不触发长度守卫。"""
+    frame = _frame(**{_INDUSTRY_COLUMN: [[None, "nan", ""]]})
+    out = normalize_list_columns(frame)
+    assert out[_INDUSTRY_COLUMN].iloc[0] == ""
 
 
 # ---------- 兜底与其他数组列 ----------
