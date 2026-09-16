@@ -1,14 +1,14 @@
 """个股日K线 全量回填命令 — stock_kline init backfill
 
 功能:
-1. 从pywencai获取全A股列表(自动过滤退市股/停牌/*ST, 对接StockTag体系)
+1. 从库内 StockTag/黑名单 取全A股列表(排除退市股/停牌/*ST)
 2. 跳过已有K线的股票(断点续传)
 3. 并发采集(可调), 批量UPSERT写入DB
 4. 进度持久化(支持Ctrl+C恢复)
 5. 采集后数据校验(字段完整性+派生字段正确性)
 
 用法:
-  # 默认模式: pywencai获取股票列表 + 过滤ST/停牌/退市 + 跳过已有 + 并发10
+  # 默认模式: 库内股票列表 + 过滤ST/停牌/退市 + 跳过已有 + 并发10
   python scripts/backfill_kline.py
   
   # 指定并发数和批次大小
@@ -24,10 +24,10 @@
   python scripts/backfill_kline.py --dry-run --codes 000001,000333,600036 --limit 3
 
 数据源:
-  - 股票列表+行业概念: pywencai.get("全部A股 所属同花顺行业...", loop=True) → ~5197只
-  - 停牌过滤: pywencai.get("停牌", loop=True)
-  - ST过滤: pywencai.get("ST股", loop=True)
-  - 退市过滤: pywencai.get("*ST股", loop=True) + 名称关键词
+  - 股票列表/停牌/ST/退市: 库内 StockTag + stock_blacklist(不联网取列表)
+  - K线: 同花顺 httpx 直连(需登录 cookie)
+  - 注: 旧 pywencai 库自 2026-08 下旬起完全失效(上游改 SSE 流)。
+        本脚本从未 import 该库，上文曾误述取数来源，2026-09-17 审计时更正。
 
 过滤规则(对接stock_tagger体系):
 - ❌ 排除: 停牌(suspended)、*ST退市风险、名称含"退/终止上市/摘牌"
@@ -151,20 +151,20 @@ def save_progress(progress: dict):
 
 
 # ============================================================================
-# 股票列表获取 — 复用 PyWencaiSource (对接stock_tagger体系)
+# 股票列表获取 — 问财(WencaiStreamSource) + StockTag 体系
 # ============================================================================
 
 async def fetch_pywencai_stocks() -> list[dict]:
     """从pywencai获取全A股列表 + 停牌/ST/退市过滤
     
-    复用 backend/app/data/sources/pywencai_source.py 的 PyWencaiSource 类,
-    与调度器完全一致的数据源和过滤逻辑.
-    
-    关键: pywencai返回列[11]="code" 是纯6位代码(如"000988"), 无需解析!
-    列[0]="股票代码" 含后缀(如"000988.SZ"), 不能直接zfill(6).
+    复用 `app.data.sources.wencai_stream_source.WencaiStreamSource`，
+    与调度器完全一致的数据源和过滤逻辑。
+
+    关键: 返回列 "code" 是纯6位代码(如"000988")，无需解析；
+    而 "股票代码" 含后缀(如"000988.SZ")，不能直接 zfill(6)。
     
     流程:
-      1. PyWencaiSource.get_stock_industry_mapping() → 全A股~5197只
+      1. 问财 `全部A股 所属同花顺行业 所属概念 ...` → 全A股约5574只
       2. 用列[11]"code" 提取6位代码
       3. 并行查询停牌 + ST股 + *ST → 代码集合
       4. 按board_tag过滤(排除blocked=退市/*ST, suspended=停牌)
@@ -189,14 +189,20 @@ async def fetch_pywencai_stocks() -> list[dict]:
             pass
 
     # --- 导入项目源 ---
+    # 2026-09-17：旧 `pywencai` 库自 8 月下旬改 SSE 流后完全失效，
+    # `PyWencaiSource` 已废弃（其 `_query` 现在失败即报错）。
+    # 改用 `WencaiStreamSource`，问句逐字沿用旧方法的问句。
     sys.path.insert(0, str(PROJECT_ROOT / "backend"))
-    from app.data.sources.pywencai_source import PyWencaiSource
+    from app.data.sources.wencai_stream_source import WencaiStreamSource
 
-    source = PyWencaiSource()
+    source = WencaiStreamSource()
 
-    # 1. 全行业映射 (loop=True自动分页全量~5197条)
-    logger.info("pywencai获取股票列表(含停牌+ST过滤)...")
-    df_all = await source.get_stock_industry_mapping()
+    # 1. 全行业映射（perpage 必须给足，全 A 股约 5574 只）
+    logger.info("问财获取股票列表(含停牌+ST过滤)...")
+    df_all = await source.query_async(
+        "全部A股 所属同花顺行业 所属概念 涨跌幅 市盈率 市净率 换手率 成交量 成交额 最新dde大单净额 总市值",
+        perpage=10000,
+    )
 
     if df_all is None or len(df_all) == 0:
         raise RuntimeError("pywencai返回空数据")
@@ -220,10 +226,10 @@ async def fetch_pywencai_stocks() -> list[dict]:
 
     # 兜底: 如果没有独立code列, 从raw提取
     if not code_col and raw_code_col:
-        logger.warning("pywencai无'code'列, 从'股票代码'提取")
+        logger.warning("问财无'code'列, 从'股票代码'提取")
         # 后续在循环中处理 .SZ/.SH 后缀
 
-    logger.info(f"pywencai返回 {len(df_all)} 只股票 "
+    logger.info(f"问财返回 {len(df_all)} 只股票 "
                 f"(code={code_col}, name={name_col}, price={price_col})")
 
     stocks = []
@@ -258,20 +264,20 @@ async def fetch_pywencai_stocks() -> list[dict]:
             "is_suspended": False,
         })
 
-    # 3. 并行获取 停牌 + ST + *ST退市风险 名单 (复用PyWencaiSource方法)
+    # 3. 串行获取 停牌 + ST + *ST退市风险 名单（问句与旧方法一致）
     suspended_set: set[str] = set()
     st_set: set[str] = set()
     delist_risk_set: set[str] = set()
 
     tasks_data = [
-        ("停牌", source.get_suspended_stocks, suspended_set),
-        ("ST股", source.get_st_stocks, st_set),
-        ("*ST股", source.get_delisting_risk_stocks, delist_risk_set),
+        ("停牌", "停牌", suspended_set),
+        ("ST股", "ST股", st_set),
+        ("*ST股", "*ST股", delist_risk_set),
     ]
 
-    for label, fn, target_set in tasks_data:
+    for label, question, target_set in tasks_data:
         try:
-            df = await fn()
+            df = await source.query_async(question, perpage=2000)
             if df is not None and len(df) > 0:
                 ccol = [c for c in df.columns if "代码" in c]
                 if ccol:
@@ -279,7 +285,7 @@ async def fetch_pywencai_stocks() -> list[dict]:
                         c = str(v).split(".")[0].strip().zfill(6)
                         if len(c) == 6 and c.isdigit():
                             target_set.add(c)
-                logger.info(f"pywencai {label}: {len(target_set)}只")
+                logger.info(f"问财 {label}: {len(target_set)}只")
         except Exception as e:
             logger.warning(f"获取{label}名单失败: {e}")
 
@@ -662,7 +668,7 @@ async def run_backfill(
         cached = load_cached_stocks()
         
         if cached is None:
-            logger.info("pywencai获取股票列表(含停牌+ST过滤)...")
+            logger.info("问财获取股票列表(含停牌+ST过滤)...")
             stocks_list = await fetch_pywencai_stocks()
             save_cached_stocks(stocks_list)
         else:
@@ -685,7 +691,7 @@ async def run_backfill(
         blocked_n = sum(1 for s in stocks_list if s["board_tag"] == "blocked")
         susp_n = sum(1 for s in stocks_list if s["is_suspended"])
         
-        logger.info(f"pywencai统计: 可交易={tradeable_n} | 观察={observe_n} | "
+        logger.info(f"问财统计: 可交易={tradeable_n} | 观察={observe_n} | "
                    f"退市/*ST={blocked_n} | 停牌={susp_n}")
         logger.info(f"回填目标: {len(all_codes)}只 (正常交易+观察, 含停牌股历史K线, 排除退市)")
 
@@ -856,7 +862,7 @@ async def run_backfill(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claw 个股日K线 全量回填工具 (pywencai股票列表 + 同花顺K线源)",
+        description="Claw 个股日K线 全量回填工具 (问财股票列表 + 同花顺K线源)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 数据源:

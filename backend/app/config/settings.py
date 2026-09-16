@@ -106,7 +106,8 @@ class Settings(BaseSettings):
     # 问财自 2026-08 下旬起要求**登录会话**才返回数据：未登录时接口返回
     # 401+captcha_url 或 403 Access Denied，库随即在 `params.get('data')`
     # 抛出 `'NoneType' object has no attribute 'get'`。
-    # pywencai.get() 支持 `cookie=` 并会写进请求头，故这里透传登录后的 cookie 串。
+    # 问财要求登录会话才返回数据（未登录时 401，或数据层返回 code_count=0）。
+    # 该 cookie 由 `WencaiStreamSource` 写进 SSE 请求头；
     # 凭据只放 `.env`（已 gitignore），不得写进仓库、日志或测试。
     PYWENCAI_COOKIE: str = ""
     # 申万

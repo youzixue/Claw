@@ -7,8 +7,8 @@ asyncpg==0.29.0
 pydantic==2.9.2
 pydantic-settings==2.5.2
 akshare==1.18.54
-pywencai==0.13.1
 pandas==2.2.3
+pywencai==0.13.1
 pyarrow==23.0.1
 numpy==2.1.1
 scipy==1.17.1

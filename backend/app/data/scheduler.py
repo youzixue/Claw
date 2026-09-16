@@ -26,6 +26,7 @@ from app.core.trade_calendar import trade_calendar
 from app.core.data_quality import data_quality_guard
 from app.core.process_awake import ProcessAwakeGuard
 from app.data.pipeline_runtime import JOB_EVENT_MASK, PipelineRuntimeHealth
+from app.data.sector_exclusions import is_excluded_concept
 from app.core.stock_tagger import stock_tagger
 from app.data.sources.akshare_source import AkShareSource
 from app.data.sources.eastmoney_source import EastMoneySource
@@ -1955,6 +1956,14 @@ class DataScheduler:
                             "sector_type": "concept",
                             "source": "pywencai",
                             "stock_count": concept_counts.get(con_name, 0),
+                            # 无业务关联概念（融资融券/指数成分/财报预告类等）不展示在
+                            # 板块营地。规则与 `scripts/collect_pywencai_sectors.py`
+                            # 共用 `app.data.sector_exclusions` 一份 —— 该脚本此前是
+                            # 唯一写入方，改由本路径写入后若不带上，新概念会以列默认
+                            # is_excluded=0 建库并漏进营地（实测 `2026中报预增`）。
+                            "is_excluded": (
+                                1 if is_excluded_concept(con_name) else 0
+                            ),
                         })
                     await self._upsert_sector_info(session, records)
                     logger.info(f"pywencai概念板块写入: {len(records)}个")
@@ -3015,8 +3024,11 @@ class DataScheduler:
                     "全部A股 所属同花顺行业 所属概念", perpage=10000,
                     ttl_sec=12 * 3600,
                 )
-                # pywencai.get("全部A股 所属同花顺行业 所属概念") 返回列:
-                #   股票代码, 股票简称, 所属同花顺行业, 所属概念(多个逗号分隔)
+                # `WencaiStreamSource` 返回列（2026-09-17 实测）:
+                #   所属同花顺行业(三级全称 `A-B-C`), 所属概念(`;` 分隔),
+                #   股票代码/股票简称/code/上市板块/上市地点
+                # 注意：上游原始值是 JSON 数组，已在 `_to_frame` 内由
+                # `normalize_list_columns` 还原成旧 pywencai 的字符串契约。
                 if df is not None and len(df) > 0:
                     mapping_records = []
                     for _, row in df.iterrows():

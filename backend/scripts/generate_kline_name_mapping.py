@@ -18,11 +18,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import akshare as ak
-import pywencai
+import pandas as pd
 from loguru import logger
 from sqlalchemy import select, and_, update
 
-from app.core.db import async_session, init_db
+from app.db.session import async_session, init_db  # 2026-09-17: app.core.db 已不存在
+from app.data.sources.wencai_stream_source import WencaiStreamSource
 from app.models.stock import SectorInfo
 
 
@@ -212,25 +213,35 @@ async def main(dry_run: bool = False):
     ak_ind_names = set(ths_ind['name'].tolist())
     logger.info(f"  AkShare行业: {len(ak_ind_names)}个")
     
-    # 2. 获取pywencai概念和行业
-    logger.info("获取pywencai概念...")
-    pyw_con = pywencai.get(query='概念板块', loop=True)
-    con_names = set()
-    for _, row in pyw_con.iterrows():
-        concepts = str(row.get('所属概念', '')).split(';')
-        for c in concepts:
-            c = c.strip()
-            if c and c != 'None':
-                con_names.add(c)
-    logger.info(f"  pywencai概念: {len(con_names)}个")
-    
-    logger.info("获取pywencai行业...")
-    pyw_ind = pywencai.get(query='同花顺行业级别3', loop=True)
-    pyw_ind['行业二级'] = pyw_ind['所属同花顺行业'].apply(
-        lambda x: str(x).split('-')[1] if '-' in str(x) else str(x)
+    # 2. 获取问财概念和行业
+    # 2026-09-17：旧 `pywencai` 库自 8 月下旬起完全失效（上游改 SSE 流），
+    # 改用 `WencaiStreamSource`。两处列名随之变化，均已按实测对齐：
+    #   * `概念板块` 问句在新源下返回**概念指数清单**，概念名在 `指数简称`
+    #     （旧列名 `所属概念` 不存在 —— 不改会静默得到空集）。
+    #     实测 390 个指数简称与库内 pywencai 概念板块交集 388 个，口径一致。
+    #   * `同花顺行业级别3` 在新源下只给三级名 `所属同花顺三级行业`
+    #     （不含 `一级-二级-三级`），无法再 `split('-')[1]` 取二级。
+    #     改为用标准映射问句的 `所属同花顺行业`（`A-B-C` 全称）取二级，
+    #     与 `scheduler._premarket` / `collect_pywencai_sectors.py` 同口径。
+    logger.info("获取问财概念(概念指数清单)...")
+    pyw_con = WencaiStreamSource().query('概念板块', perpage=1000)
+    con_names = {
+        str(name).strip()
+        for name in pyw_con.get('指数简称', pd.Series(dtype=object)).dropna()
+        if str(name).strip()
+    }
+    logger.info(f"  问财概念: {len(con_names)}个")
+
+    logger.info("获取问财行业(三级全称)...")
+    pyw_ind = WencaiStreamSource().query(
+        '全部A股 所属同花顺行业 所属概念', perpage=10000
     )
-    ind_l2_names = set(pyw_ind['行业二级'].unique())
-    logger.info(f"  pywencai行业二级: {len(ind_l2_names)}个")
+    ind_l2_names = {
+        str(value).split('-')[1].strip()
+        for value in pyw_ind.get('所属同花顺行业', pd.Series(dtype=object)).dropna()
+        if '-' in str(value)
+    }
+    logger.info(f"  问财行业二级: {len(ind_l2_names)}个")
     
     # 3. 构建映射
     mapping = build_name_mapping(ak_con_names, ak_ind_names, con_names, ind_l2_names)

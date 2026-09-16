@@ -1,4 +1,4 @@
-"""从pywencai采集全量行业/概念板块列表写入SectorInfo
+"""从问财采集全量行业/概念板块列表写入SectorInfo
 
 口径: 257个三级行业 + 389个概念(从个股映射去重)
 用法: python3 scripts/collect_pywencai_sectors.py
@@ -11,37 +11,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pywencai
+from app.data.sources.wencai_stream_source import WencaiStreamSource
 import pandas as pd
 from sqlalchemy import select, func
 from app.db.session import async_session, init_db
 from app.models.stock import SectorInfo
-
-# 无业务关联的概念板块, 采集时自动标记排除(不展示在板块营地)
-EXCLUDED_CONCEPTS = {
-    "融资融券", "沪股通", "深股通", "证金持股", "国家大基金持股",
-    "ST板块", "新股与次新股", "注册制次新股", "科创次新股",
-    "回购增持再贷款概念", "同花顺果指数", "同花顺漂亮100", "同花顺中特估100",
-    "同花顺出海50", "同花顺新质50", "中国AI 50",
-    "摘帽", "股权转让(并购重组)", "兵装重组概念", "高股息精选", "超级品牌",
-    "专精特新", "独角兽概念", "央企国企改革", "国企改革",
-    "上海国企改革", "深圳国企改革", "中字头股票", "中芯国际概念", "中船系",
-    "参股保险", "参股券商", "参股银行", "信托概念", "期货概念", "PPP概念",
-}
-# 年报/季报预增类板块(年更, 名称随年份变化) — 模式匹配
-EXCLUDED_PATTERNS = ["预增", "预减", "预盈", "预亏"]
+# 排除规则已上移到 app 层，与调度器盘前写入路径共用同一份口径。
+# 2026-09-17 起概念板块由调度器写入（本脚本不再经过），若各留一份会漂移。
+from app.data.sector_exclusions import is_excluded_concept
 
 
 async def collect():
     await init_db()
     
-    # ===== 1. pywencai全量采集 =====
-    print("=== pywencai全量采集(约45秒) ===")
+    # ===== 1. 问财全量采集 =====
+    # 2026-09-17：旧 `pywencai` 库自 8 月下旬起完全失效（上游改 SSE 流），
+    # 改用 `WencaiStreamSource`（同一问句）。`perpage` 必须给足 —— 默认 50
+    # 只会拿到首页 N 条，全 A 股约 5574 只。
+    print("=== 问财全量采集(约10-20秒) ===")
     t0 = time.time()
-    df = pywencai.get(
-        query="全部A股 所属同花顺行业 所属概念",
-        query_type="stock",
-        loop=True,  # 关键: 自动分页获取全量
+    df = WencaiStreamSource().query(
+        "全部A股 所属同花顺行业 所属概念",
+        perpage=10000,
     )
     elapsed = time.time() - t0
     print(f"采集完成: {len(df)}条个股, 耗时{elapsed:.1f}秒")
@@ -119,7 +110,7 @@ async def collect():
             con_name = str(con_name).strip()
             sector_code = f"pw_concept_{con_name}"
             # 检查是否在排除名单(无业务关联板块)
-            is_exc = con_name in EXCLUDED_CONCEPTS or any(p in con_name for p in EXCLUDED_PATTERNS)
+            is_exc = is_excluded_concept(con_name)
             existing = await session.execute(
                 select(SectorInfo).where(SectorInfo.sector_code == sector_code)
             )

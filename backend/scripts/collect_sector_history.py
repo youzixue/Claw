@@ -1,4 +1,18 @@
-"""板块历史数据采集 — pywencai统一口径
+"""板块历史数据采集 — 问财统一口径
+
+⚠️ 本脚本当前**不可运行**（2026-09-17 审计），原因与取数源无关：
+   它写入的 `SectorLeader` / `SectorLimitUpDetail` 两个模型已从代码库移除，
+   对应表 `sector_leader` / `sector_limit_up_detail` 在库中也不存在
+   （实测 2026-09-17 已确认）。第 43-46 行的 import 会直接
+   `ImportError: cannot import name 'SectorLeader'`。
+   要恢复必须先确认这两个模型/表是被哪个模块取代了，不能只改 import。
+
+   取数层已顺带迁到 `WencaiStreamSource`（旧 pywencai 库自 2026-08 下旬
+   改 SSE 流后完全失效），本模块的列读取全部走 `_find_col` 模糊匹配，
+   天然兼容带日期后缀与新的多值列形状，故恢复模型后取数层可直接使用。
+
+   日常的板块生命周期采集由调度器承担（`scheduler` 的板块任务），
+   本脚本仅为一次性历史回填工具。
 
 采集内容(概念+行业):
 1. 涨停池(含连板数) → 计算生命周期状态
@@ -7,7 +21,7 @@
 4. 连板梯队 → 龙头股/梯队结构
 
 历史范围: 近60个交易日
-数据源: pywencai(loop=True全量)
+数据源: 问财(WencaiStreamSource, 需 `.env` 的 PYWENCAI_COOKIE)
 
 写入表:
 - SectorLifecycle: 板块生命周期状态
@@ -32,7 +46,7 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pywencai
+from app.data.sources.wencai_stream_source import WencaiStreamSource
 import pandas as pd
 from loguru import logger
 from sqlalchemy import select, and_, func, delete
@@ -60,12 +74,16 @@ def get_recent_trade_dates(n: int = 60, end_date: date = None) -> list[date]:
     return list(reversed(dates))
 
 
-# ===== pywencai 采集 =====
+# ===== 问财采集 =====
+# 2026-09-17：旧 `pywencai` 库自 8 月下旬起完全失效（上游改 SSE 流），
+# 改用 `WencaiStreamSource`。本模块的列读取全部走 `_find_col` 模糊匹配，
+# 天然兼容带日期后缀的列名与新的多值列形状，故只需替换取数层。
+# 注意 `perpage` 必须给足：默认 50 只拿首页 N 条。
 
 def collect_limit_up() -> pd.DataFrame:
     """涨停池(含连板数)"""
     try:
-        df = pywencai.get(query="涨停 连板数", query_type="stock", loop=True)
+        df = WencaiStreamSource().query("涨停 连板数", perpage=1000)
         return df
     except Exception as e:
         logger.error(f"涨停池采集失败: {e}")
@@ -75,7 +93,7 @@ def collect_limit_up() -> pd.DataFrame:
 def collect_broken_limit() -> pd.DataFrame:
     """炸板池"""
     try:
-        df = pywencai.get(query="炸板", query_type="stock", loop=True)
+        df = WencaiStreamSource().query("炸板", perpage=1000)
         return df
     except Exception as e:
         logger.error(f"炸板池采集失败: {e}")
@@ -85,7 +103,7 @@ def collect_broken_limit() -> pd.DataFrame:
 def collect_limit_down() -> pd.DataFrame:
     """跌停池"""
     try:
-        df = pywencai.get(query="跌停 连续跌停", query_type="stock", loop=True)
+        df = WencaiStreamSource().query("跌停 连续跌停", perpage=1000)
         return df
     except Exception as e:
         logger.error(f"跌停池采集失败: {e}")
@@ -95,10 +113,9 @@ def collect_limit_down() -> pd.DataFrame:
 def collect_stock_mapping() -> pd.DataFrame:
     """全量个股→行业+概念映射"""
     try:
-        df = pywencai.get(
-            query="全部A股 所属同花顺行业 所属概念 涨跌幅 市盈率 市净率 换手率 成交量 成交额 最新dde大单净额 总市值",
-            query_type="stock",
-            loop=True,
+        df = WencaiStreamSource().query(
+            "全部A股 所属同花顺行业 所属概念 涨跌幅 市盈率 市净率 换手率 成交量 成交额 最新dde大单净额 总市值",
+            perpage=10000,
         )
         return df
     except Exception as e:

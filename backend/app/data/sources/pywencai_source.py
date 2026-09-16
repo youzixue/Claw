@@ -1,8 +1,24 @@
-"""pywencai数据源 — 问财(核心映射+选股)
+"""问财(pywencai)数据源 —— **已废弃，仅保留 health_check**
 
-关键: pywencai.get() 必须传 loop=True 才能自动分页获取全量数据!
-不传 loop 默认只返回第一页100条, 这就是之前行业/概念数量不全的根因。
-全量采集5197条约需45秒(每页100条, 52页自动循环)
+2026-09-17 全仓审计结论
+-----------------------
+生产链路已全部改走 `app.data.sources.wencai_stream_source.WencaiStreamSource`，
+本类只剩 `health_check` 一个存活入口（由 `scheduler._quality_check` 遍历
+`_sources` 时调用），而它也已改为探测新流式源。
+
+旧 `pywencai` 库不可用的根因**不是版本旧**，而是上游换协议：
+* 旧：`POST /customized/chart/get-robot-data` → JSON
+* 新：`POST /gateway/aime/stream-query` → SSE 流
+旧库的「一次 POST → 解析 JSON」模型无论怎么升级都无法工作。
+
+因此本类所有走 `_query` 的方法（行业映射/涨停池/跌停池/炸板池/连板梯队/
+概念成分/行业成分/ST/停牌/退市/北交所ST/custom_query/板块聚合）现在
+**失败即报错**，而不是重试到耗尽后返回空表 —— 空表会被下游当成
+「今天没有涨停股」。它们本就只能经 `collect()` 到达，而 `collect()`
+全仓零调用。
+
+`import pywencai` 已移除（本类不再引用该库）；`requirements.txt` 中的
+`pywencai==0.13.1` 随之可去掉。
 """
 
 import asyncio
@@ -16,9 +32,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.data.sources.base import DataSourceBase
 from app.core.data_quality import data_quality_guard
 from app.config.settings import settings
-
-import pywencai
-
 
 class PyWencaiSource(DataSourceBase):
     """pywencai数据源 (via 问财)
