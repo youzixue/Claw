@@ -14,6 +14,7 @@ from typing import Optional
 import pandas as pd
 from loguru import logger
 from sqlalchemy import and_, desc, func, or_, select, delete
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import OperationalError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -464,6 +465,18 @@ def _calculate_market_sentiment_state(
 STOCK_STATUS_ALERT_MARKER = "stock_tags 风险标签流水线中断"
 # 连续失败达到该次数即视为"不是偶发抖动"，需要人看（该任务每交易日 08:25 跑一次）。
 STOCK_STATUS_ALERT_THRESHOLD = 2
+
+# 汇总告警（2026-09-16）：扫 data_source_health 里所有持续失败的 (source, api)。
+# 阈值取 3 —— 与 record_failure 里「连续 3 次标记 down」的口径一致。
+SOURCE_ALERT_FAIL_STREAK = 3
+# 同一 (source, api) 每小时最多报一次，避免每 5 分钟刷屏把告警淹掉 ——
+# 这正是当初 2,626 次失败没能引起注意的原因。
+SOURCE_ALERT_REPEAT_SEC = 3600
+# 只对「近期仍在写入」的记录告警。该表是追加式历史，停止探测的端点会
+# 留下 fail_streak 很大但 updated_at 冻结的旧行；不按时间过滤会把
+# 「已不再探测」误报成「正在失败」。1 小时 = 12 个探测周期。
+SOURCE_ALERT_MAX_AGE_SEC = 3600
+_SOURCE_ALERT_LAST: dict[str, float] = {}
 
 
 async def _stock_status_fail_streak(session: AsyncSession) -> int:
@@ -3242,6 +3255,54 @@ class DataScheduler:
                         logger.warning(f"⚠️ 数据源 {name} 健康检查失败")
                 except Exception as e:
                     logger.error(f"数据源 {name} 健康检查异常: {e}")
+            # 2026-09-16 新增：汇总式静默失效告警。
+            # 上面的逐源检查只覆盖「在 _sources 里且被主动探测」的源；
+            # pywencai/query_limit_up 曾连续失败 2,626 次、stock_tags 冻结 16 天，
+            # 都是「一直在报错但没人汇总」才拖那么久。这里按 fail_streak 统一
+            # 扫一遍，把「持续失败」升级为带 [ALERT] 标记的显式告警。
+            try:
+                await self._alert_persistently_failing_sources(session)
+            except Exception as exc:            # noqa: BLE001 — 告警失败不影响检查
+                logger.warning(f"[ALERT] 汇总告警扫描自身失败: {exc}")
+
+    async def _alert_persistently_failing_sources(self, session: AsyncSession) -> int:
+        """把「连续失败达到阈值」的数据源打成 [ALERT]，按 (source,api) 每小时去重。
+
+        取每个 (source, api_name) 的最新一行判断现状 —— 该表是**追加式的健康
+        历史**（每次成功/失败各追加一行），最新行才代表当前状态；这与
+        `record_failure` 内部读取 `order_by(id.desc()).limit(1)` 的方式一致。
+        必须同时要求该行**是近期写入的**：`data_source_health` 是追加式历史，
+        早已停止探测的端点会留下一条 fail_streak 很大但时间冻结的旧行
+        （如 eastmoney/health_check 停在 2026-09-02、streak=3512）。
+        不按时间过滤就会把「已不再探测」误报成「正在失败」。
+        """
+        result = await session.execute(sa_text(
+            "SELECT source, api_name, status, fail_streak FROM ("
+            "  SELECT source, api_name, status, fail_streak, updated_at,"
+            "         ROW_NUMBER() OVER (PARTITION BY source, api_name"
+            "                            ORDER BY id DESC) AS rn"
+            "  FROM data_source_health"
+            ") WHERE rn = 1 AND fail_streak >= :threshold"
+            "  AND updated_at >= :since"
+        ), {
+            "threshold": SOURCE_ALERT_FAIL_STREAK,
+            "since": datetime.now() - timedelta(seconds=SOURCE_ALERT_MAX_AGE_SEC),
+        })
+
+        now = _time.monotonic()
+        alerted = 0
+        for source, api_name, status, streak in result.all():
+            key = f"{source}/{api_name}"
+            if now - _SOURCE_ALERT_LAST.get(key, 0.0) < SOURCE_ALERT_REPEAT_SEC:
+                continue
+            _SOURCE_ALERT_LAST[key] = now
+            alerted += 1
+            logger.error(
+                f"[ALERT] 数据源持续失败：{key} 已连续失败 {streak} 次"
+                f"（状态 {status}）。该端点数据在此期间不可用，依赖它的功能"
+                f"会静默降级或失败关闭，请检查。"
+            )
+        return alerted
 
     # =========================================================================
     # DataFrame 解析器 (AkShare列名 → ORM字段映射)
