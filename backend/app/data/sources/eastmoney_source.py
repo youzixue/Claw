@@ -310,10 +310,25 @@ class EastMoneySource(DataSourceBase):
             return pd.DataFrame()
 
     async def health_check_endpoints(self, session: AsyncSession) -> dict[str, bool]:
-        """按端点记录健康，避免资金流单点故障把涨停池也误报为不可用。"""
+        """按端点记录健康，避免资金流单点故障把涨停池也误报为不可用。
+
+        2026-09-16：移除 ``market_fund_flow`` 探测。该端点依赖 akshare 的
+        ``ak.stock_market_fund_flow``（``push2his.eastmoney.com``），服务端对该
+        请求返回空回复（TCP/TLS 均成功，`curl: (52) Empty reply from server`），
+        ``data_source_health.last_success`` 为 **None**（从未成功过）。
+
+        它已不在任何生产链路内：
+          * 个股资金流改由腾讯 ``tencent_hsfundtab_v1`` 提供（``_intraday_slow``）；
+          * ``market_sentiment.main_net_inflow`` 取自 ``fund_flow`` 表（腾讯源）；
+          * 前端已不使用该字段。
+        唯一残留调用是行情总览 API 的展示分支（自带 try/except 降级），不影响交易。
+
+        保留在这里的后果是：每 5 分钟必然失败一次，产生 ``ERROR`` 日志与
+        ``fail_streak`` 累加（实测约 288 条/天），把真正的数据故障淹没在噪音里 ——
+        复盘时正是这条噪音导致误判。故从探测集合中摘除。
+        """
         checks = {
             "limit_up_pool": self.get_limit_up_pool,
-            "market_fund_flow": self.get_market_fund_flow,
         }
         results: dict[str, bool] = {}
         for api_name, call in checks.items():

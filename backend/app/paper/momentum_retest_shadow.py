@@ -20,6 +20,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import settings
+from app.core.trade_calendar import trading_elapsed_seconds
 from app.models.paper import PaperShadowEvaluation, PaperShadowEvent
 from app.models.stock import StockBlacklist, StockKline, StockTag
 
@@ -799,21 +800,13 @@ class MomentumRetestShadowEngine:
 
     @staticmethod
     def _trading_elapsed_seconds(quote_time: datetime) -> float:
-        morning_start = quote_time.replace(hour=9, minute=30, second=0, microsecond=0)
-        morning_end = quote_time.replace(hour=11, minute=30, second=0, microsecond=0)
-        afternoon_start = quote_time.replace(hour=13, minute=0, second=0, microsecond=0)
-        afternoon_end = quote_time.replace(hour=15, minute=0, second=0, microsecond=0)
-        if quote_time <= morning_start:
-            return 0.0
-        if quote_time <= morning_end:
-            return (quote_time - morning_start).total_seconds()
-        morning_seconds = (morning_end - morning_start).total_seconds()
-        if quote_time < afternoon_start:
-            return morning_seconds
-        return morning_seconds + min(
-            (quote_time - afternoon_start).total_seconds(),
-            (afternoon_end - afternoon_start).total_seconds(),
-        )
+        """委托给 app.core.trade_calendar 的共享实现。
+
+        原先此处复制了一份「午休冻结」的时段计算；2026-09-16 修复资金流
+        新鲜度口径时把它提取到了 `trade_calendar.trading_elapsed_seconds`，
+        两处语义必须一致，故保留本方法作为转发以免改动调用点。
+        """
+        return trading_elapsed_seconds(quote_time)
 
     @staticmethod
     def _unfillable(quote: Mapping[str, Any]) -> bool:

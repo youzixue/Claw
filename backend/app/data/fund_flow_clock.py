@@ -10,6 +10,8 @@ import math
 
 from numpy import bool_
 
+from app.core.trade_calendar import trading_elapsed_seconds
+
 
 _MARKET_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -65,7 +67,11 @@ def verified_fund_clocks(source_at, received_at, observed_at, trade_date: date,
             return None
         if not source_at <= received_at <= observed_at:
             return None
-        if (observed_at - source_at).total_seconds() > limit:
+        # 新鲜度按**交易时间**度量，不按墙钟：午休（11:30–13:00）不推进交易时钟，
+        # 否则正常的午休休市会被误判成数据陈旧。交易时段内的真实缺口仍照常拦截。
+        if (
+            trading_elapsed_seconds(observed_at) - trading_elapsed_seconds(source_at)
+        ) > limit:
             return None
     except (ValueError, TypeError, OverflowError):
         return None
