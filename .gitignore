@@ -36,7 +36,9 @@ frontend/dist/
 # Logs and generated runtime market archives
 *.log
 logs/
-runtime/quote_rounds/
+# 运行数据整体忽略。runtime/wencai-profile 是 Playwright 持久化登录 profile，
+# **含问财登录 cookie**，绝不能入库。
+runtime/
 
 # Coverage
 htmlcov/
