@@ -28,6 +28,7 @@ from app.data.pipeline_runtime import JOB_EVENT_MASK, PipelineRuntimeHealth
 from app.core.stock_tagger import stock_tagger
 from app.data.sources.akshare_source import AkShareSource
 from app.data.sources.eastmoney_source import EastMoneySource
+from app.data.sources.wencai_stream_source import WencaiStreamError, WencaiStreamSource
 from app.data.fund_flow_clock import evidence_clock, local_clock, verified_fund_clocks
 from app.data.sources.pywencai_source import PyWencaiSource
 from app.data.sources.sw_source import ShenwanSource
@@ -37,6 +38,7 @@ from app.data.sources.tencent_source import TencentSource
 from app.data.sources.ths_kline_source import ThsKlineSource
 from app.db.session import async_session
 from app.models.news import FinanceNews
+from app.models.risk import DataSourceHealth
 
 # ORM Models
 from app.models.stock import (
@@ -455,6 +457,35 @@ def _calculate_market_sentiment_state(
         "quality_completeness": round(quality_completeness, 6),
         "broad_weakness": broad_weakness,
     }
+
+
+# ── 静默失效告警（2026-09-16）─────────────────────────────────────────
+# 风险标签停止更新时使用稳定标记，便于检索与外部告警订阅。
+STOCK_STATUS_ALERT_MARKER = "stock_tags 风险标签流水线中断"
+# 连续失败达到该次数即视为"不是偶发抖动"，需要人看（该任务每交易日 08:25 跑一次）。
+STOCK_STATUS_ALERT_THRESHOLD = 2
+
+
+async def _stock_status_fail_streak(session: AsyncSession) -> int:
+    """读取 stock_status 取数的最大连续失败次数；无法判定时返回 0。
+
+    取自 `data_source_health.fail_streak`，与既有数据质量记账共用同一事实来源，
+    不另起一套计数器。
+
+    注意：**不静默吞错**。查不到时返回 0，但会打 WARNING —— 因为"读不出失败次数"
+    与"没有失败"必须可区分，否则告警自身会变成新的静默失效点（本项目已多次
+    出现该模式）。
+    """
+    try:
+        value = await session.scalar(
+            select(func.max(DataSourceHealth.fail_streak)).where(
+                DataSourceHealth.api_name == "stock_status"
+            )
+        )
+    except Exception as exc:                # noqa: BLE001 — 告警失败不得影响主流程
+        logger.warning(f"[ALERT] 无法读取 stock_status 失败次数（告警可能失真）: {exc}")
+        return 0
+    return int(value or 0)
 
 
 class DataScheduler:
@@ -1656,24 +1687,18 @@ class DataScheduler:
         t_fetch = _time.monotonic()
         loop = asyncio.get_event_loop()
         queries = ("ST股", "停牌", "*ST股", "北交所ST股")
-        import pywencai as _pw
-        # 问财自 2026-08 下旬起要求登录会话；cookie 从 settings（`.env`）读取。
-        # 仅在非空时才传：库的 headers() 会把 None 原样当字符串写进 cookie 头。
-        _pw_extra = {}
-        _pw_cookie = str(getattr(settings, "PYWENCAI_COOKIE", "") or "").strip()
-        if _pw_cookie:
-            _pw_extra["cookie"] = _pw_cookie
+        # 2026-09-16：pywencai 自 8 月下旬起失效（上游改为 SSE 流），改用
+        # WencaiStreamSource。取不到会抛 WencaiStreamError —— 绝不返回空表，
+        # 因此下面「四个查询均为空」的判定仍只代表「真的没有」。
         try:
+            _wencai = WencaiStreamSource()
             frames = await asyncio.gather(*[
-                loop.run_in_executor(
-                    None, lambda q=q: _pw.get(query=q, loop=True, **_pw_extra)
-                )
-                for q in queries
+                _wencai.query_async(query) for query in queries
             ])
             if any(not isinstance(frame, pd.DataFrame) for frame in frames):
-                raise TypeError("pywencai股票状态返回类型异常")
+                raise TypeError("问财股票状态返回类型异常")
             if all(frame.empty for frame in frames):
-                raise ValueError("pywencai股票状态四个查询均为空，禁止清空既有风控标签")
+                raise ValueError("问财股票状态四个查询均为空，禁止清空既有风控标签")
             maps = []
             seen_names = {}
             for query, frame in zip(queries, frames):
@@ -1708,6 +1733,17 @@ class DataScheduler:
                     session, "pywencai", "stock_status", str(exc),
                     latency_ms=int((_time.monotonic() - t_fetch) * 1000),
                 )
+                streak = await _stock_status_fail_streak(session)
+            # 静默失效告警（2026-09-16 新增）。
+            # 背景：该任务自 2026-08 下旬起连续失败，`stock_tags` 冻结在 08-31
+            # 整整 16 天无人发现 —— 因为失败只留了一条 WARNING，被行情日志淹没。
+            # 这里用稳定标记 `[ALERT]` + 明确后果，便于检索与外部告警订阅。
+            logger.error(
+                f"[ALERT] 风险标签停止更新：{STOCK_STATUS_ALERT_MARKER}"
+                f"连续失败 {streak} 次，原因：{exc}。"
+                f"stock_tags 的 ST/停牌/退市标记保持上次值（fail-safe，"
+                f"不会错误清除），但**新增风险不会被捕获**，直到取数恢复。"
+            )
             return {"status": "failed", "reason": str(exc)}
 
         async with async_session() as session:
@@ -1814,10 +1850,14 @@ class DataScheduler:
             ak_src = self._sources["akshare"]
             sw = self._sources["shenwan"]
 
-            # ---- 1. pywencai 个股映射→提取行业+概念板块列表 → SectorInfo ----
+            # ---- 1. 问财个股映射→提取行业+概念板块列表 → SectorInfo ----
+            # 2026-09-16：pywencai 失效，改用 WencaiStreamSource（同一问句）。
+            # 全 A 股约 5600 只，perpage 必须给足，否则只拿到首页 N 条。
             try:
                 t1 = _time.monotonic()
-                df_mapping = await pw.get_stock_industry_mapping()
+                df_mapping = await WencaiStreamSource().query_async(
+                    "全部A股 所属同花顺行业 所属概念", perpage=10000,
+                )
                 if df_mapping is not None and len(df_mapping) > 0:
                     # 1a. 提取行业板块(三级全名"医药生物-中药-中药Ⅲ", 与collect_pywencai_sectors.py一致)
                     industries = set()
@@ -2914,10 +2954,13 @@ class DataScheduler:
             pw = self._sources["pywencai"]
             today = date.today()
 
-            # ---- 1. pywencai 个股→行业+概念映射 ----
+            # ---- 1. 问财个股→行业+概念映射 ----
+            # 2026-09-16：pywencai 失效，改用 WencaiStreamSource（同一问句）。
             try:
                 t0 = _time.monotonic()
-                df = await pw.get_stock_industry_mapping()
+                df = await WencaiStreamSource().query_async(
+                    "全部A股 所属同花顺行业 所属概念", perpage=10000,
+                )
                 # pywencai.get("全部A股 所属同花顺行业 所属概念") 返回列:
                 #   股票代码, 股票简称, 所属同花顺行业, 所属概念(多个逗号分隔)
                 if df is not None and len(df) > 0:

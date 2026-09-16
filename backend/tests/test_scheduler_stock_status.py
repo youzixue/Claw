@@ -19,9 +19,13 @@ async def test_stock_status_all_empty_fails_closed(monkeypatch):
         "is_trade_day",
         AsyncMock(return_value=True),
     )
+    # 2026-09-16：取数源由 pywencai 改为 WencaiStreamSource（上游改 SSE 流）。
+    class _FakeWencaiEmpty:
+        async def query_async(self, question, *, perpage=50):
+            return pd.DataFrame()
+
     monkeypatch.setattr(
-        "pywencai.get",
-        lambda **_kwargs: pd.DataFrame(),
+        scheduler_module, "WencaiStreamSource", lambda *a, **k: _FakeWencaiEmpty()
     )
 
     class EmptySessionContext:
@@ -92,15 +96,21 @@ async def test_stock_status_positive_merge_preserves_existing_blacklist(
         AsyncMock(return_value=True),
     )
 
-    def fake_get(*, query, loop):
-        assert loop is True
-        if query == "ST股":
-            return pd.DataFrame(
-                [{"股票代码": "000001", "股票简称": "测试ST"}]
-            )
-        return pd.DataFrame(columns=["股票代码", "股票简称"])
+    # 2026-09-16：取数源由 pywencai 改为 WencaiStreamSource。
+    # 原 mock 断言 `loop is True`（pywencai 专有参数），新源无此参数，
+    # 改为断言问句被正确透传。
+    seen_questions = []
 
-    monkeypatch.setattr("pywencai.get", fake_get)
+    class _FakeWencai:
+        async def query_async(self, question, *, perpage=50):
+            seen_questions.append(question)
+            if question == "ST股":
+                return pd.DataFrame([{"股票代码": "000001", "股票简称": "测试ST"}])
+            return pd.DataFrame(columns=["股票代码", "股票简称"])
+
+    monkeypatch.setattr(
+        scheduler_module, "WencaiStreamSource", lambda *a, **k: _FakeWencai()
+    )
     monkeypatch.setattr(scheduler_module, "async_session", session_factory)
 
     await DataScheduler()._update_stock_status()

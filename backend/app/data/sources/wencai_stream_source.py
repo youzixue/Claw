@@ -146,6 +146,11 @@ def extract_table(stream_text: str) -> dict[str, Any] | None:
 def _to_frame(data: dict[str, Any]) -> pd.DataFrame:
     rows = data.get("datas") or []
     frame = pd.DataFrame(rows)
+    # 上游按问句返回的列集合并不固定：有的问句给 `股票代码`，有的只给 `code`。
+    # 旧 pywencai 契约恒有 `股票代码`，下游解析器（scheduler 盘前/盘后/股票状态）
+    # 读的也是它；这里补一列以维持同一契约，避免每个调用方各自适配。
+    if "股票代码" not in frame.columns and "code" in frame.columns:
+        frame["股票代码"] = frame["code"]
     frame.attrs["code_count"] = int(data.get("code_count") or 0)
     frame.attrs["row_count"] = int(data.get("row_count") or len(rows))
     frame.attrs["chunks_info"] = data.get("chunks_info") or ""
