@@ -57,6 +57,11 @@ class AuctionSignal:
 
 # ========== 竞价数据采集 ==========
 
+# 腾讯竞价帧的来源标识：与东财/新浪的 `*_unverified` 明确区分，
+# 因为只有这条路径带 provider 行情时间戳、能通过 auction_provenance_v1。
+TENCENT_AUCTION_SOURCE_VERSION = "tencent_qt_auction_open_v1"
+
+
 class AuctionCollector:
     """集合竞价数据采集器"""
 
@@ -175,6 +180,21 @@ class AuctionCollector:
             if not self._verified_observed_at(observed_at, trade_date):
                 logger.warning(
                     f"竞价数据源 {source_name} 返回已越过终场窗口: received_at={observed_at.isoformat()}"
+                )
+                continue
+            # 2026-09-18：>=09:25 的帧由腾讯证据路径负责，这里不再写。
+            #
+            # 原因：`get_snapshot_health` 只按每只代码 `MAX(auction_time)` 取"最新帧"
+            # 参与 `feed_complete_count`。本路径（东财/新浪 spot）在 >=09:25 只能标
+            # `spot_open_unverified` + `source_quote_at=None`，必然判 `unknown`；
+            # 若它的 auction_time 晚于腾讯证据帧，就会把已验证的那一帧**顶掉**，
+            # 分子重新变 0、闸门继续 blocked —— 即"用一条不可用的记录遮蔽可用记录"。
+            # 该帧本来就不被任何判定采纳（`unknown` 从不计数），跳过不损失任何证据，
+            # 只消除这个遮蔽竞态。09:15–09:24 的观察帧照常保存。
+            if observed_at.time() >= time(9, 25):
+                logger.info(
+                    f"竞价数据源 {source_name} 的 {observed_at.strftime('%H:%M:%S')} 帧交由"
+                    "腾讯证据路径处理，本路径跳过（该帧无法认证且会遮蔽已验证帧）"
                 )
                 continue
             df["_auction_source"] = source_name
@@ -339,6 +359,161 @@ class AuctionCollector:
         await session.commit()
         logger.info(f"竞价数据保存: {count}条, {trade_date} {snapshot_time}")
         return count
+
+    async def collect_tencent_auction_evidence(
+        self,
+        session: AsyncSession,
+        trade_date: date | None = None,
+        *,
+        now: datetime | None = None,
+        codes: list[str] | None = None,
+    ) -> dict:
+        """用**腾讯实时行情**生成 09:25 终场竞价证据（唯一可满足契约的来源）。
+
+        为什么走腾讯
+        ------------
+        东财/新浪的 `spot` 接口拿不到"供应商行情时间戳"，采集器只能把
+        `source_quote_at` 置空、`price_basis` 标成 `spot_open_unverified`，
+        于是 `auction_provenance_v1` 永远判 `unknown`，D 路由闸门永久 blocked
+        （实测 3,226 次 `candidate_data_missing`）。
+        腾讯 `qt` 字段[30] 提供 provider 行情时间戳，`stock_spot` 实测
+        5,224/5,231 行有值，因此可以写出真正可认证的竞价帧。
+
+        契约依据（与 `app/data/auction_evidence.py` 的第二组分支一致）
+        --------------------------------------------------------------
+        `price_basis="auction_opening"` + `volume_basis="auction_matched"`
+        + `source_quote_at.time() >= 09:25`。
+        **金融假设（显式为假设，非从公开文档抄来）**：A 股 09:25 集合竞价撮合，
+        09:25–09:30 为过渡期、不产生连续竞价成交（本仓库
+        `TRADE_SESSIONS` 也把 09:25–09:30 留空，没有对应时段）。
+        因此该窗口内：今开 = 竞价撮合价；累计成交量/额 = 竞价撮合量/额；
+        且因竞价只有唯一成交价，`成交额 = 成交价 × 成交量` 是恒等式而非估算。
+        若该假设不成立，本方法产出的帧就只是"开盘瞬间快照"，
+        **不应被当作竞价证据** —— 因此下面逐行用 `auction_evidence_status`
+        自检，只保留判定为 `ok` 的行，绝不批量写入未认证的行。
+
+        只写自检通过的行
+        ----------------
+        每个候选行先构造一个**不加入 session** 的 `AuctionData`，交给
+        `auction_evidence_status(row, decision_at=now)` 判定；
+        只有 `ok` 才进入落库，其余按状态计数返回。因此本方法
+        **不可能伪造证据**：它用的是策略同一个契约函数。
+        """
+        from app.data.sources.tencent_source import TencentSource
+
+        target_date = trade_date or date.today()
+        precheck = local_clock(now if now is not None else datetime.now())
+        if precheck is None or precheck.date() != target_date:
+            return {"status": "not_today", "written": 0}
+        # 契约要求三个时钟都落在 09:15:00–09:25:30，且 >=09:25 分支需要
+        # source_quote_at.time() >= 09:25，故本地观测窗只能是 09:25:00–09:25:30。
+        # 这里只做前置判断以免在窗外发起无谓请求；真正的 observed_at 在取数**之后**再取。
+        if not time(9, 25) <= precheck.time() <= time(9, 25, 30):
+            return {"status": "outside_evidence_window", "written": 0,
+                    "observed_at": precheck.isoformat()}
+
+        if codes is None:
+            code_rows = (await session.execute(
+                select(StockTag.code).where(
+                    StockTag.board_tag == TAG_TRADEABLE,
+                    func.coalesce(StockTag.is_st, False).is_(False),
+                    func.coalesce(StockTag.is_suspended, False).is_(False),
+                    func.coalesce(StockTag.is_delisting, False).is_(False),
+                )
+            )).all()
+            codes = [str(code) for (code,) in code_rows if code]
+        if not codes:
+            return {"status": "no_universe", "written": 0}
+
+        records = await TencentSource().collect_spot_batch(list(codes))
+        # observed_at 必须在**取数之后**取：契约要求
+        # source_quote_at <= received_at <= observed_at，而记录的 received_at
+        # 是取数过程中写入的。若在取数前取 observed_at，
+        # 记录的 received_at 会晚于它，契约判"future"并拒绝整批
+        # （本方法第一版就是这么写的，被自检当场拦下）。
+        observed_at = local_clock(now if now is not None else datetime.now())
+        if observed_at is None or not time(9, 25) <= observed_at.time() <= time(9, 25, 30):
+            return {"status": "outside_evidence_window", "written": 0,
+                    "observed_at": observed_at.isoformat() if observed_at else None,
+                    "reason": "取数耗时已越过 09:25:30 证据窗"}
+        snapshot_time = observed_at.strftime("%H:%M:%S")
+        accepted: list[dict] = []
+        rejected: dict[str, int] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            code = self._normalize_code(record.get("code", ""))
+            if not code:
+                continue
+            source_quote_at = local_clock(record.get("source_quote_at"))
+            received_at = local_clock(record.get("received_at")) or observed_at
+            candidate = AuctionData(
+                code=code, trade_date=target_date, auction_time=snapshot_time,
+                auction_price=self._safe_float(record.get("open")),
+                auction_volume=int(self._safe_float(record.get("volume")) or 0),
+                auction_amount=self._safe_float(record.get("amount")),
+                prev_close=self._safe_float(record.get("prev_close")),
+                volume_ratio=self._safe_float(record.get("volume_ratio")),
+                source="tencent",
+                source_version=TENCENT_AUCTION_SOURCE_VERSION,
+                source_quote_at=source_quote_at,
+                received_at=received_at,
+                observed_at=observed_at,
+                price_basis="auction_opening",
+                volume_basis="auction_matched",
+                volume_unit="lot100",
+                amount_unit="CNY",
+            )
+            status = auction_evidence_status(candidate, decision_at=observed_at)
+            if status != "ok":
+                rejected[status] = rejected.get(status, 0) + 1
+                continue
+            accepted.append({
+                "code": code,
+                "open": candidate.auction_price,
+                "prev_close": candidate.prev_close,
+                "volume": candidate.auction_volume,
+                "amount": candidate.auction_amount,
+                "volume_ratio": candidate.volume_ratio,
+                "source": candidate.source,
+                "source_version": candidate.source_version,
+                "source_quote_at": source_quote_at,
+                "received_at": received_at,
+                "price_basis": candidate.price_basis,
+                "volume_basis": candidate.volume_basis,
+                "volume_unit": candidate.volume_unit,
+                "amount_unit": candidate.amount_unit,
+            })
+
+        distinct_source_frames = len({
+            item["source_quote_at"] for item in accepted if item["source_quote_at"]
+        })
+        if not accepted:
+            logger.warning(
+                "腾讯竞价证据自检全部未通过，未写入任何行: "
+                f"observed={snapshot_time} candidates={len(records)} rejected={rejected}"
+            )
+            return {"status": "no_verified_rows", "written": 0,
+                    "candidates": len(records), "rejected": rejected,
+                    "observed_at": observed_at.isoformat()}
+
+        frame = pd.DataFrame(accepted)
+        frame.attrs["auction_observed_at"] = observed_at
+        written = await self.save_auction_data(session, frame, target_date)
+        # `multi_frame_complete_count` 是闸门的**分子**：每只标的需要 >=2 个
+        # 不同 source_quote_at 的 ok 帧。本方法一次只产出一帧，
+        # 由调度器在同一 30 秒窗口内多次调用累加；这里报告本轮贡献的时间戳，
+        # 便于次日直接看出"供应商时间戳是否在窗口内推进"。
+        return {
+            "status": "ok",
+            "written": written,
+            "accepted": len(accepted),
+            "candidates": len(records),
+            "rejected": rejected,
+            "source_frame": snapshot_time,
+            "distinct_source_quote_at": distinct_source_frames,
+            "observed_at": observed_at.isoformat(),
+        }
 
     async def get_snapshot_health(
         self,

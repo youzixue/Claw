@@ -762,6 +762,17 @@ class DataScheduler:
         )
 
         # === 盘中慢频 — 每30秒(资金流) ===
+        # 竞价证据采样必须在 09:25:00–09:25:30 内多次触发（契约要求三个时钟
+        # 都落在该窗口），整分 cron 做不到，故单独按秒注册。
+        self.scheduler.add_job(
+            self._auction_collect_tencent_evidence,
+            CronTrigger(hour=9, minute=25, second="5,15,25", day_of_week="mon-fri"),
+            id="auction_evidence_0925",
+            name="腾讯竞价证据采样(09:25窗口)",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=5,
+        )
         self.scheduler.add_job(
             self._intraday_slow, IntervalTrigger(seconds=30),
             id="intraday_slow", name="腾讯资金滚动采集(30s)",
@@ -3148,6 +3159,43 @@ class DataScheduler:
     async def _auction_collect_force_0925(self):
         """09:25:06 触发终场采样；延迟响应不得倒填为09:25."""
         await self._auction_collect(force=True)
+
+    async def _auction_collect_tencent_evidence(self):
+        """09:25 窗口内的腾讯竞价证据采样（D 路由闸门的唯一可满足路径）。
+
+        为什么需要独立任务：`_intraday_fast` 与 `_intraday_slow` 都以
+        `is_trading_hours()` 为前置，而 09:25–09:30 不在任何交易时段内
+        （见 `TRADE_SESSIONS`），所以那两条路径在该窗口直接 return，
+        拿不到数据。这里用独立的 cron 秒点采样。
+
+        为什么采多次：`auction_data` 闸门的分子是
+        `multi_frame_complete_count`，要求每只标的有 **>=2 个不同
+        `source_quote_at` 的 ok 帧**。一次采样只能给一帧，所以要在 09:25:00–09:25:30
+        这 30 秒里多采几次；供应商时间戳是否在该窗口内推进，只有实测才知道，
+        因此每次采样都把本轮的时间戳计入返回，供次日核对。
+        """
+        session_type = trade_calendar.get_trade_session()
+        if not await trade_calendar.is_trade_day():
+            return
+        from app.strategy.auction import auction_collector
+
+        async with async_session() as session:
+            try:
+                result = await auction_collector.collect_tencent_auction_evidence(
+                    session, date.today()
+                )
+            except Exception as exc:               # noqa: BLE001 — 采样失败不得影响主流程
+                logger.warning(f"腾讯竞价证据采样失败: {type(exc).__name__}: {exc}")
+                return
+        if result.get("status") == "ok":
+            logger.info(
+                f"腾讯竞价证据写入 {result.get('written')} 条 "
+                f"(accepted={result.get('accepted')}/{result.get('candidates')}, "
+                f"frame={result.get('source_frame')}, "
+                f"distinct_source_quote_at={result.get('distinct_source_quote_at')})"
+            )
+        elif result.get("status") not in {"outside_evidence_window"}:
+            logger.warning(f"腾讯竞价证据未写入: {result}")
 
     async def _after_market(self):
         """盘后补全 — pywencai个股行业映射 + 涨停池补充"""
