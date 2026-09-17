@@ -153,3 +153,34 @@ def test_every_live_code_prefix_is_registered():
         conn.close()
     unknown = sorted(code for (code,) in rows if stock_tagger.get_board_type(code) == "unknown")
     assert unknown == [], f"存在未登记号段: {unknown[:20]}"
+
+
+def test_board_scope_matches_the_declared_tradeable_set():
+    """锁定"只有主板可交易"这一口径：创业板/科创板/北交所一律仅观察。
+
+    实测 2026-09-18 用新流式源取「全部A股 所属同花顺行业 所属概念」，
+    5,575 个代码的板块分布为
+    {main_sh: 1702, main_sz: 577, sme: 919, gem: 1410, star: 618, bse: 349}，
+    可交易 3,198 / 仅观察 2,377。
+    """
+    tradeable_boards = {
+        board for board in (
+            "main_sh", "main_sz", "sme", "gem", "star", "bse", "unknown",
+        ) if stock_tagger.get_board_tag(board) == "tradeable"
+    }
+    assert tradeable_boards == {"main_sh", "main_sz", "sme"}, tradeable_boards
+
+
+@pytest.mark.parametrize("code,expected_tag", [
+    # 主板 + 中小板 → 可交易
+    ("600000", "tradeable"), ("601398", "tradeable"), ("603538", "tradeable"),
+    ("605580", "tradeable"), ("000001", "tradeable"), ("001979", "tradeable"),
+    ("002403", "tradeable"), ("003816", "tradeable"), ("302132", "tradeable"),
+    # 创业板 / 科创板 / 北交所 → 仅观察（用户没有对应权限）
+    ("300750", "observe_only"), ("301628", "observe_only"),
+    ("688009", "observe_only"), ("689009", "observe_only"),
+    ("830799", "observe_only"), ("870436", "observe_only"),
+    ("920000", "observe_only"),
+])
+def test_each_board_resolves_to_the_expected_tag(code, expected_tag):
+    assert stock_tagger.get_board_tag(stock_tagger.get_board_type(code)) == expected_tag

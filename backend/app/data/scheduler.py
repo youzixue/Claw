@@ -521,7 +521,66 @@ SOURCE_ALERT_MAX_AGE_SEC = 3600
 # —— 这正是本告警要消除的那类噪音。带此标记的行仍会走 `_quality_check`
 # 里既有的 stock_tags 冻结告警（`STOCK_STATUS_ALERT_MARKER`），不会漏报真故障。
 DEGRADED_COVERAGE_MARKER = "[DEGRADED-COVERAGE]"
+# 「本交易时段还不可能有当日数据」——不是端点不可用，而是会话时钟决定的必然结果。
+#
+# 实测（2026-09-18，data_source_health 全历史）：
+#   index/daily_snapshot          开盘前 61 次 / 盘中盘后 10 次
+#   tencent/individual_fund_flow  开盘前 110 次 / 盘中盘后 **0** 次
+# 这两项每个交易日早盘都会各写出一条 status=down、fail_streak 递增的记录
+# （index 到 7~8、tencent 到 17），于是 `_alert_persistently_failing_sources`
+# 每天早盘误报一次 [ALERT]。这正是本告警当初要消除的那类噪音，
+# 而它掩盖真故障的代价与 pywencai/stock_status 那次完全相同。
+#
+# 处理方式与 DEGRADED_COVERAGE_MARKER 一致：**记录照常如实落库**
+# （status=down、fail_streak 照常累加，不掩盖任何历史），只把该行排除出
+# 汇总告警。标记**只在开盘前窗口内**添加，所以盘中/盘后的真实故障不带标记，
+# 仍然照常告警 —— index 那 10 次盘中失败（10:17~11:06）就是例子。
+EXPECTED_PREOPEN_MARKER = "[EXPECTED-PREOPEN]"
+# 集合竞价结束、当日首个完整数据可得的时点。09:30 之后不再算「开盘前」。
+_MARKET_OPEN_TIME = time(9, 30)
 _SOURCE_ALERT_LAST: dict[str, float] = {}
+
+
+def _expected_preopen_unavailable(now: datetime | None = None) -> bool:
+    """当日首个完整数据尚不可能存在的时间窗（开盘前）。"""
+    return (now or datetime.now()).time() < _MARKET_OPEN_TIME
+
+
+def _preopen_marked(message: str, now: datetime | None = None) -> str:
+    """开盘前窗口内的失败原因加标记；窗口外原样返回。"""
+    if not _expected_preopen_unavailable(now):
+        return message
+    return f"{EXPECTED_PREOPEN_MARKER} {message}"
+
+
+CONCEPT_FUND_FLOW_ENDPOINT = "同花顺概念资金流 ak.stock_fund_flow_concept"
+
+
+def _classify_concept_fund_flow_error(exc: BaseException) -> str:
+    """把概念资金流的上游异常翻译成可行动的诊断。
+
+    原始消息里既没有端点名也没有异常类型，运维看到
+    `'NoneType' object has no attribute 'text'` 无法判断是本地解析 bug
+    还是上游页面问题。实测该类失败只有两种来源（全历史 180 + 46 次）：
+      * `AttributeError` —— 上游返回空响应后 akshare 内部未做保护；
+      * `Length mismatch: Expected axis has N elements` —— 页面表头列数变了。
+    两者都是**上游响应/表头变化**，不是本项目解析逻辑错误。
+    """
+    kind = type(exc).__name__
+    detail = str(exc)
+    lowered = detail.lower()
+    if "has no attribute" in lowered or "nonetype" in lowered:
+        cause = "上游返回空响应/空文档，akshare 内部未做保护"
+    elif "length mismatch" in lowered or "expected axis has" in lowered:
+        cause = "上游页面表头列数变化，akshare 列名映射失配"
+    elif "no text parsed" in lowered or "文档" in detail:
+        cause = "上游返回非数据文档（反爬/空页）"
+    else:
+        cause = "上游异常"
+    return (
+        f"概念资金上游失败({kind})：{detail}；端点={CONCEPT_FUND_FLOW_ENDPOINT}；"
+        f"判定={cause}；属上游问题，不影响个股资金入库"
+    )
 
 
 async def _stock_status_fail_streak(session: AsyncSession) -> int:
@@ -2464,7 +2523,9 @@ class DataScheduler:
                 if not individual_records:
                     primary_error = "腾讯资金帧无有效主力字段、代码或同日新鲜源时钟"
         else:
-            primary_error = "腾讯资金本轮无有效数据（空帧、退避或缺失），不以旧源/零填补"
+            primary_error = _preopen_marked(
+                "腾讯资金本轮无有效数据（空帧、退避或缺失），不以旧源/零填补"
+            )
         if isinstance(df_individual, pd.DataFrame):
             diagnostics = df_individual.attrs.get("fund_flow_errors") or {}
             if diagnostics:
@@ -2544,7 +2605,7 @@ class DataScheduler:
                         session,
                         "akshare",
                         "concept_fund_flow",
-                        str(df_concept),
+                        _classify_concept_fund_flow_error(df_concept),
                         latency_ms=fetch_ms,
                     )
                 elif isinstance(df_concept, pd.DataFrame) and len(df_concept) > 0:
@@ -2763,7 +2824,10 @@ class DataScheduler:
                     # Zero current rows must also replace a stale healthy status.
                     await data_quality_guard.record_failure(
                         session, "index", "daily_snapshot",
-                        f"当日有效指数仅{valid_index_count}/3，历史日线回退不视为当前完整快照",
+                        _preopen_marked(
+                            f"当日有效指数仅{valid_index_count}/3，"
+                            "历史日线回退不视为当前完整快照"
+                        ),
                         completeness=valid_index_count / 3,
                     )
 
@@ -3392,6 +3456,13 @@ class DataScheduler:
         同时排除带 `DEGRADED_COVERAGE_MARKER` 的行：「取到了但覆盖未核验」是
         设计上故意记的 degraded（见 `_update_stock_status` 末尾），并非端点
         不可用；不排除会每小时误报一次。
+
+        也排除带 `EXPECTED_PREOPEN_MARKER` 的行：开盘前「当日首个完整数据还
+        不可能存在」是会话时钟决定的必然结果，不是端点不可用。实测
+        tencent/individual_fund_flow 的 110 次失败 **全部** 在开盘前，
+        index/daily_snapshot 的 71 次里 61 次在开盘前 —— 不排除就是每交易日
+        早盘各误报一次。标记只在开盘前窗口内添加，盘中/盘后的真实故障
+        不带标记，仍然照常告警（不会掩盖真故障）。
         """
         result = await session.execute(sa_text(
             "SELECT source, api_name, status, fail_streak FROM ("
@@ -3402,10 +3473,12 @@ class DataScheduler:
             ") WHERE rn = 1 AND fail_streak >= :threshold"
             "  AND updated_at >= :since"
             "  AND COALESCE(error_msg, '') NOT LIKE :degraded_marker"
+            "  AND COALESCE(error_msg, '') NOT LIKE :preopen_marker"
         ), {
             "threshold": SOURCE_ALERT_FAIL_STREAK,
             "since": datetime.now() - timedelta(seconds=SOURCE_ALERT_MAX_AGE_SEC),
             "degraded_marker": f"{DEGRADED_COVERAGE_MARKER}%",
+            "preopen_marker": f"{EXPECTED_PREOPEN_MARKER}%",
         })
 
         now = _time.monotonic()
