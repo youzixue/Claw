@@ -47,6 +47,33 @@
 `promotion_prediction_record` 的 `outcome_status / outcome_trade_date /
 actual_close_change_pct` —— **引擎已经在逐条结算，无需新建观察表**。
 本脚本只读。
+
+⚠️ 口径警告（2026-09-18 加入，此前本脚本没有这条，导致结论被误用）
+------------------------------------------------------------------
+`actual_close_change_pct` **不是策略的可执行收益**，实测口径为：
+
+    actual_close_change_pct == stock_kline.change_pct(outcome_trade_date)
+                            == close(P) → close(P+1)      （近窗口一致率 99.2%）
+
+即"预测的第二天这只票涨了多少"，是**预测命中口径**。它能不能当作可执行
+收益，取决于**信号在该日收盘前是否已知**：
+
+  * `snapshot_context ∈ {promotion_1510, promotion_2000}`（15:10 / 20:00）
+    —— 信号在 P 日**收盘后**才产生，P 日收盘价**买不到**，只能 P+1 入场。
+    此时 `close(P)→close(P+1)` 的收益里**全部是隔夜跳空**，而 P+1 入场者
+    是在**付出**这个跳空。实测 `second_board_promotion` 收盘后批次 n=1227：
+    结算口径 +0.811%，隔夜跳空 +1.488%，**可执行（P+1 开盘→P+1 收盘）−0.643%
+    （净 CI 下界 −0.904%）** —— 符号相反。
+  * 盘中上下文（0925/0935/1000/1030/1305）—— 信号在 P 日盘中已知，
+    P 日收盘前可买，`close(P)` 入场在**原理上可达**；但策略实际是在确认轮
+    的当时价成交，与 P 日收盘价仍有差异，仍未严格可执行。
+
+因此：**用本脚本的读数列做"能不能开单"的判定，必须先按 snapshot_context
+拆分，并至少用 P+1 开盘入场重算一遍。** 只对盘中上下文批次，
+`close(P)→close(P+1)` 才勉强能当上界。
+
+本脚本当前输出的是**预测命中口径**，是所有可执行口径的**上界或下界都不一定**
+的中间量，禁止直接当作策略期望。`expected_count` 之类的字段同样只描述预测质量。
 """
 
 from __future__ import annotations
@@ -193,6 +220,10 @@ def verdict(discovery: dict, out_of_sample: dict, combined: dict) -> tuple[str, 
 
 
 def main() -> int:
+    print("⚠️  本表是**预测命中口径**（close(P)→close(P+1)），不是可执行收益。")
+    print("    收盘后批次(1510/2000)此口径含全部隔夜跳空，而 P+1 入场者是付出跳空；")
+    print("    实测 second_board_promotion 该批次：此口径 +0.811% vs 可执行 −0.643%（符号相反）。")
+    print("    判定前必须按 snapshot_context 拆分并用 P+1 开盘入场重算。详见模块 docstring。\n")
     print(f"判据：n≥设计门槛 max({N_FLOOR}, power_n(σ,δ={TARGET_DELTA_PCT})) "
           f"且 净CI下界>0 且 两段窗口同号为正（摩擦 {FRICTION_PCT}%）")
     print(f"发现窗 {DISCOVERY[0]}~{DISCOVERY[1]}；样本外 = 该窗之前\n")

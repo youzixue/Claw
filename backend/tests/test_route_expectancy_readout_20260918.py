@@ -64,9 +64,19 @@ def test_readout_criteria_are_pinned():
 
 
 def test_readout_uses_engine_settled_values_not_own_prices():
-    """读数器不得读取 stock_kline 自算收益（那会重新引入口径偏差）。"""
-    body = READOUT.read_text(encoding="utf-8")
-    assert "stock_kline" not in body, "权威判据必须用引擎结算值，不能自算"
+    """读数器的**代码**不得读取 stock_kline 自算收益。
+
+    注意：模块 docstring 里现在会提到 `stock_kline`，那是为了说明结算值的
+    口径（等于 outcome_trade_date 当天的 change_pct）。所以这里只检查
+    去掉 docstring 之后的代码部分。
+    """
+    import ast
+
+    source = READOUT.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    doc = ast.get_docstring(tree) or ""
+    code_only = source.replace(doc, "", 1)
+    assert "stock_kline" not in code_only, "权威判据必须用引擎结算值，不能自算"
 
 
 def test_verdict_distinguishes_four_states():
@@ -132,3 +142,22 @@ def test_required_n_follows_route_sigma_not_a_constant():
     assert module.need_text(None) == "n/a（点估计为负）"
     # (3) 两个函数不得合流：设计门槛必须与点估计无关
     assert module.power_n(2.70) == module.power_n(2.70)
+
+def test_readout_warns_that_settled_metric_is_not_executable():
+    """读数器必须自曝口径：结算值是"预测命中"，不是可执行收益。
+
+    本脚本第一版把这个读数列当成策略期望，得出"second_board_promotion 是唯一
+    可开单路线"。实测该路线的结算口径 close(P)→close(P+1) 在收盘后批次上
+    收益 **全部是隔夜跳空**，而 P+1 入场者是付出跳空：
+        结算 +0.811%  vs  可执行 −0.643%（净CI下界 −0.904%，n=1227）
+    符号相反。若不把这条写在工具里，同一个错误会被下一个人重犯。
+    """
+    body = READOUT.read_text(encoding="utf-8")
+    assert "不是策略的可执行收益" in body
+    assert "actual_close_change_pct == stock_kline.change_pct(outcome_trade_date)" in body
+    assert "P+1 开盘" in body or "P+1 入场" in body
+    assert "隔夜跳空" in body
+    assert "second_board_promotion" in body and "收盘后批次" in body
+    assert "9.2% 一致率" in body or "99.2%" in body
+    # 顶部必须显著提示，而不是只藏在 docstring 里
+    assert "本表是**预测命中口径**" in body

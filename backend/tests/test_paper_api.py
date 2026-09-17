@@ -5505,3 +5505,115 @@ async def test_scheduler_isolates_each_paper_account_failure(monkeypatch):
     assert sessions[0].rolled_back is True
     assert sessions[1].rolled_back is False
     assert sessions[2].rolled_back is False
+
+
+# =========================================================================
+# 2026-09-18 盘中确认链可归因性
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_promotion_confirm_rejections_report_actual_sub_reasons(paper_client, monkeypatch):
+    """被过滤的候选必须报出**实际触发**的子原因，而不是一串静态标签。
+
+    原实现只累加一个计数，再把六个可能原因整串写进括号：
+        "已过滤N只不满足盘中确认条件(行情缺失/低开/追高/一字/缩量/ST)"
+    实测生产日志里那六项**每轮计数完全相同**（都是 404）—— 它是静态标签，
+    不是证据。后果：B 在 10 个交易日里 35 个过概率门槛的候选只成交 1 笔，
+    却无法回答"剩下 34 个各自被哪一条挡掉"，确认链的价值因此不可测。
+    """
+    _client, SessionLocal = paper_client
+    today = date.today()
+    now = datetime.combine(today, time(9, 40))
+    monkeypatch.setattr(paper, "_paper_now", lambda: now)
+
+    async with SessionLocal() as session:
+        run = _governed_promotion_run(
+            run_key="confirm-reject-attr",
+            reference_trade_date=today,
+            snapshot_context="promotion_0935",
+            as_of_at=now,
+        )
+        session.add(run)
+        await session.flush()
+        session.add_all([
+            _governed_promotion_snapshot(
+                run_id=run.id, record_key="gap-down", code="600019",
+                prediction_trade_date=today, probability=0.95,
+            ),
+            _governed_promotion_snapshot(
+                run_id=run.id, record_key="chase-high", code="600029",
+                prediction_trade_date=today, probability=0.95,
+            ),
+            _governed_promotion_snapshot(
+                run_id=run.id, record_key="shrink-volume", code="600039",
+                prediction_trade_date=today, probability=0.95,
+            ),
+            _governed_promotion_snapshot(
+                run_id=run.id, record_key="no-quote", code="600049",
+                prediction_trade_date=today, probability=0.95,
+            ),
+        ])
+        # 600049 故意不写行情 → 行情缺失
+        session.add_all([
+            StockSpot(code="600019", name="低开票", price=9.7, prev_close=10.0,
+                      change_pct=-3.0, volume_ratio=1.5),
+            StockSpot(code="600029", name="追高票", price=10.9, prev_close=10.0,
+                      change_pct=9.0, volume_ratio=1.5),
+            StockSpot(code="600039", name="缩量票", price=10.2, prev_close=10.0,
+                      change_pct=2.0, volume_ratio=0.3),
+        ])
+        await session.commit()
+
+        candidates, notes = await paper._promotion_route_buy_candidates(
+            session, limit=5, trade_date=today,
+            account_name=paper.PAPER_ACCOUNT_PROMOTION,
+        )
+
+    assert candidates == [], "本用例全部候选都应被确认链挡掉"
+    joined = " | ".join(notes)
+    assert "已过滤4只" in joined, joined
+
+    # 关键：逐条归因必须出现，且计数正确
+    assert "低开×1" in joined, joined
+    assert "追高×1" in joined, joined
+    assert "缩量×1" in joined, joined
+    assert "行情缺失×1" in joined, joined
+
+    # 关键：静态六标签模板必须消失；只报真正触发的两项，不得出现未触发的 一字/ST
+    assert "行情缺失/低开/追高/一字/缩量/ST" not in joined, joined
+    assert "一字/涨停×" not in joined, joined
+    assert "ST/退市/停牌/非主板×" not in joined, joined
+
+
+@pytest.mark.asyncio
+async def test_promotion_confirm_rejections_absent_when_nothing_filtered(paper_client, monkeypatch):
+    """没有候选被挡时不得凭空写出一条"已过滤0只"的诊断。"""
+    _client, SessionLocal = paper_client
+    today = date.today()
+    now = datetime.combine(today, time(9, 40))
+    monkeypatch.setattr(paper, "_paper_now", lambda: now)
+
+    async with SessionLocal() as session:
+        run = _governed_promotion_run(
+            run_key="confirm-no-reject",
+            reference_trade_date=today,
+            snapshot_context="promotion_0935",
+            as_of_at=now,
+        )
+        session.add(run)
+        await session.flush()
+        session.add(_governed_promotion_snapshot(
+            run_id=run.id, record_key="ok", code="600019",
+            prediction_trade_date=today, probability=0.95,
+        ))
+        session.add(StockSpot(code="600019", name="正常票", price=10.2,
+                              prev_close=10.0, change_pct=2.0, volume_ratio=1.5))
+        await session.commit()
+
+        candidates, notes = await paper._promotion_route_buy_candidates(
+            session, limit=5, trade_date=today,
+            account_name=paper.PAPER_ACCOUNT_PROMOTION,
+        )
+
+    assert len(candidates) == 1, notes
+    assert not any("已过滤" in note for note in notes), notes

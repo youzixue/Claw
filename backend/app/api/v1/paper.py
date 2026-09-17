@@ -5239,6 +5239,24 @@ async def _promotion_route_buy_candidates(
 
     candidates: list[dict] = []
     rejected = 0
+    # 逐条记录**实际触发**的子原因。
+    #
+    # 原实现只累加一个计数，再把六个可能原因整串写进括号里
+    # （"行情缺失/低开/追高/一字/缩量/ST"），于是日志里那六项**每轮计数完全相同**
+    # —— 它是静态标签，不是证据。后果：B 在 10 个交易日里 35 个过概率门槛的候选
+    # 只成交 1 笔，却无法回答"剩下 34 个各自被哪一条挡掉"。
+    # 这是纯诊断字段，不参与任何判定，也不改变任何候选的取舍。
+    rejection_counts: dict[str, int] = []
+
+    def _reject(reason: str) -> None:
+        nonlocal rejected
+        rejected += 1
+        for entry in rejection_counts:
+            if entry[0] == reason:
+                entry[1] += 1
+                return
+        rejection_counts.append((reason, 1))
+
     mainline_rejections: list[str] = []
     for record in records:
         if len(candidates) >= limit:
@@ -5248,33 +5266,33 @@ async def _promotion_route_buy_candidates(
             continue
         spot = await _spot_by_code(db, code)
         if not spot or not spot.price or float(spot.price) <= 0:
-            rejected += 1
+            _reject("行情缺失")
             continue
         price = float(spot.price)
         prev_close = float(getattr(spot, "prev_close", 0) or 0)
         if prev_close <= 0:
-            rejected += 1
+            _reject("行情缺失")
             continue
         change_pct = _to_float(getattr(spot, "change_pct", None))
         if change_pct is None:
-            rejected += 1
+            _reject("行情缺失")
             continue
         # 盘中确认: 现价涨幅下限(不低开/要求高开)与上限(不追高)
         if change_pct < min_confirm:
-            rejected += 1
+            _reject("低开")
             continue
         if change_pct > max_confirm:
-            rejected += 1
+            _reject("追高")
             continue
         # 涨停/一字板不追 (用 limit_up 或涨幅判断)
         limit_up_price = float(getattr(spot, "limit_up", 0) or 0)
         if limit_up_price > 0 and price >= limit_up_price * 0.998:
-            rejected += 1
+            _reject("一字/涨停")
             continue
         # 量比健康 (有承接, 不缩量)
         volume_ratio = _to_float(getattr(spot, "volume_ratio", None))
         if volume_ratio is None or volume_ratio <= 0 or volume_ratio < 0.6:
-            rejected += 1
+            _reject("缩量")
             continue
         # ST/退市过滤 — tag 标记 或 stock_blacklist 命中即拦截 (2026-08-31 修复 600002 类静默通过)
         tag = (
@@ -5290,7 +5308,7 @@ async def _promotion_route_buy_candidates(
             )
         ).scalar_one_or_none()
         if blocked_reason:
-            rejected += 1
+            _reject(f"黑名单:{blocked_reason.reason}")
             notes.append(f"{code} 在黑名单({blocked_reason.reason})中, 拒绝候选")
             continue
         if (
@@ -5298,7 +5316,7 @@ async def _promotion_route_buy_candidates(
             or (tag is not None and tag.board_tag != "tradeable")
             or (tag and (tag.is_st or tag.is_suspended or tag.is_delisting))
         ):
-            rejected += 1
+            _reject("ST/退市/停牌/非主板")
             notes.append(f"{code} 非主板可交易标的或标记为 ST/退市/停牌, 拒绝候选")
             continue
 
@@ -5318,7 +5336,7 @@ async def _promotion_route_buy_candidates(
                 sector_context=mainline_sector_context,
             )
             if mainline_reject_reason:
-                rejected += 1
+                _reject(f"主线独立确认:{mainline_reject_reason[:40]}")
                 if len(mainline_rejections) < 3:
                     mainline_rejections.append(
                         f"{code} {record.name or spot.name or code}：{mainline_reject_reason}"
@@ -5368,7 +5386,11 @@ async def _promotion_route_buy_candidates(
 
     notes.extend(mainline_rejections)
     if rejected:
-        notes.append(f"已过滤{rejected}只不满足盘中确认条件(行情缺失/低开/追高/一字/缩量/ST)的{label}候选")
+        detail = "、".join(
+            f"{reason}×{count}"
+            for reason, count in sorted(rejection_counts, key=lambda item: -item[1])
+        )
+        notes.append(f"已过滤{rejected}只不满足盘中确认条件的{label}候选：{detail}")
     if not candidates:
         notes.append(f"{label}候选均未通过盘中确认，等待下一次轮询")
     return candidates[:limit], notes
