@@ -319,6 +319,27 @@ class Settings(BaseSettings):
     PAPER_INTRADAY_CONFIRM_MAX_SAMPLE_GAP_SEC: int = 90
     # 行情轮询存在亚秒级调度抖动；59.9秒应按一分钟确认，不能因浮点时钟误差漏单。
     PAPER_CONFIRMATION_CLOCK_JITTER_SEC: float = 1.0
+    # === 2026-09-18 文档化：A 策略必要价格区间的隐含振幅上限 ===
+    # `_a_entry_price_band`（app/api/v1/paper.py）把 A 原入口的两条约束取交集：
+    #     下界 = high × (1 − dd)，dd 即本参数
+    #     上界 = low  × (1 + PAPER_AUTO_VALUE_ENTRY_MAX_REBOUND_FROM_LOW_PCT)
+    # 可解（交集非空）条件： high × (1 − dd) ≤ low × (1 + rb)
+    #        <=> 振幅 (high/low − 1) ≤ rb/(1 − dd) + dd/(1 − dd)
+    # 取 dd = 2.0%、rb = 3.0% 时，**隐含上限 = 5.10%**：
+    #     振幅 ≤ (1.03/0.98) − 1 = 5.102%
+    # 该 5.102% 是 A 入口对"日内振幅"的真实隐含约束：振幅大于它的候选，
+    # 下界恒高于上界，必要价格区间为空，`_pending_primary_buy_confirmation`
+    # 直接以"A原入口必要价格区间已无交集"撤销委托。
+    # 含义（已实测，见 outputs/today_review_20260917/T2-9-T2-10-离线实验-20260917.md）：
+    #   * 实测 9,387 条"必要价格区间为空"的隐含振幅中位为 **7.14%**，远超 5.10%
+    #     -> 该区间对绝大多数候选恒为空，dd 这个参数长期形同虚设
+    #   * 但**不要据此放宽 dd**：T2-10 反事实显示解锁后的候选池
+    #     胜率仅 47%~50%、均值 ≈ 0（n=5,595），即过滤掉的是一个零边际群体
+    # 因此本参数的正确用法是"承认它只适用于窄振幅标的"，
+    # 若要让入场规则对宽振幅候选真正生效，应换成**单一自洽**的规则
+    # （需独立的可证伪假设与实验），而不是调大 dd。
+    # 改本参数或 rb 都会移动 5.102% 这条线，
+    # tests/test_a_entry_band_amplitude_cap_20260918.py 会同步校验。
     PAPER_INTRADAY_CONFIRM_MAX_PULLBACK_FROM_HIGH_PCT: float = 2.0
     # 旧PAPER_INTRADAY_CONFIRM_*仅归A；其他执行账户拥有各自的同值基线。
     # 可用JSON环境变量单独覆盖某账户，未提供的账户使用自身默认值，不继承A。
@@ -830,22 +851,13 @@ class Settings(BaseSettings):
     PAPER_AUTO_STOP_LOSS_PCT: float = 5.0
     PAPER_AUTO_SMALL_STOP_LOSS_PCT: float = 2.0
     PAPER_AUTO_NEXT_DAY_MIN_PROFIT_PCT: float = 0.5
-    # === 2026-09-18 文档化：A 策略必要价格区间的隐含振幅上限 ===
-    # `_stable_intraday_entry_quote` 的入场区间是两条约束的交集：
-    #     下界 = high × (1 − PAPER_STRATEGY_ITERATION_MAX_PULLBACK_FROM_HIGH_PCT)
-    #     上界 = low  × (1 + MAX_REBOUND_FROM_LOW_PCT 口径)
-    # 可解条件： high × (1 − dd) ≤ low × (1 + rb)
-    #        <=> 振幅 (high/low − 1) ≤ rb/(1 − dd) + dd/(1 − dd)
-    # 取 dd = 2.0%、rb = 3.0% 时，**隐含上限 = 5.10%**：
-    #     振幅 ≤ (1.03/0.98) − 1 = 5.102%
-    # 含义（已实测，见 outputs/today_review_20260917/T2-9-T2-10-离线实验-20260917.md）：
-    #   * 实测 9,387 条"必要价格区间为空"的隐含振幅中位为 **7.14%**，远超 5.10%
-    #     -> 该区间对绝大多数候选恒为空，dd 这个参数长期形同虚设
-    #   * 但**不要据此放宽 dd**：T2-10 反事实显示解锁后的候选池
-    #     胜率仅 47%~50%、均值 ≈ 0（n=5,595），即过滤掉的是一个零边际群体
-    # 因此本参数的正确用法是"承认它只适用于窄振幅标的"，
-    # 若要让入场规则对宽振幅候选真正生效，应换成**单一自洽**的规则
-    # （需独立的可证伪假设与实验），而不是调大 dd。
+    # 注意：本参数**不是** `_a_entry_price_band` 的必要价格区间下界来源。
+    # A 入口区间的两条约束分别取
+    # PAPER_INTRADAY_CONFIRM_MAX_PULLBACK_FROM_HIGH_PCT（下界）
+    # 与 PAPER_AUTO_VALUE_ENTRY_MAX_REBOUND_FROM_LOW_PCT（上界），
+    # 隐含振幅上限 5.102% 的推导见上面对应参数的注释与
+    # tests/test_a_entry_band_amplitude_cap_20260918.py。
+    # 本参数只用于较宽松的行情快照回撤提示，调它不会改变 A 的可买区间。
     PAPER_AUTO_PULLBACK_FROM_HIGH_PCT: float = 2.5
     PAPER_AUTO_VOLUME_NEGATIVE_RATIO: float = 1.2
     PAPER_AUTO_SECTOR_RETREAT_STRENGTH: float = 55.0
