@@ -60,6 +60,8 @@ PREDICTION_INTRADAY_CONTEXTS = {
     "promotion_1000",
     "promotion_1030",
     "promotion_1305",
+    "promotion_1400",
+    "promotion_1430",
 }
 PREDICTION_AUCTION_CONTEXTS = {"promotion_0925", "promotion_0935"}
 
@@ -536,6 +538,8 @@ class PredictionDataQualityAuditor:
             "promotion_1000": (time(9, 55), time(10, 15)),
             "promotion_1030": (time(10, 25), time(10, 45)),
             "promotion_1305": (time(13, 0), time(13, 20)),
+            "promotion_1400": (time(13, 55), time(14, 15)),
+            "promotion_1430": (time(14, 25), time(14, 45)),
         }
         invalid = []
         for record in records:

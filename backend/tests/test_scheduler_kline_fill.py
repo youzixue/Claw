@@ -252,6 +252,8 @@ def test_scheduler_registers_promotion_prediction_and_weekend_news_jobs():
         "promotion_prediction_1000",
         "promotion_prediction_1030",
         "promotion_prediction_1305",
+        "promotion_prediction_1400",
+        "promotion_prediction_1430",
         "auction_collect_0925",
         "news_weekend_refresh",
         "news_monday_weekend_backfill",
@@ -270,6 +272,8 @@ def test_scheduler_registers_promotion_prediction_and_weekend_news_jobs():
         "promotion_prediction_1000",
         "promotion_prediction_1030",
         "promotion_prediction_1305",
+        "promotion_prediction_1400",
+        "promotion_prediction_1430",
     ):
         prediction_job = scheduler.scheduler.get_job(job_id)
         assert prediction_job is not None

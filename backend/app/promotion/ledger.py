@@ -229,7 +229,8 @@ class ScheduleBatch:
     def validate(self) -> None:
         if not isinstance(self.snapshot_context, str) or self.snapshot_context not in {
             "promotion_0925", "promotion_0935", "promotion_1000",
-            "promotion_1030", "promotion_1305", "promotion_1510", "promotion_2000",
+            "promotion_1030", "promotion_1305", "promotion_1400",
+            "promotion_1430", "promotion_1510", "promotion_2000",
         }:
             raise ValueError("schedule_batch: unsupported_context")
         if (

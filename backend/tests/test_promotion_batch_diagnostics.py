@@ -417,7 +417,10 @@ async def test_read_only_endpoint_avoids_generation_storage_calendar_network(dat
     assert response.status_code == 200
     payload = response.json()
     assert payload["scope"] == "persisted_formal_attempts_read_only"
-    assert len(payload["contexts"]) == 7
+    # 上下文清单必须与官方窗口表同源，新增/删除时点不应再改这个数字。
+    assert {c["snapshot_context"] for c in payload["contexts"]} == set(
+        promotion._PROMOTION_OFFICIAL_CONTEXT_WINDOWS
+    )
     assert window(payload)["attempt_count"] == 1
 
 

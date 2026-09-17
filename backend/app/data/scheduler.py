@@ -108,7 +108,7 @@ def _promotion_news_source_health(
 def _promotion_prediction_snapshot_context(trigger: str, now: datetime | None = None) -> str:
     """给晋级预测调度快照生成稳定上下文名，便于隔离和复盘."""
     normalized = str(trigger or "").strip().lower()
-    for suffix in ("0925", "0935", "1000", "1030", "1305", "1510", "2000"):
+    for suffix in ("0925", "0935", "1000", "1030", "1305", "1400", "1430", "1510", "2000"):
         if normalized.endswith(suffix):
             return f"promotion_{suffix}"
     if normalized and normalized not in {"schedule", "scheduler", "cron"}:
@@ -123,6 +123,10 @@ def _promotion_prediction_snapshot_context(trigger: str, now: datetime | None = 
         return "promotion_1000" if current.minute < 25 else "promotion_1030"
     if current.hour == 13 and current.minute <= 20:
         return "promotion_1305"
+    if (current.hour == 13 and current.minute >= 55) or (current.hour == 14 and current.minute <= 15):
+        return "promotion_1400"
+    if current.hour == 14 and current.minute <= 45:
+        return "promotion_1430"
     if current.hour == 15:
         return "promotion_1510"
     if current.hour >= 20:
@@ -157,6 +161,10 @@ def _promotion_startup_catchup_trigger(now: datetime | None = None) -> str:
         return "promotion_prediction_1030"
     if 13 * 60 <= minutes < 13 * 60 + 20:
         return "promotion_prediction_1305"
+    if 13 * 60 + 55 <= minutes < 14 * 60 + 15:
+        return "promotion_prediction_1400"
+    if 14 * 60 + 25 <= minutes < 14 * 60 + 45:
+        return "promotion_prediction_1430"
     # Do not duplicate or widen producer windows. In particular, a restart at
     # 19:50 must not manufacture a nominal 20:00 snapshot ten minutes early.
     from app.api.v1.promotion import _PROMOTION_OFFICIAL_CONTEXT_WINDOWS
@@ -737,6 +745,8 @@ class DataScheduler:
             (10, 0, "promotion_prediction_1000", "主线扩散刷新快照(10:00)"),
             (10, 30, "promotion_prediction_1030", "主线扩散刷新快照(10:30)"),
             (13, 5, "promotion_prediction_1305", "主线扩散刷新快照(13:05)"),
+            (14, 0, "promotion_prediction_1400", "主线扩散刷新快照(14:00)"),
+            (14, 30, "promotion_prediction_1430", "主线扩散刷新快照(14:30)"),
         ):
             self.scheduler.add_job(
                 self._prewarm_promotion_candidates,

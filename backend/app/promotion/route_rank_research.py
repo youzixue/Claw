@@ -25,7 +25,8 @@ RESEARCH_VERSION = "promotion_route_rank_research_v2_quality_contract"
 C_ROUTE = "mainline_spread_start"
 CONTEXTS = {
     "promotion_1510", "promotion_2000", "promotion_0925", "promotion_0935",
-    "promotion_1000", "promotion_1030", "promotion_1305",
+    "promotion_1000", "promotion_1030", "promotion_1305", "promotion_1400",
+    "promotion_1430",
 }
 
 

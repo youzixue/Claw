@@ -428,6 +428,8 @@ PROMOTION_MAINLINE_REFRESH_CONTEXTS = (
     "promotion_1000",
     "promotion_1030",
     "promotion_1305",
+    "promotion_1400",
+    "promotion_1430",
 )
 PROMOTION_INTRADAY_CONTEXTS = (
     *PROMOTION_OPEN_CONFIRM_CONTEXTS,
@@ -460,6 +462,8 @@ _PROMOTION_OFFICIAL_CONTEXT_WINDOWS = {
     "promotion_1000": ((9, 55), (10, 15)),
     "promotion_1030": ((10, 25), (10, 45)),
     "promotion_1305": ((13, 0), (13, 20)),
+    "promotion_1400": ((13, 55), (14, 15)),
+    "promotion_1430": ((14, 25), (14, 45)),
 }
 
 
@@ -8312,6 +8316,8 @@ async def _resolve_promotion_snapshot_news_end_time(
             "promotion_1000": (10, 0),
             "promotion_1030": (10, 30),
             "promotion_1305": (13, 5),
+            "promotion_1400": (14, 0),
+            "promotion_1430": (14, 30),
         }
         session_date = (
             trade_date

@@ -336,6 +336,8 @@ PAPER_MAINLINE_INTRADAY_CONTEXTS = (
     "promotion_1000",
     "promotion_1030",
     "promotion_1305",
+    "promotion_1400",
+    "promotion_1430",
 )
 PAPER_MAINLINE_ALLOWED_CONTEXTS = (
     "promotion_0925",
@@ -4921,7 +4923,7 @@ async def _promotion_route_buy_candidates(
     from app.models.promotion import PromotionPredictionRun, PromotionPredictionSnapshot
 
     # 15:10/20:00 只消费上一交易日收盘快照；B/D只用09:25/09:35开盘确认，
-    # C额外消费10:00/10:30/13:05主线刷新。先锁定该策略允许的最新批次，
+    # C额外消费10:00/10:30/13:05/14:00/14:30主线刷新。先锁定该策略允许的最新批次，
     # 再查具体赛道，确保质量失败或该批次无候选时都不会回退到更旧批次。
     previous_trade_date = await trade_calendar.previous_trade_day(trade_date)
     allowed_intraday_contexts = (
