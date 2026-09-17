@@ -241,6 +241,8 @@ def account_sell_params(account_name: str) -> dict[str, Any]:
         "open_noise_weak_min_evidence": settings.PAPER_AUTO_OPEN_NOISE_WEAK_MIN_EVIDENCE,
         # 2026-09-17 改1/改3：窗外弱信号 rung 的独立证据门槛也是隐式退出依赖
         "weak_exit_min_evidence": settings.PAPER_AUTO_WEAK_EXIT_MIN_EVIDENCE,
+        # 2026-09-17 改4：MIDLINE 到期平仓宽限天数（隐式退出依赖）
+        "expiry_grace_days": settings.PAPER_MIDLINE_EXPIRY_GRACE_DAYS,
     }
 
 
