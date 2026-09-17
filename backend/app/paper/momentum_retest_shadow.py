@@ -1045,6 +1045,37 @@ shadow_engine = MomentumRetestShadowEngine()
 _allowed_codes_date: date | None = None
 _allowed_codes: set[str] = set()
 _hydrated_date: date | None = None
+# 水位落库节流状态（进程内）。见 `scan_momentum_retest_shadow` 的注释：
+# 逐轮 commit 会给 SQLite 写锁紧张的热路径凭空加约 500 次写/天。
+_watermark_persisted_at: datetime | None = None
+_watermark_persist_pending: datetime | None = None
+
+
+def _watermark_min_interval_sec() -> float:
+    return max(
+        float(settings.PAPER_MOMENTUM_RETEST_WATERMARK_MIN_INTERVAL_SEC),
+        0.0,
+    )
+
+
+def _watermark_due(watermarked: datetime) -> bool:
+    """距上次落水是否已过节流间隔；节流为 0 时每轮都落。"""
+    global _watermark_persist_pending
+    interval = _watermark_min_interval_sec()
+    if interval <= 0 or _watermark_persisted_at is None:
+        _watermark_persist_pending = watermarked
+        return True
+    if (
+        watermarked - _watermark_persisted_at
+    ).total_seconds() >= interval:
+        _watermark_persist_pending = watermarked
+        return True
+    return False
+
+
+def _watermark_persisted_for(watermarked: datetime) -> bool:
+    """本次是否真的写过水位（决定无事件路径要不要 commit）。"""
+    return _watermark_persist_pending == watermarked
 
 
 async def _load_allowed_codes(db: AsyncSession, trade_date: date) -> set[str]:
@@ -1140,6 +1171,8 @@ async def _persist_consumer_watermark(
         },
     )
     await db.execute(statement)
+    global _watermark_persisted_at
+    _watermark_persisted_at = observed_at
 
 
 async def _persist_shadow_events(
@@ -1170,15 +1203,24 @@ async def scan_momentum_retest_shadow(
     pending = shadow_engine.observe_batch(
         quotes, observed_at, allowed_codes, coverage_loss=coverage_loss,
     )
-    # 无论本轮有没有产生事件都要落水位 —— 水位记的是「行情吃到了」，
+    # 无论本轮有没有产生事件都要推进水位 —— 水位记的是「行情吃到了」，
     # 而大多数轮次本就不产生事件。漏落会让重启后基线退回陈旧值。
+    #
+    # 但**必须节流**：SQLite 写锁本就紧张（实测 `database is locked`
+    # 9/15=306、9/16=304、9/17=501 次，并已造成 196 条
+    # 「隔离Challenger模拟账户执行失败」）。原先无事件时本函数**不写库**，
+    # 逐轮落水会给热路径凭空加约 500 次 commit/天。
+    #
+    # 节流上限由 `PAPER_MOMENTUM_RETEST_WATERMARK_MIN_INTERVAL_SEC` 控制
+    # （默认 120s）。安全性：水位最多陈旧 120s，叠加停机+重启约 20s，
+    # 首帧 gap ≤140s，仍低于 180s 阈值 ⇒ 幻影缺口不会因此误判。
     watermarked = shadow_engine.consumer_watermark()
-    if watermarked is not None:
-        await _persist_consumer_watermark(
-            db, observed_at.date(), watermarked,
-        )
+    if watermarked is not None and _watermark_due(watermarked):
+        await _persist_consumer_watermark(db, observed_at.date(), watermarked)
     if not pending:
-        await db.commit()
+        # 只有真的写过水位才需要 commit；否则保持原「无事件不写库」的行为。
+        if watermarked is not None and _watermark_persisted_for(watermarked):
+            await db.commit()
         return {"events": 0, "confirmed": 0}
     await _persist_shadow_events(db, pending)
     shadow_engine.ack(item["event_key"] for item in pending)

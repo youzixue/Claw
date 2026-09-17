@@ -382,6 +382,12 @@ class Settings(BaseSettings):
     # 允许 `coverage_blocked` 在「连续性恢复 + 重新观察到武装低点」时解除，
     # 不再当日永久出局。置 False 回到原终态语义。
     PAPER_MOMENTUM_RETEST_ALLOW_COVERAGE_BLOCK_REARM: bool = True
+    # 消费者水位落库的**最小间隔**（秒）。逐轮 commit 会给 SQLite 写锁紧张的
+    # 热路径凭空加约 500 次写/天（实测 `database is locked` 9/15=306、
+    # 9/16=304、9/17=501 次，并已造成 196 条「隔离Challenger模拟账户执行失败」）。
+    # 默认 120s：水位最多陈旧 120s，叠加停机+重启约 20s，首帧 gap ≤140s，
+    # 仍低于 180s 阈值 ⇒ 不会把幻影缺口误判成真缺口。置 0 = 每轮都落（旧行为）。
+    PAPER_MOMENTUM_RETEST_WATERMARK_MIN_INTERVAL_SEC: float = 120.0
     # 仅缓存前向采集的A2证据帧；超过上限必须显式阻断路径，不能静默合并。
     PAPER_MOMENTUM_RETEST_QUOTE_INBOX_MAX_BATCHES: int = 6
     PAPER_MOMENTUM_RETEST_MIN_TRACK_SEC: int = 60

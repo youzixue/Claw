@@ -1067,3 +1067,46 @@ def test_other_terminal_states_still_ignore_subsequent_frames():
     assert state.stage == "confirmed"
     assert (state.last_at, state.observation_count, len(state.quote_history)) == before, \
         "终态不得被后续帧改写"
+
+
+def test_watermark_persist_is_throttled():
+    """水位落库必须节流 —— 逐轮 commit 会加剧 SQLite 写锁竞争。
+
+    实测 `database is locked`：9/15=306、9/16=304、9/17=501 次，并已造成
+    196 条「隔离Challenger模拟账户执行失败」。安全性：水位最多陈旧 120s，
+    叠加停机+重启约 20s，首帧 gap ≤140s < 180s 阈值。
+    """
+    import app.paper.momentum_retest_shadow as module
+
+    base = datetime(2026, 9, 17, 9, 40, 0)
+    saved = (
+        module._watermark_persisted_at,
+        module._watermark_persist_pending,
+    )
+    try:
+        module._watermark_persisted_at = base
+        assert module._watermark_due(base + timedelta(seconds=30)) is False
+        assert module._watermark_due(base + timedelta(seconds=119)) is False
+        assert module._watermark_due(base + timedelta(seconds=120)) is True
+        # 节流后最坏缺口仍低于**生产**策略阈值（测试里的 _policy 是手工构造的 90s）
+        from app.config.settings import settings
+
+        worst_gap = module._watermark_min_interval_sec() + 20
+        assert worst_gap < settings.PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC
+    finally:
+        (
+            module._watermark_persisted_at,
+            module._watermark_persist_pending,
+        ) = saved
+
+
+def test_watermark_due_always_true_when_throttle_disabled(monkeypatch):
+    """节流置 0 ⇒ 每轮都落（可回到旧行为）。"""
+    import app.paper.momentum_retest_shadow as module
+
+    monkeypatch.setattr(
+        module.settings, "PAPER_MOMENTUM_RETEST_WATERMARK_MIN_INTERVAL_SEC", 0.0
+    )
+    base = datetime(2026, 9, 17, 9, 40, 0)
+    module._watermark_persisted_at = base
+    assert module._watermark_due(base) is True
