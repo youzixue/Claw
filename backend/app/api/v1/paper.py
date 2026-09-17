@@ -7045,6 +7045,19 @@ def _short_sell_reason(
         if (params or {}).get("open_noise_weak_min_evidence") is not None
         else settings.PAPER_AUTO_OPEN_NOISE_WEAK_MIN_EVIDENCE
     )
+    # 2026-09-17 复盘 改1/改3：窗外弱信号 rung 的独立证据门槛。
+    # 这些 rung 只依赖"价格低于某条参考线"，此前在开盘噪声窗之外零门槛，
+    # 实测 62% 的盈利持仓被它们提前平掉（平均只拿到 +1.51%，止盈组 +9.90%）。
+    weak_exit_min_evidence = int(
+        (params or {}).get("weak_exit_min_evidence")
+        if (params or {}).get("weak_exit_min_evidence") is not None
+        else settings.PAPER_AUTO_WEAK_EXIT_MIN_EVIDENCE
+    )
+    # 冷门门槛：0 = 关闭（恢复修复前行为），否则要求 independent_evidence 达标
+    weak_exit_allowed = (
+        weak_exit_min_evidence <= 0
+        or independent_evidence >= weak_exit_min_evidence
+    )
 
     if prev_was_limit_up:
         if price is not None and limit_down and limit_down > 0 and price <= limit_down * 1.002:
@@ -7083,23 +7096,26 @@ def _short_sell_reason(
         high_profit = (high / position.buy_price - 1) * 100
         pullback = (price / high - 1) * 100 if high else 0
         if (
-            high_profit >= breakeven_protect_high_profit_pct
+            weak_exit_allowed
+            and high_profit >= breakeven_protect_high_profit_pct
             and breakeven_protect_low_pct <= profit_pct <= breakeven_protect_high_pct
         ):
             return f"回落成本线保护：当日日高相对成本{high_profit:.2f}%（非持仓最高浮盈），当前盈亏{profit_pct:.2f}%"
-        if high_profit >= 1.8 and pullback <= -pullback_from_high_pct:
+        if weak_exit_allowed and high_profit >= 1.8 and pullback <= -pullback_from_high_pct:
             return f"盘中冲高回落：当日日高相对成本{high_profit:.2f}%（非持仓最高浮盈），从当日日高回落{abs(pullback):.2f}%"
-        if high_profit >= 1.8 and close_position is not None and close_position < 0.35:
+        if weak_exit_allowed and high_profit >= 1.8 and close_position is not None and close_position < 0.35:
             return f"盘中收弱：当日日高相对成本{high_profit:.2f}%（非持仓最高浮盈），收盘位置{close_position:.2f}"
-    if price is not None and avg_price is not None and price < avg_price and profit_pct <= 0.5 and hold_days >= 1:
+    if (weak_exit_allowed and price is not None and avg_price is not None
+            and price < avg_price and profit_pct <= 0.5 and hold_days >= 1):
         return f"跌破分时均价：现价{price:.2f} < 均价{avg_price:.2f}，短线转弱"
-    if price is not None and open_price is not None and price < open_price and profit_pct <= 0.5 and hold_days >= 1:
+    if (weak_exit_allowed and price is not None and open_price is not None
+            and price < open_price and profit_pct <= 0.5 and hold_days >= 1):
         return f"跌破开盘价：现价{price:.2f} < 开盘{open_price:.2f}，短线转弱"
     if min5_change is not None and min5_change <= -1.0 and profit_pct <= 1.0 and hold_days >= 1:
         return f"5分钟急跌：{min5_change:.2f}%"
     if orderbook_imbalance is not None and orderbook_imbalance <= -0.35 and profit_pct <= 1.0 and hold_days >= 1:
         return f"盘口卖压增强：五档失衡{orderbook_imbalance:.2f}"
-    if hold_days >= 1 and profit_pct < next_day_min_profit_pct:
+    if weak_exit_allowed and hold_days >= 1 and profit_pct < next_day_min_profit_pct:
         weak_parts = []
         if change_pct is not None:
             weak_parts.append(f"当日涨幅{change_pct:.2f}%")
@@ -7107,7 +7123,8 @@ def _short_sell_reason(
             weak_parts.append(f"现价{price:.2f}/MA5 {ma5:.2f}")
         detail = "，".join(weak_parts) if weak_parts else f"盈亏{profit_pct:.2f}%"
         return f"次日不强就走：{detail}"
-    if ma5 is not None and price is not None and price < ma5 and hold_days >= 1:
+    if (weak_exit_allowed and ma5 is not None and price is not None
+            and price < ma5 and hold_days >= 1):
         return f"跌破5日线：现价{price:.2f} < MA5 {ma5:.2f}"
     if (
         volume_ratio is not None

@@ -40,6 +40,8 @@ def test_sell_profile_contains_every_implicit_short_exit_dependency():
         # 2026-09-17 复盘修复：开盘噪声窗的独立走弱证据门槛也是隐式退出依赖，
         # 必须随账户参数冻结并进入 exit_parameters 审计，否则窗内豁免无法回放。
         "open_noise_stop_min_evidence", "open_noise_weak_min_evidence",
+        # 2026-09-17 改1/改3：窗外弱信号 rung 的独立证据门槛
+        "weak_exit_min_evidence",
     }
 
     for account_name in ACCOUNT_NAMES:

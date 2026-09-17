@@ -677,7 +677,10 @@ def test_short_sell_reason_uses_tighter_intraday_rules():
     # 2026-08-31 复盘：PULLBACK_FROM_HIGH_PCT 1.5 -> 2.5，需要从高点回落 >= 2.5%
     pullback = paper._short_sell_reason(
         position,
-        {"price": 10.15, "high": 10.42, "close_position": 0.3},
+        # 2026-09-17 改3：弱信号 rung 现要求 ≥2 项独立走弱证据，
+        # 这里补 ma5 破位 + 五档卖压；触发阈值本身未变。
+        {"price": 10.15, "high": 10.42, "close_position": 0.3,
+         "ma5": 10.30, "orderbook_imbalance": -0.5},
         profit_pct=1.5,
         hold_days=1,
         trade_date=datetime.now().date(),
@@ -697,7 +700,9 @@ def test_short_sell_reason_protects_breakeven_after_intraday_profit():
     # 2026-08-31 复盘：BREAKEVEN_PROTECT_HIGH_PROFIT_PCT 1.5 -> 3.0，最高浮盈需 >= 3.0%
     reason = paper._short_sell_reason(
         position,
-        {"price": 10.02, "high": 10.4, "close_position": 0.5},
+        # 2026-09-17 改3：同上，补两项独立证据
+        {"price": 10.02, "high": 10.4, "close_position": 0.5,
+         "ma5": 10.20, "orderbook_imbalance": -0.5},
         profit_pct=0.2,
         hold_days=1,
         trade_date=datetime.now().date(),

@@ -40,8 +40,11 @@ def test_session_high_is_not_post_entry_high_and_rule_is_unchanged():
     state, changed = step(pos=pos)
     assert changed and state["post_entry_high"] == 8.07
     assert state["post_entry_high"] != 8.30
+    # 2026-09-17 改3：弱信号 rung 现要求 ≥2 项独立走弱证据；断言的是
+    # "session_high 不是 post_entry_high" 与触发文案，故补证据而不改断言。
     ctx = {"price": 8.07, "high": 8.30, "open": 7.98, "change_pct": .75,
-           "limit_down": 7.21, "stop_loss_price": 7.78, "close_position": .5}
+           "limit_down": 7.21, "stop_loss_price": 7.78, "close_position": .5,
+           "ma5": 8.20, "orderbook_imbalance": -0.5}
     exit_audit.attach_exit_audit(ctx, position=pos, extrema=state, quote_ok=True)
     reason = paper._short_sell_reason(pos, ctx, -.738, 0, AT.date(), AT,
                                       params={"pullback_from_high_pct": 2.5})
@@ -149,8 +152,10 @@ async def test_trigger_survives_all_execution_blocks(paper_client, monkeypatch, 
     from app.trading import service
     _, maker = paper_client
     async def build(*_args):
+        # 2026-09-17 改3：弱信号 rung 现要求 ≥2 项独立走弱证据
         return {"price": 8.07, "high": 8.30, "open": 7.98, "change_pct": .75,
-                "stop_loss_price": 7.78, "close_position": .5}
+                "stop_loss_price": 7.78, "close_position": .5,
+                "ma5": 8.20, "orderbook_imbalance": -0.5}
     async def fetch(*_args): return spot()
     async def available(*_args): return 0 if mode in {"t1", "audit_error"} else 100
     async def stats(*_args): return {"amount": 0}

@@ -333,10 +333,14 @@ def test_weak_trigger_blocked_in_window_without_independent_evidence():
 
 
 def test_weak_trigger_allowed_in_window_with_independent_evidence():
-    """窗前、带 1 项独立证据（放量下跌）的弱触发可提前生效，减轻 09:45 集中释放。"""
+    """窗前、带 ≥2 项独立证据的弱触发可提前生效，减轻 09:45 集中释放。
+
+    注：改1/改3 之后窗外 rung 门槛为 2，它同时约束窗内——
+    窗内实际门槛 = max(open_noise_weak_min_evidence=1, weak_exit_min_evidence=2) = 2。
+    """
     reason = _short_sell_reason(
         _weak_position(),
-        _weak_ctx(volume_ratio=2.5, change_pct=-1.2), profit_pct=-0.4, hold_days=1,
+        _weak_ctx(volume_ratio=2.5, change_pct=-1.2, ma5=10.05), profit_pct=-0.4, hold_days=1,
         trade_date=datetime(2026, 9, 17).date(), now=AT_0931, params=WEAK_PARAMS,
     )
     assert reason.startswith("跌破分时均价"), reason
@@ -344,7 +348,8 @@ def test_weak_trigger_allowed_in_window_with_independent_evidence():
 
 def test_weak_trigger_orderbook_evidence_allowed_in_window():
     reason = _short_sell_reason(
-        _weak_position(), _weak_ctx(orderbook_imbalance=-0.55), profit_pct=-0.4, hold_days=1,
+        _weak_position(), _weak_ctx(orderbook_imbalance=-0.55, ma5=10.05),
+        profit_pct=-0.4, hold_days=1,
         trade_date=datetime(2026, 9, 17).date(), now=AT_0931, params=WEAK_PARAMS,
     )
     assert reason.startswith("跌破分时均价"), reason
@@ -352,7 +357,8 @@ def test_weak_trigger_orderbook_evidence_allowed_in_window():
 
 def test_weak_trigger_min5_evidence_allowed_in_window():
     reason = _short_sell_reason(
-        _weak_position(), _weak_ctx(min5_change=-1.6), profit_pct=-0.4, hold_days=1,
+        _weak_position(), _weak_ctx(min5_change=-1.6, ma5=10.05),
+        profit_pct=-0.4, hold_days=1,
         trade_date=datetime(2026, 9, 17).date(), now=AT_0931, params=WEAK_PARAMS,
     )
     assert reason.startswith("跌破分时均价"), reason
@@ -369,14 +375,32 @@ def test_weak_hard_block_restorable_with_99():
     assert reason == ""
 
 
-def test_weak_trigger_unaffected_after_window():
-    """窗外不受门槛约束，零独立证据也照常触发。"""
-    reason = _short_sell_reason(
+def test_weak_trigger_after_window_uses_same_gate():
+    """2026-09-17 改3 后：窗外与窗内使用同一证据门槛，不产生新的时点跳变。
+
+    修复前窗外零门槛 → 实测 21 笔盈利持仓中 13 笔（62%）被这些 rung 提前平掉
+    （平均只拿到 +1.51%，止盈组 +9.90%）。
+    本用例的行情零独立证据，因此窗内窗外都必须被拦下。
+    """
+    inside = _short_sell_reason(
+        _weak_position(), _weak_ctx(), profit_pct=-0.4, hold_days=1,
+        trade_date=datetime(2026, 9, 17).date(), now=AT_0931, params=WEAK_PARAMS,
+    )
+    outside = _short_sell_reason(
         _weak_position(), _weak_ctx(), profit_pct=-0.4, hold_days=1,
         trade_date=datetime(2026, 9, 17).date(),
         now=datetime(2026, 9, 17, 10, 30, 0), params=WEAK_PARAMS,
     )
-    assert reason.startswith("跌破分时均价"), reason
+    assert inside == outside == ""
+
+    # 带 1 项独立证据后，窗外照常生效（不误伤真实走弱）
+    with_evidence = _short_sell_reason(
+        _weak_position(), _weak_ctx(volume_ratio=2.5, change_pct=-1.2, ma5=10.05),
+        profit_pct=-0.4, hold_days=1,
+        trade_date=datetime(2026, 9, 17).date(),
+        now=datetime(2026, 9, 17, 10, 30, 0), params=WEAK_PARAMS,
+    )
+    assert with_evidence.startswith("跌破分时均价"), with_evidence
 
 
 # --------------------------------------------------------------------------
@@ -434,4 +458,130 @@ def test_missing_market_data_is_safe():
         profit_pct=-1.0, hold_days=1,
         trade_date=datetime(2026, 9, 17).date(), now=AT_0931, params=WEAK_PARAMS,
     )
+    assert reason == ""
+
+
+# --------------------------------------------------------------------------
+# 5. 改1/改3（2026-09-17）：窗外弱信号 rung 的独立证据门槛
+#    实测背景：21 笔盈利持仓中 13 笔（62%）被这些 rung 提前平掉，
+#    平均只拿到 +1.51%，而走到止盈的 8 笔拿到 +9.90%。
+# --------------------------------------------------------------------------
+
+# 复用一个"只看价格低于参考线、无独立证据"的行情
+def _weak_out_ctx(**over):
+    ctx = {
+        "price": 9.96, "open": 9.95, "high": 10.08, "low": 9.95,
+        "change_pct": -0.40, "volume_ratio": 0.9, "avg_price": 10.00,
+        "ma5": 9.80, "orderbook_imbalance": 0.10, "min5_change": None,
+        "stop_loss_price": 9.00, "prev_was_limit_up": False,
+        "open_gap_from_prev_close_pct": 0.0, "limit_down": 9.00,
+    }
+    ctx.update(over)
+    return ctx
+
+
+OUT_PARAMS = {
+    "stop_loss_pct": 5.0, "small_stop_loss_pct": 5.0, "open_severe_stop_loss_pct": 5.0,
+    "open_noise_end": "09:45", "take_profit_pct": 8.0, "max_hold_days": 5,
+    "next_day_min_profit_pct": -99.0, "trade_t_enabled": False,
+    "pullback_from_high_pct": 2.5, "breakeven_protect_high_profit_pct": 3.0,
+    "breakeven_protect_low_pct": -0.2, "breakeven_protect_high_pct": 0.6,
+}
+AFTER_WINDOW = datetime(2026, 9, 17, 10, 30, 0)
+
+
+def _call(ctx, params=None, now=AFTER_WINDOW, profit=-0.4):
+    return _short_sell_reason(
+        _weak_position(), ctx, profit_pct=profit, hold_days=1,
+        trade_date=datetime(2026, 9, 17).date(), now=now,
+        params=params if params is not None else OUT_PARAMS,
+    )
+
+
+@pytest.mark.parametrize("rung,over", [
+    ("跌破分时均价", {}),
+    ("跌破开盘价", {"price": 9.90, "avg_price": 9.70}),
+])
+def test_weak_rungs_blocked_without_independent_evidence(rung, over):
+    """窗外、零独立证据：只依赖价格参考线的 rung 必须被拦下。"""
+    assert _call(_weak_out_ctx(**over)) == ""
+
+
+def test_weak_rung_needs_two_evidence_after_correction():
+    """门槛取 2：仅 1 项独立证据时弱信号仍被拦下。
+
+    依据：12 笔被砍盈利持仓的证据分布为 {0:2, 1:7, 2:3}——
+    门槛取 1 只能拦下 17%，等于没改；取 2 拦下 75%。
+    """
+    assert _call(_weak_out_ctx(ma5=10.05)) == ""                      # 只有 MA5 一项
+    # 注意：五档失衡单项会命中"盘口卖压增强"（该 rung 自带证据、不受门槛约束），
+    # 因此不能用它构造"只有 1 项证据"的用例。
+
+
+@pytest.mark.parametrize("over", [
+    {"ma5": 10.05, "volume_ratio": 2.5, "change_pct": -1.2},
+    {"ma5": 10.05, "orderbook_imbalance": -0.55},
+    {"orderbook_imbalance": -0.55, "min5_change": -1.6},
+])
+def test_weak_rungs_allowed_with_two_independent_evidence(over):
+    """窗外、带 ≥2 项独立证据：弱信号照常生效（不误伤真实走弱）。"""
+    assert _call(_weak_out_ctx(**over)).startswith("跌破分时均价")
+
+
+def test_ma5_break_rung_gated():
+    """跌破5日线本身是证据，但仍需 evidence>=1 —— 它自带证据故可通过；
+    而同样行情若把 ma5 放到价格下方，则不再触发该 rung。"""
+    ctx = _weak_out_ctx(ma5=10.05, avg_price=9.50, open=9.50, volume_ratio=2.5, change_pct=-1.2)
+    assert _call(ctx).startswith("跌破5日线")
+    assert _call(_weak_out_ctx(ma5=9.50, avg_price=9.50, open=9.50)) == ""
+
+
+def test_stop_loss_is_never_gated():
+    """关键：止损不受该门槛约束 —— 修复只应"让赢家跑"，不得削弱止损。"""
+    ctx = _weak_out_ctx(price=9.40, stop_loss_price=9.50,
+                        ma5=9.10, avg_price=9.10, open=9.10,
+                        orderbook_imbalance=0.3, volume_ratio=0.5, change_pct=-1.0)
+    assert _call(ctx, profit=-6.0).startswith("触发持仓止损价")
+
+
+def test_take_profit_is_never_gated():
+    """止盈也不受门槛约束。"""
+    ctx = _weak_out_ctx(price=10.90, ma5=9.10, avg_price=9.10, open=9.10,
+                        orderbook_imbalance=0.3, volume_ratio=0.5, change_pct=5.0)
+    assert _call(ctx, profit=9.0).startswith("触发短线止盈")
+
+
+def test_threshold_zero_restores_previous_behaviour():
+    """置 0 必须精确复现修复前行为（窗外弱信号零门槛）。"""
+    params = dict(OUT_PARAMS); params["weak_exit_min_evidence"] = 0
+    assert _call(_weak_out_ctx(), params=params).startswith("跌破分时均价")
+    # 也复现"门槛 1"的中间状态
+    params["weak_exit_min_evidence"] = 1
+    assert _call(_weak_out_ctx(ma5=10.05), params=params).startswith("跌破分时均价")
+
+
+def test_gate_applies_inside_window_too():
+    """窗内门槛更严（open_noise_weak_min_evidence 默认 1），窗外门槛同样为 1 —— 
+    两侧一致，不产生新的时点跳变。"""
+    inside = _call(_weak_out_ctx(), now=AT_0931)
+    outside = _call(_weak_out_ctx(), now=AFTER_WINDOW)
+    assert inside == outside == ""
+
+
+def test_self_corroborating_rungs_unaffected():
+    """自带证据的 rung 不受该门槛影响：盘口卖压增强 / 5分钟急跌。"""
+    # 阶梯顺序：5分钟急跌(7089) 先于 盘口卖压增强(7090)
+    assert _call(_weak_out_ctx(min5_change=-1.5, price=9.98,
+                               avg_price=9.70, open=9.70, ma5=9.50)).startswith("5分钟急跌")
+    assert _call(_weak_out_ctx(orderbook_imbalance=-0.55, price=9.98,
+                               avg_price=9.70, open=9.70, ma5=9.50)).startswith("盘口卖压增强")
+
+
+def test_missing_market_data_never_enables_weak_exit():
+    """缺数据时不得凭空产生独立证据，也不得抛异常。"""
+    reason = _call({"price": None, "open": None, "high": None, "change_pct": None,
+                    "volume_ratio": None, "avg_price": None, "ma5": None,
+                    "orderbook_imbalance": None, "min5_change": None,
+                    "stop_loss_price": None, "prev_was_limit_up": False,
+                    "limit_down": None})
     assert reason == ""

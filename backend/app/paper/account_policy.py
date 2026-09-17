@@ -239,6 +239,8 @@ def account_sell_params(account_name: str) -> dict[str, Any]:
         # 2026-09-17 复盘修复：开盘噪声窗独立证据门槛随账户参数冻结并进入 exit_parameters 审计。
         "open_noise_stop_min_evidence": settings.PAPER_AUTO_OPEN_NOISE_STOP_MIN_EVIDENCE,
         "open_noise_weak_min_evidence": settings.PAPER_AUTO_OPEN_NOISE_WEAK_MIN_EVIDENCE,
+        # 2026-09-17 改1/改3：窗外弱信号 rung 的独立证据门槛也是隐式退出依赖
+        "weak_exit_min_evidence": settings.PAPER_AUTO_WEAK_EXIT_MIN_EVIDENCE,
     }
 
 
