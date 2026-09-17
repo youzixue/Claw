@@ -218,7 +218,16 @@ class StockTagger:
         """增量标记；映射缺失/False不构成摘帽或复牌证据，不清除既有风险。"""
         board_type = self.get_board_type(code)
         if board_type == "unknown":
-            raise ValueError("invalid_or_unknown_stock_code")
+            # 2026-09-18：原实现只抛裸字符串，导致 data_source_health 里
+            # pywencai/stock_mapping 报 invalid_or_unknown_stock_code 时
+            # **无法知道是哪个代码**，只能靠猜。现把代码与已登记前缀一并带出。
+            # 注意：调用方以 `match="invalid_or_unknown_stock_code"` 匹配前缀，
+            # 追加后缀不影响既有测试。
+            raise ValueError(
+                f"invalid_or_unknown_stock_code: code={code!r} "
+                f"prefix={str(code)[:3]!r} "
+                f"（请在 stock_tagger.CODE_PREFIX_MAP 登记该号段）"
+            )
         tag = await session.get(StockTag, code)
         if tag is None:
             tag = StockTag(code=code, board_type=board_type,
