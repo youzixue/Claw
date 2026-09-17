@@ -512,6 +512,38 @@ async def _stock_status_fail_streak(session: AsyncSession) -> int:
     return int(value or 0)
 
 
+# ── 生产研究宇宙的通用过滤（2026-09-17 复盘）────────────────────────────
+# 收盘快照覆盖率门槛（completeness >= 0.99）在生产上被判 blocked：
+# health canonical=5182 / expected=5240 = 0.988931，差 6 只。根因是分母纳入了
+# 两类"行情源结构性无法覆盖"的标的：
+#   1) 北交所 51 只 —— 920xxx 在 stock_spot / stock_kline 中 0 行，腾讯实时源
+#      不提供；用户已明确不关注北交所（也无创业板/科创板交易权限）
+#   2) 名称以"退"结尾的退市股 4 只（国华退/恒久退/赛隆退/立方退）—— 原过滤
+#      只排除 "退%" 前缀形式，漏掉 A 股实际使用的后缀形式
+# 排除后 expected=5185 / canonical=5182 = 0.999421，门槛可通过（余量 48 只）。
+# 该过滤只界定"哪些标的必须被收盘快照覆盖"，不改变任何个股的可交易性与风控
+# 口径；沪深主板、创业板、科创板全部保留在观测宇宙内。
+_UNOBSERVABLE_CODE_PATTERNS = ("4%", "8%", "92%")  # 与 price_limit_rules.board_for_code 的 bse 段一致
+
+
+def _research_universe_filters() -> tuple:
+    """收盘快照判定、腾讯行情采集、盘后K线采集共用的宇宙过滤条件。"""
+    return (
+        or_(
+            StockTag.board_tag.in_(["tradeable", "observe_only"]),
+            StockTag.is_st.is_(True),
+        ),
+        StockTag.is_suspended.is_(False),
+        # 退市股：前缀("退市XX")与后缀("XX退")两种历史命名都要排除
+        or_(
+            StockTag.name.is_(None),
+            and_(~StockTag.name.like("退%"), ~StockTag.name.like("%退")),
+        ),
+        # 行情源结构性不可覆盖
+        *(~StockTag.code.like(pattern) for pattern in _UNOBSERVABLE_CODE_PATTERNS),
+    )
+
+
 class DataScheduler:
     """数据采集调度器 — 采集+写入一体化"""
 
@@ -4423,14 +4455,7 @@ class DataScheduler:
             StockKline.low <= StockKline.open,
             StockKline.low <= StockKline.close,
         )
-        scope_filters = (
-            or_(
-                StockTag.board_tag.in_(["tradeable", "observe_only"]),
-                StockTag.is_st.is_(True),
-            ),
-            StockTag.is_suspended.is_(False),
-            or_(StockTag.name.is_(None), ~StockTag.name.like("退%")),
-        )
+        scope_filters = _research_universe_filters()
         expected = int(
             await session.scalar(
                 select(func.count()).select_from(StockTag).where(*scope_filters)
@@ -4778,14 +4803,7 @@ class DataScheduler:
         if not self._tradeable_codes:
             async with async_session() as session:
                 result = await session.execute(
-                    select(StockTag.code).where(
-                        or_(
-                            StockTag.board_tag.in_(["tradeable", "observe_only"]),
-                            StockTag.is_st == True,
-                        ),
-                        StockTag.is_suspended == False,
-                        or_(StockTag.name.is_(None), ~StockTag.name.like("退%")),
-                    )
+                    select(StockTag.code).where(*_research_universe_filters())
                 )
                 self._tradeable_codes = [r[0] for r in result.all()]
                 logger.info(f"[tencent] 可交易+仅观察+ST研究行情: {len(self._tradeable_codes)}只")
@@ -4932,14 +4950,7 @@ class DataScheduler:
 
         async with async_session() as session:
             result = await session.execute(
-                select(StockTag.code).where(
-                    or_(
-                        StockTag.board_tag.in_(["tradeable", "observe_only"]),
-                        StockTag.is_st == True,
-                    ),
-                    StockTag.is_suspended == False,
-                    or_(StockTag.name.is_(None), ~StockTag.name.like("退%")),
-                )
+                select(StockTag.code).where(*_research_universe_filters())
             )
             codes = [r[0] for r in result.all()]
 

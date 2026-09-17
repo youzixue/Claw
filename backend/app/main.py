@@ -7,7 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.config.settings import settings
+from app.core.tls_trust import install_extra_ca_bundle
 from app.db.session import engine, init_db
+
+# 必须早于任何数据源网络调用：把随仓库携带的缺失 CA 中间证书并入进程信任源。
+# 背景：申万个股行业分类文件的服务端不下发中间证书，导致 shenwan/stock_mapping
+# 长期 down（已验证仅用 certifi 仍失败）。此处补齐证书链，而非关闭校验。
+install_extra_ca_bundle()
 from app.api.v1 import (
     dashboard, sectors, stocks, tenbagger, promotion,
     sentiment, news, risk, governance, performance, paper, ws,
