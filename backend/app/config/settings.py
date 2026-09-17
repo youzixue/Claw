@@ -379,6 +379,14 @@ class Settings(BaseSettings):
     # 注意交易时段边界（09:24→09:30 的 361s、午休 11:29→13:00）不属此类：
     # 午休已在 `trading_elapsed_seconds` 里冻结，开盘边界由引擎的窗口判定处理。
     PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC: int = 180
+    # === 2026-09-18 解耦：通用报价轮次连续性阈值 ===
+    # `quote_round_continuity()` 的 max_gap_sec 此前复用了 momentum 路由的专用阈值，
+    # 导致把"MOMENTUM 消费者水位落库节流（120s）× 30s 轮次 = 最坏 140s"
+    # 这一**策略专用**容忍度，泄漏成了**通用**的报价连续性阈值（90 -> 180），
+    # 使 PipelineRuntimeHealth 的 stale 判定被放宽，4 个通用用例因此失败。
+    # 现拆开：本值只用于通用连续性/健康判定（与 30s 轮次节奏匹配）；
+    # momentum 路由仍用 PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC（180）。
+    QUOTE_ROUND_CONTINUITY_MAX_GAP_SEC: int = 90
     # 允许 `coverage_blocked` 在「连续性恢复 + 重新观察到武装低点」时解除，
     # 不再当日永久出局。置 False 回到原终态语义。
     PAPER_MOMENTUM_RETEST_ALLOW_COVERAGE_BLOCK_REARM: bool = True

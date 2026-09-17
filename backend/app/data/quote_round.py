@@ -96,8 +96,9 @@ def quote_round_continuity(
         "committed_at": current.isoformat() if current else None,
         "wall_gap_sec": None,
         "active_gap_sec": None,
-        "max_gap_sec": int(settings.PAPER_MOMENTUM_RETEST_MAX_QUOTE_GAP_SEC),
-        "threshold_consumer": "momentum_first_retest",
+        # 2026-09-18：本值是**通用**报价轮次连续性阈值，不再复用 momentum 专用阈值
+        "max_gap_sec": int(settings.QUOTE_ROUND_CONTINUITY_MAX_GAP_SEC),
+        "threshold_consumer": "quote_round_continuity",
         "per_stock_clock_check_required": True,
     }
     if current is None or previous is None:
