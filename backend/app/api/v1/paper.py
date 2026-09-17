@@ -6077,8 +6077,24 @@ def _midline_sell_reason(
         return f"触发硬止损：{profit_pct:.2f}%"
     if profit_pct >= take_profit_pct:
         return f"触发短线止盈：{profit_pct:.2f}%"
+    # 2026-09-17 改4：到期平仓不再无条件砍掉盈利仓。
+    # 实测个案：账户12 603980 持仓 5 日到期时盈利 +1.80% 被平，
+    # 而该账户的目标止盈是 +8.0% —— 属于"赢家被提前平掉"的同一类问题。
+    # 现改为：到期时仅在未盈利时平仓；盈利仓给出宽限天数，
+    # 满宽限后仍强制平仓以避免无限持有。
+    # grace=0 时与修复前完全等价（到期无条件平仓）。
+    expiry_grace_days = int((params or {}).get("expiry_grace_days")
+                            if (params or {}).get("expiry_grace_days") is not None
+                            else settings.PAPER_MIDLINE_EXPIRY_GRACE_DAYS)
     if hold_days >= max_hold_days:
-        return f"持仓{hold_days}个交易日到期平仓"
+        if profit_pct <= 0:
+            return f"持仓{hold_days}个交易日到期平仓"
+        if expiry_grace_days <= 0 or hold_days >= max_hold_days + expiry_grace_days:
+            # grace<=0 时返回与修复前逐字相同的文案，保证可精确回退
+            if expiry_grace_days <= 0:
+                return f"持仓{hold_days}个交易日到期平仓"
+            return (f"持仓{hold_days}个交易日到期平仓"
+                    f"（盈利{profit_pct:.2f}%，已用满 {expiry_grace_days} 日宽限）")
     return ""
 
 
