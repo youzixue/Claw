@@ -1400,3 +1400,55 @@ async def test_close_health_does_not_certify_bad_old_rows_by_source_label(schedu
             assert health["stale_tencent_close_count"] == 0  # invalid != stale
             assert health["qualified_tencent_close_count"] == 0
 
+
+
+def test_unavailable_and_invalid_sentiment_fields_are_distinguishable():
+    """2026-09-18：`main_net_inflow=None` 是"拿不到"，不是"数值非法"。
+
+    9/15–9/17 连续三日 `market_sentiment/snapshot` 报
+    `情绪数值无效: main_net_inflow`，把"当日资金流一条都没通过新鲜度校验"
+    误报成数值非法，告警无法指向真因。两者都仍关闭情绪闸门（degraded、
+    completeness 0），行为不变，只是原因可区分。
+    """
+    base = dict(
+        limit_up_count=60, limit_down_count=3, broken_limit_count=10,
+        seal_rate=85.7, board_height=6, advance_decline_ratio=2.0,
+        breadth_sample_count=5000, breadth_coverage=1.0,
+        index_avg_change_pct=0.8, index_sample_count=3,
+        turnover_total=1.2, fund_flow_coverage=1.0,
+    )
+
+    unavailable = _calculate_market_sentiment_state(main_net_inflow=None, **base)
+    assert unavailable["quality_status"] == "degraded"
+    assert unavailable["quality_completeness"] == 0.0
+    assert unavailable["unavailable_fields"] == ["main_net_inflow"]
+    assert unavailable["invalid_fields"] == []
+    assert "不可用" in unavailable["quality_reason"]
+    assert "无效" not in unavailable["quality_reason"]
+
+    invalid = _calculate_market_sentiment_state(main_net_inflow=float("nan"), **base)
+    assert invalid["quality_status"] == "degraded"
+    assert invalid["invalid_fields"] == ["main_net_inflow"]
+    assert invalid["unavailable_fields"] == []
+    assert "无效" in invalid["quality_reason"]
+
+    overflow = _calculate_market_sentiment_state(main_net_inflow=0.0, **{**base, "turnover_total": float("inf")})
+    assert overflow["invalid_fields"] == ["turnover_total"]
+
+    healthy = _calculate_market_sentiment_state(main_net_inflow=12.5, **base)
+    assert healthy["quality_status"] == "ok"
+    assert healthy["unavailable_fields"] == [] and healthy["invalid_fields"] == []
+
+
+def test_unavailable_index_keeps_its_established_downstream_path():
+    """`index_avg_change_pct=None` 有既有降级路径，不得被当成"字段不可用"提前返回。"""
+    state = _calculate_market_sentiment_state(
+        limit_up_count=60, limit_down_count=3, broken_limit_count=10,
+        seal_rate=85.7, board_height=6, main_net_inflow=12.5,
+        advance_decline_ratio=2.0, breadth_sample_count=5000, breadth_coverage=1.0,
+        index_avg_change_pct=None, index_sample_count=0,
+        turnover_total=1.2, fund_flow_coverage=1.0,
+    )
+    assert state["quality_reason"] != "情绪字段不可用: index_avg_change_pct"
+    assert "index_avg_change_pct" not in state.get("unavailable_fields", [])
+    assert "index_avg_change_pct" not in state.get("invalid_fields", [])

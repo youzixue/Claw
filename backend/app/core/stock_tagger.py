@@ -300,6 +300,20 @@ class StockTagger:
                 f"{skipped[:10]}{'...' if len(skipped) > 10 else ''}；"
                 "请在 CODE_PREFIX_MAP 登记号段后重跑"
             )
+            # 2026-09-18：跳过只写日志等于**静默丢标记** —— 数据源健康里看不到，
+            # 汇总告警也不会亮，只能靠人工翻日志。改成落一条可审计的健康记录：
+            # 首次出现记为 degraded，持续出现升级为 down，与其它采集失败同一口径。
+            from app.core.data_quality import data_quality_guard
+
+            await data_quality_guard.record_failure(
+                session,
+                "stock_tagger",
+                "unregistered_code_segment",
+                "invalid_or_unknown_stock_code: "
+                f"count={len(skipped)} "
+                f"prefixes={sorted({code[:3] for code in skipped})} "
+                f"codes={skipped[:20]}{'...' if len(skipped) > 20 else ''}",
+            )
         logger.info(f"批量标记完成: {count}只股票")
         return count
 

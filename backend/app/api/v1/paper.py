@@ -2694,6 +2694,59 @@ def _is_post_t_protect_exit_reason(reason: str) -> bool:
     ))
 
 
+_POST_T_PROTECT_PREFIXES = ("T后保护卖出：",)
+_T_PARTIAL_PREFIX_PATTERN = re.compile(r"^T减仓\d+股：")
+# 原因串的尾部是数值细节：VWAP58.63 / 2.53% / MA5=10.02 / -0.72%
+_EXIT_RUNG_TRAILING_NOISE = re.compile(r"[A-Za-z0-9\s.%=:：,+-]+$")
+
+
+def _exit_reason_rung_key(reason: str) -> str:
+    """把退出原因归一成"哪一条 rung"，用于判断是否**同一条**信号重复触发。
+
+    原因串里带数值（`跌破分时均价VWAP58.63`、`盘中冲高回落2.53%`），
+    直接比字符串永远不相等；`T减仓400股：` 前缀也会让同一 rung 看起来不同。
+    这里剥掉已知前缀与**尾部**数值细节，只留 rung 的中文标签。
+    不追求标签文本精确，只保证「同一 rung → 同一 key」的一致性。
+    """
+    text = str(reason or "")
+    for prefix in _POST_T_PROTECT_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    text = _T_PARTIAL_PREFIX_PATTERN.sub("", text)
+    # `板块退潮：传媒走弱` / `盘中收弱：收盘价接近日内低点` —— 冒号后是细节，不是 rung 身份
+    text = re.split(r"[：:；;]", text, maxsplit=1)[0]
+    label = _EXIT_RUNG_TRAILING_NOISE.sub("", text).strip()
+    return label or text[:8]
+
+
+def _post_t_protect_escalation_allowed(
+    *, reason: str, previous_rungs: set[str], params: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """T 减仓后是否允许把剩余仓位全部卖出（`T后保护卖出`）。
+
+    2026-09-17 复盘 改2：T 机制的设计意图是日内高抛低吸降成本，
+    但实现上"弱信号 -> T减仓 33% -> 同一条弱信号再触发 -> 保护性清仓"，
+    弱信号的实际效果等于清仓。实测历史 14 次 `T后保护卖出` 中
+    **8 次（57%）触发它的 rung 与当日 T 减仓是同一条**，
+    属于同一份证据被计了两次。
+    这里要求升级必须引入**当日尚未用过的 rung**：
+    同一 rung 重复出现只维持"已减仓、等回补或保护卖点"，
+    不同的 rung（例如 T 减仓来自止盈、保护来自冲高回落）仍照常全退。
+    """
+    if not bool((params or {}).get(
+        "t_protect_require_new_rung", settings.PAPER_AUTO_T_PROTECT_REQUIRE_NEW_RUNG
+    )):
+        return True, ""
+    rung = _exit_reason_rung_key(reason)
+    if rung not in previous_rungs:
+        return True, ""
+    return False, (
+        f"T后保护卖出需新证据：今日已按同一信号（{rung}）减仓，"
+        "同一份证据不得再次升级为清仓"
+    )
+
+
 def _auto_sell_amount(position: PaperPosition, available_amount: int, reason: str, *, params: Optional[dict] = None) -> int:
     params = params or {}
     available_amount = _round_lot(available_amount)
@@ -2781,17 +2834,24 @@ async def _today_sell_stats(
         )
     ).scalars().all()
     if not rows:
-        return {"amount": 0, "avg_price": None, "first_time": None}
+        return {
+            "amount": 0, "avg_price": None, "first_time": None,
+            "reasons": [], "rungs": set(),
+        }
 
     amount = sum(int(row.amount or 0) for row in rows)
     value = sum(float(row.price or 0) * int(row.amount or 0) for row in rows)
     first_time = rows[0].trade_time
     bought_after_sell = await _today_trade_amount(
         db, account_id, code, "buy", trade_date, first_time, as_of=as_of)
+    # 改2：把当日已用过的退出 rung 一并带出，供"同一证据不得二次升级"判定。
+    reasons = [str(row.reason or "") for row in rows]
     return {
         "amount": max(0, amount - bought_after_sell),
         "avg_price": round(value / amount, 4) if amount else None,
         "first_time": first_time,
+        "reasons": reasons,
+        "rungs": {_exit_reason_rung_key(item) for item in reasons},
     }
 
 
@@ -7374,11 +7434,19 @@ async def _run_auto_sells(
                 and int(today_sell_stats.get("amount") or 0) >= 100
                 and not _is_full_exit_reason(reason)
             ):
+                protect_allowed = False
+                protect_block_reason = "今日已做T减仓，等待回补或保护卖点"
                 if _is_post_t_protect_exit_reason(reason):
+                    protect_allowed, protect_block_reason = _post_t_protect_escalation_allowed(
+                        reason=reason,
+                        previous_rungs=set(today_sell_stats.get("rungs") or set()),
+                        params=sell_params,
+                    )
+                if protect_allowed:
                     sell_amount = available_amount
                     reason = f"T后保护卖出：{reason}"
                 else:
-                    block_exit(sell_ctx, code="intraday_t_already_sold", reason="今日已做T减仓，等待回补或保护卖点", status="waiting")
+                    block_exit(sell_ctx, code="intraday_t_already_sold", reason=protect_block_reason, status="waiting")
                     logs.append(await _add_auto_log(
                         db,
                         account_id=account.id,
@@ -7390,7 +7458,7 @@ async def _run_auto_sells(
                         name=position.name or "",
                         action="hold",
                         decision="wait",
-                        reason="今日已做T减仓，等待回补或保护卖点",
+                        reason=protect_block_reason,
                         price=price,
                         amount=position.buy_amount,
                         candidate=sell_ctx,

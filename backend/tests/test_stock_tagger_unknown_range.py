@@ -79,3 +79,77 @@ async def test_batch_tag_still_raises_for_direct_single_call(session):
     """单只 `tag_stock` 的严格校验保留 —— 只放宽批量路径的失败隔离。"""
     with pytest.raises(ValueError, match="invalid_or_unknown_stock_code"):
         await stock_tagger.tag_stock(session, code="777777", name="未登记")
+
+
+async def test_skipped_codes_become_an_auditable_health_signal(session):
+    """跳过不能只写日志：必须在 data_source_health 留下可查、会升级的记录。
+
+    2026-09-17 的 `invalid_or_unknown_stock_code` 只在日志里出现，
+    数据源健康表看不到，汇总告警不亮，只能人工翻日志才发现整批标记丢失。
+    """
+    from sqlalchemy import select
+
+    from app.models.risk import DataSourceHealth
+
+    stocks = [
+        {"code": "600000", "name": "浦发银行"},
+        {"code": "777777", "name": "未登记A"},
+        {"code": "888888", "name": "未登记B"},
+    ]
+    assert await stock_tagger.batch_tag(session, stocks) == 1
+
+    rows = (await session.scalars(
+        select(DataSourceHealth)
+        .where(DataSourceHealth.source == "stock_tagger")
+        .order_by(DataSourceHealth.id.desc())
+    )).all()
+    assert rows, "跳过未登记号段必须落健康记录"
+    latest = rows[0]
+    assert latest.api_name == "unregistered_code_segment"
+    assert latest.status == "degraded", "首次出现按 degraded，连续出现才升 down"
+    assert latest.fail_streak == 1
+    assert "777777" in latest.error_msg and "888888" in latest.error_msg
+    assert "'777'" in latest.error_msg and "'888'" in latest.error_msg
+
+    # 连续出现要升级为 down，否则长期未登记号段会被当成一次性抖动
+    assert await stock_tagger.batch_tag(session, stocks) == 1
+    assert await stock_tagger.batch_tag(session, stocks) == 1
+    latest = (await session.scalars(
+        select(DataSourceHealth)
+        .where(DataSourceHealth.source == "stock_tagger")
+        .order_by(DataSourceHealth.id.desc())
+        .limit(1)
+    )).one()
+    assert latest.fail_streak == 3 and latest.status == "down"
+
+
+async def test_no_health_signal_when_nothing_was_skipped(session):
+    """全部号段已登记时不得产生噪声记录。"""
+    from sqlalchemy import select
+
+    from app.models.risk import DataSourceHealth
+
+    await stock_tagger.batch_tag(session, [{"code": "600000", "name": "浦发银行"}])
+    assert (await session.scalars(
+        select(DataSourceHealth).where(DataSourceHealth.source == "stock_tagger")
+    )).all() == []
+
+
+def test_every_live_code_prefix_is_registered():
+    """回归护栏：全市场现存代码必须 100% 能判定板块。
+
+    用真实库快照，未登记号段一出现这里就红，而不是等到整批标记静默丢失。
+    """
+    import sqlite3
+    from pathlib import Path
+
+    db = Path(__file__).resolve().parents[1] / "claw.db"
+    if not db.exists():
+        pytest.skip("本地开发库不存在，跳过真实快照护栏")
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT DISTINCT code FROM stock_tags").fetchall()
+    finally:
+        conn.close()
+    unknown = sorted(code for (code,) in rows if stock_tagger.get_board_type(code) == "unknown")
+    assert unknown == [], f"存在未登记号段: {unknown[:20]}"

@@ -345,7 +345,12 @@ async def test_t_only_future_sell_is_not_available_and_cannot_freeze(memory_sess
     sale.trade_time = AT+timedelta(minutes=5)
     await memory_session.commit()
     stats = await paper._today_sell_stats(memory_session, pos.account_id, pos.code, AT.date(), as_of=AT)
-    assert stats == {"amount": 0, "avg_price": None, "first_time": None}
+    # `rungs`/`reasons` 供"改2：同一 rung 不得升级为清仓"判定；无成交时都必须为空，
+    # 否则闸门会拿到不存在的当日证据。
+    assert stats == {
+        "amount": 0, "avg_price": None, "first_time": None,
+        "reasons": [], "rungs": set(),
+    }
     meta = json.loads(order.risk_json)["paper_deferred_order"]
     cmd = service.SubmitOrderCommand(code=order.code, side="buy", price=order.price,
         quantity=order.quantity, account_id=order.account_id, strategy_id="paper-auto-t",

@@ -243,6 +243,8 @@ def account_sell_params(account_name: str) -> dict[str, Any]:
         "weak_exit_min_evidence": settings.PAPER_AUTO_WEAK_EXIT_MIN_EVIDENCE,
         # 2026-09-17 改4：MIDLINE 到期平仓宽限天数（隐式退出依赖）
         "expiry_grace_days": settings.PAPER_MIDLINE_EXPIRY_GRACE_DAYS,
+        # 2026-09-18 改2：T 减仓后能否用同一条信号升级为清仓（隐式退出依赖）
+        "t_protect_require_new_rung": settings.PAPER_AUTO_T_PROTECT_REQUIRE_NEW_RUNG,
     }
 
 

@@ -327,10 +327,25 @@ def _calculate_market_sentiment_state(
     }
     count_fields = {"limit_up_count", "limit_down_count", "broken_limit_count",
                     "board_height", "breadth_sample_count", "index_sample_count"}
+    # 2026-09-18：把"不可用"与"非法"分开。二者都关闭情绪闸门（行为不变），
+    # 但此前共用一句"情绪数值无效"，把 main_net_inflow=None（当日资金流一条都
+    # 没通过新鲜度校验）误报成"数值非法"，导致 9/15–9/17 连续三日
+    # `market_sentiment/snapshot` 的告警无法指向真正原因。
+    # 语义：None = 供应商没给可用的当日聚合（unavailable）；
+    #       非数值/NaN/Inf/越界 = 拿到了但不能用（invalid）。
+    unavailable_fields = []
     invalid_fields = []
     for field, value in numeric_inputs.items():
         # An explicitly unavailable index already has an established degraded path.
+        # 它由下游自行降级，**不能**在这里被当成"字段不可用"而提前返回，
+        # 否则会改变原有语义（原实现在此 continue，不进入 invalid_fields）。
         if field == "index_avg_change_pct" and value is None:
+            continue
+        if value is None:
+            # 其余字段原来被判为"非法"，实际是"供应商没给可用值"。
+            # 仍然关闭情绪闸门（degraded + completeness 0，行为不变），
+            # 只把原因从"无效"改成"不可用"，让告警指向真因。
+            unavailable_fields.append(field)
             continue
         try:
             valid = (isinstance(value, Real) and not pd.api.types.is_bool(value)
@@ -347,14 +362,21 @@ def _calculate_market_sentiment_state(
             valid = False
         if not valid:
             invalid_fields.append(field)
-    if invalid_fields:
+    if invalid_fields or unavailable_fields:
         # Non-tradable sentinel, not a neutral/strong-market observation. Preserve
         # raw unknown values separately; do not change entry or exit thresholds.
+        reasons = []
+        if invalid_fields:
+            reasons.append("情绪数值无效: " + ", ".join(invalid_fields))
+        if unavailable_fields:
+            reasons.append("情绪字段不可用: " + ", ".join(unavailable_fields))
         return {
             "score": 0.0, "cycle_points": 0, "cycle": "divergence",
             "quality_status": "degraded",
-            "quality_reason": "情绪数值无效: " + ", ".join(invalid_fields),
+            "quality_reason": "；".join(reasons),
             "quality_completeness": 0.0, "broad_weakness": False,
+            "unavailable_fields": unavailable_fields,
+            "invalid_fields": invalid_fields,
         }
     # cycle_points 只用于离散周期判定；对外 sentiment_score 必须统一为
     # 0~100，避免旧实现把 -4~+4 的周期分值误当成百分制评分持久化。
@@ -466,6 +488,10 @@ def _calculate_market_sentiment_state(
         "quality_reason": "；".join(quality_reasons),
         "quality_completeness": round(quality_completeness, 6),
         "broad_weakness": broad_weakness,
+        # 与降级分支保持同一组字段，消费者无需按分支判断键是否存在。
+        # 能走到这里说明没有任何字段是 None 或非法值。
+        "unavailable_fields": [],
+        "invalid_fields": [],
     }
 
 

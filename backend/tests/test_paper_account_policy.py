@@ -44,6 +44,9 @@ def test_sell_profile_contains_every_implicit_short_exit_dependency():
         "weak_exit_min_evidence",
         # 2026-09-17 改4：MIDLINE 到期平仓宽限天数
         "expiry_grace_days",
+        # 2026-09-18 改2：T 减仓后能否用同一条信号升级为清仓；决定弱信号
+        # 是否等于清仓，属于隐式退出依赖，必须随账户参数冻结。
+        "t_protect_require_new_rung",
     }
 
     for account_name in ACCOUNT_NAMES:
