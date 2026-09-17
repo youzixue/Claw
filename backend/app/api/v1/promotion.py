@@ -2446,6 +2446,21 @@ def _annotate_prediction_record_metadata(
             "prediction_route_actionable": (
                 not bool(execution_item.get("prediction_watch_only"))
             ),
+            # 首板路线的两级判定分开留证（纯附加，不参与判定）：
+            #   route_level_actionable = `_is_actionable_first_board_prediction`
+            #   active_confirmation     = 硬新闻或已验证竞价证据
+            #   not_actionable_reasons  = 实际判负的子条件（按发生顺序）
+            "prediction_route_level_actionable": bool(
+                execution_item.get("prediction_route_level_actionable")
+                if execution_item.get("prediction_route_level_actionable") is not None
+                else execution_item.get("prediction_actionable")
+            ),
+            "prediction_active_confirmation": execution_item.get(
+                "prediction_active_confirmation"
+            ),
+            "prediction_not_actionable_reasons": list(
+                execution_item.get("prediction_not_actionable_reasons") or []
+            )[:8],
             "prediction_watch_only": bool(
                 execution_item.get("prediction_watch_only")
                 or execution_item.get("prediction_only")
@@ -14577,7 +14592,10 @@ def _first_board_rank_exposure_meta(item: dict) -> dict:
 def _first_board_trade_actionability(item: dict) -> dict:
     factors = item.get("probability_factors") or {}
     active_confirmation = _first_board_rank_has_active_confirmation(item)
-    actionable = _is_actionable_first_board_prediction(item)
+    # 归因出参：把"哪一条把首板候选判成不可执行"记下来。
+    # 实测九条首板路线 5.6 万条预测 actionable 恒 False，此前无法归因。
+    reject_reasons: list[str] = []
+    actionable = _is_actionable_first_board_prediction(item, reject_reasons=reject_reasons)
     strict_confirmation_count = _safe_int(factors.get("strict_confirmation_count"))
     score = 12.0
     score += 38.0 if actionable else 0.0
@@ -14592,11 +14610,22 @@ def _first_board_trade_actionability(item: dict) -> dict:
         status, label = "conditional", "条件观察·待确认"
     else:
         status, label = "forecast_only", "仅预测·不可交易"
+    if not active_confirmation:
+        # 这一级与路线门槛是**两个独立**的失败原因，必须分开记账：
+        # `active_confirmation` 只有"盘后硬新闻"或"已验证竞价证据"两条来源。
+        reject_reasons.append(
+            "active_confirmation_false:no_fresh_hard_news_and_no_verified_auction_evidence"
+        )
+    executable = bool(actionable and active_confirmation)
     return {
         "trade_actionability_score": score,
         "trade_actionability_status": status,
         "trade_actionability_label": label,
-        "prediction_actionable": bool(actionable and active_confirmation),
+        "prediction_actionable": executable,
+        # 纯诊断：可执行时为空列表；不可执行时按发生顺序列出每条判负的子条件。
+        "prediction_not_actionable_reasons": [] if executable else reject_reasons,
+        "prediction_route_level_actionable": bool(actionable),
+        "prediction_active_confirmation": bool(active_confirmation),
     }
 
 
@@ -14796,23 +14825,51 @@ def _rank_first_board_recall_candidates(
     ]
 
 
-def _is_actionable_first_board_prediction(item: dict) -> bool:
+def _is_actionable_first_board_prediction(
+    item: dict, *, reject_reasons: list[str] | None = None
+) -> bool:
+    """路线级可执行判定。
+
+    `reject_reasons` 是**纯诊断出参**：传进来时，每个把判定判负的子条件会把
+    自己的短标签追加进去。默认 None 时行为与旧版逐位相同 —— 条件表达式一个字
+    未改，只是把"哪一条说不"记下来。
+
+    为什么需要它：实测九条首板路线合计约 5.6 万条预测 `actionable` 恒为 False，
+    但无法回答"到底是路线门槛挡的，还是别的东西"。而 `support_strength_score`
+    / `main_net_inflow_pct` 这两个输入**没有出现在 `promotion_prediction_record`
+    的 factors_json 里**（`sector_strength_score`、`route_score` 都在），
+    因此"这两个字段在运行时是否真的存在"无法从落库数据反推 —— 若不存在，
+    经 `_safe_float` 变 0.0 会让 `main_inflow_pct >= -6.5` 这类负阈值守护
+    **被空值静默绕过**。本出参正是为了把这件事一次定死。
+    """
+    def _no(reason: str) -> bool:
+        if reject_reasons is not None:
+            reject_reasons.append(reason)
+        return False
+
+    def _clause(ok: bool, reason: str) -> bool:
+        if not ok and reject_reasons is not None:
+            reject_reasons.append(reason)
+        return bool(ok)
+
     if bool(item.get("keep_in_diagnostics")) or item.get("trade_ready") is False:
-        return False
+        return _no("keep_in_diagnostics_or_not_trade_ready")
     if str(item.get("time_horizon") or "") == "weak_watch":
-        return False
+        return _no("time_horizon_weak_watch")
 
     probability = _safe_float(item.get("probability"))
     factors = item.get("probability_factors") or {}
     market_risk_level = str(factors.get("market_risk_level") or "")
     route = str(item.get("candidate_route") or "")
     if route == "oversold_reversal_start":
-        return _is_oversold_reversal_sprint_candidate(item)
+        return _clause(_is_oversold_reversal_sprint_candidate(item),
+                       "route_gate:oversold_reversal_start")
     if route == "auction_surge_start" and (
         "auction_open_change" in factors
         or "auction_open_change" in (item.get("detail") or {})
     ):
-        return _is_auction_surge_sprint_candidate(item)
+        return _clause(_is_auction_surge_sprint_candidate(item),
+                       "route_gate:auction_surge_start")
 
     # 封板基因过滤：news_catalyst_start / mainline_spread_start 是"题材/板
     # 块扩散"路径，依赖票本身具有真实封板历史。如果近 180 天内从未涨停
@@ -14830,7 +14887,12 @@ def _is_actionable_first_board_prediction(item: dict) -> bool:
             # 近 120 天有过涨停 OR 近 50 天有过 1 次以上涨停 = 有"封板基因"
             has_seal_gene = memory_hits_120d >= 1 or memory_hits_50d >= 1 or days_since_last <= 120
             if not has_seal_gene:
-                return False
+                return _no("seal_gene_missing")
+        else:
+            # 空 memory_features 会让上面整段被跳过（静默放行）。单独记账，
+            # 便于判断这个过滤在生产里到底有没有生效。
+            if reject_reasons is not None:
+                reject_reasons.append("seal_gene_filter_skipped_no_memory_features")
 
     # probability 已是以路线真实后验命中率为中心的校准值，首板
     # 常态基准本就在2%~4%。继续沿用旧的6%~12%阈值会把所有候选清空；
@@ -14850,36 +14912,49 @@ def _is_actionable_first_board_prediction(item: dict) -> bool:
     ):
         min_probability = 0.018
     if probability < min_probability:
-        return False
+        return _no(f"probability_below_min:{probability:.4f}<{min_probability:.4f}")
 
+    support_strength_known = item.get("support_strength_score") is not None
+    main_inflow_known = item.get("main_net_inflow_pct") is not None
     support_strength = _safe_float(item.get("support_strength_score"))
     main_inflow_pct = _safe_float(item.get("main_net_inflow_pct"))
     strict_confirmation_count = _safe_int(factors.get("strict_confirmation_count"))
+    if reject_reasons is not None and not (support_strength_known and main_inflow_known):
+        # 只记账，不改变判定（本次不修行为，先取证）。
+        reject_reasons.append(
+            "input_missing:support_strength_score={} main_net_inflow_pct={}".format(
+                "present" if support_strength_known else "ABSENT",
+                "present" if main_inflow_known else "ABSENT",
+            )
+        )
     if market_risk_level == "hostile":
         route_score = _safe_float(item.get("route_score"))
         if route == "pre_board_probe_start":
-            return (
+            return _clause(
                 support_strength >= 48
                 and route_score >= 48
                 and strict_confirmation_count >= 1
-                and _safe_float(factors.get("pre_board_probe_score")) >= PRE_BOARD_PROBE_MIN_SCORE
+                and _safe_float(factors.get("pre_board_probe_score")) >= PRE_BOARD_PROBE_MIN_SCORE,
+                "hostile:pre_board_probe_clause",
             )
         if route == "news_catalyst_start":
-            return (
+            return _clause(
                 route_score >= 46
                 and support_strength >= 38
                 and _safe_float(factors.get("news_catalyst_score")) >= NEWS_CATALYST_MIN_SCORE + 8.0
-                and main_inflow_pct >= -4.0
+                and main_inflow_pct >= -4.0,
+                "hostile:news_catalyst_clause",
             )
         if route == "auction_surge_start":
             auction_feed_complete = auction_context_complete(factors)
-            return (
+            return _clause(
                 route_score >= 44
                 and support_strength >= 38
                 and _safe_float(factors.get("auction_strength_score")) >= AUCTION_SURGE_MIN_SCORE + 8.0
                 and _safe_float(factors.get("auction_open_change")) >= AUCTION_SURGE_MIN_OPEN_CHANGE
                 and _safe_float(factors.get("auction_open_change")) < AUCTION_SURGE_MAX_OPEN_CHANGE
-                and auction_feed_complete
+                and auction_feed_complete,
+                "hostile:auction_surge_clause",
             )
         if route == "mainline_spread_start":
             broad_rotation_cluster = bool(factors.get("broad_rotation_cluster_setup"))
@@ -14887,7 +14962,7 @@ def _is_actionable_first_board_prediction(item: dict) -> bool:
                 bool(factors.get("market_broad_first_board_overflow"))
                 or bool(factors.get("sector_catalyst_spread"))
             ):
-                return (
+                return _clause(
                     route_score >= (36 if broad_rotation_cluster else 38)
                     and (
                         support_strength >= (36 if broad_rotation_cluster else 40)
@@ -14896,9 +14971,10 @@ def _is_actionable_first_board_prediction(item: dict) -> bool:
                     and (
                         broad_rotation_cluster
                         or _safe_float(item.get("sector_strength_score")) >= 55.0
-                    )
+                    ),
+                    "hostile:mainline_relaxed_clause",
                 )
-            return (
+            return _clause(
                 route_score >= 46
                 and (
                     support_strength >= 42
@@ -14908,13 +14984,15 @@ def _is_actionable_first_board_prediction(item: dict) -> bool:
                 and (
                     broad_rotation_cluster
                     or _safe_float(item.get("sector_strength_score")) >= BROAD_ROTATION_MAINLINE_MIN_SECTOR_STRENGTH
-                )
+                ),
+                "hostile:mainline_strict_clause",
             )
-        return (
+        return _clause(
             support_strength >= 60
             and main_inflow_pct >= 5
             and strict_confirmation_count >= 3
-            and route in {"fresh_mainline_start", "support_squeeze_start", "platform_relaunch"}
+            and route in {"fresh_mainline_start", "support_squeeze_start", "platform_relaunch"},
+            "hostile:generic_route_clause",
         )
     return True
 
