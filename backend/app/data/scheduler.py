@@ -3179,23 +3179,30 @@ class DataScheduler:
             return
         from app.strategy.auction import auction_collector
 
-        async with async_session() as session:
+        # 两个独立来源各采一次：闸门要求每只 >=2 个不同 source_quote_at 的 ok 帧，
+        # 而 09:25–09:30 无成交、单一来源的时间戳可能不推进（腾讯实测如此），
+        # 所以用东财 f124 作为第二个来源。任一来源失败不影响另一个。
+        results = {}
+        for label, collector in (
+            ("腾讯", auction_collector.collect_tencent_auction_evidence),
+            ("东财", auction_collector.collect_eastmoney_auction_evidence),
+        ):
             try:
-                result = await auction_collector.collect_tencent_auction_evidence(
-                    session, date.today()
-                )
+                async with async_session() as session:
+                    results[label] = await collector(session, date.today())
             except Exception as exc:               # noqa: BLE001 — 采样失败不得影响主流程
-                logger.warning(f"腾讯竞价证据采样失败: {type(exc).__name__}: {exc}")
-                return
-        if result.get("status") == "ok":
-            logger.info(
-                f"腾讯竞价证据写入 {result.get('written')} 条 "
-                f"(accepted={result.get('accepted')}/{result.get('candidates')}, "
-                f"frame={result.get('source_frame')}, "
-                f"distinct_source_quote_at={result.get('distinct_source_quote_at')})"
-            )
-        elif result.get("status") not in {"outside_evidence_window"}:
-            logger.warning(f"腾讯竞价证据未写入: {result}")
+                logger.warning(f"{label}竞价证据采样失败: {type(exc).__name__}: {exc}")
+                results[label] = {"status": "error", "written": 0}
+        for label, result in results.items():
+            if result.get("status") == "ok":
+                logger.info(
+                    f"{label}竞价证据写入 {result.get('written')} 条 "
+                    f"(accepted={result.get('accepted')}/{result.get('candidates')}, "
+                    f"frame={result.get('source_frame')}, "
+                    f"distinct_source_quote_at={result.get('distinct_source_quote_at')})"
+                )
+            elif result.get("status") not in {"outside_evidence_window"}:
+                logger.warning(f"{label}竞价证据未写入: {result}")
 
     async def _after_market(self):
         """盘后补全 — pywencai个股行业映射 + 涨停池补充"""

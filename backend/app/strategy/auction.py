@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import settings
 from app.data.auction_evidence import auction_evidence_status, volume_in_shares
-from app.data.fund_flow_clock import local_clock
+from app.data.fund_flow_clock import eastmoney_quote_clock, local_clock
 from app.core.data_date import resolve_latest_trade_date
 from app.models.stock import AuctionData, StockKline, StockTag
 from app.core.stock_tagger import stock_tagger, TAG_TRADEABLE
@@ -60,6 +60,15 @@ class AuctionSignal:
 # 腾讯竞价帧的来源标识：与东财/新浪的 `*_unverified` 明确区分，
 # 因为只有这条路径带 provider 行情时间戳、能通过 auction_provenance_v1。
 TENCENT_AUCTION_SOURCE_VERSION = "tencent_qt_auction_open_v1"
+# 东财行情：`f124` 是**行情更新时间戳**，本项目已在
+# `app/data/fund_flow_clock.eastmoney_quote_clock` 里解码并信任
+# （见 `main_fund.py` 的 `individual_fund_flow_v3_f124`）。
+# 主域名在本机长期拒连（与 eastmoney/market_fund_flow 的 chronic 失败同源），
+# 因此按可用性顺序回退；实测 push2delay 可用且字段齐全。
+EASTMONEY_AUCTION_SOURCE_VERSION = "eastmoney_qt_auction_open_v1"
+EASTMONEY_QUOTE_HOSTS = ("push2delay.eastmoney.com", "push2.eastmoney.com")
+EASTMONEY_AUCTION_BATCH = 300
+EASTMONEY_AUCTION_FIELDS = "f12,f14,f17,f18,f5,f6,f10,f124"
 
 
 class AuctionCollector:
@@ -360,6 +369,193 @@ class AuctionCollector:
         logger.info(f"竞价数据保存: {count}条, {trade_date} {snapshot_time}")
         return count
 
+    async def _save_verified_auction_candidates(
+        self,
+        session: AsyncSession,
+        candidates: list,
+        observed_at: datetime,
+        trade_date: date,
+        *,
+        source_label: str,
+    ) -> dict:
+        """逐行自检（策略同一个契约函数），只把 `ok` 的行落库。
+
+        两个来源（腾讯 / 东财）共用这一段，避免出现"两份不同的证据判定"。
+        """
+        accepted: list[dict] = []
+        rejected: dict[str, int] = {}
+        for candidate in candidates:
+            status = auction_evidence_status(candidate, decision_at=observed_at)
+            if status != "ok":
+                rejected[status] = rejected.get(status, 0) + 1
+                continue
+            accepted.append({
+                "code": candidate.code,
+                "open": candidate.auction_price,
+                "prev_close": candidate.prev_close,
+                "volume": candidate.auction_volume,
+                "amount": candidate.auction_amount,
+                "volume_ratio": candidate.volume_ratio,
+                "source": candidate.source,
+                "source_version": candidate.source_version,
+                "source_quote_at": candidate.source_quote_at,
+                "received_at": candidate.received_at,
+                "price_basis": candidate.price_basis,
+                "volume_basis": candidate.volume_basis,
+                "volume_unit": candidate.volume_unit,
+                "amount_unit": candidate.amount_unit,
+            })
+        if not accepted:
+            logger.warning(
+                f"{source_label} 竞价证据自检全部未通过，未写入任何行: "
+                f"observed={observed_at.strftime('%H:%M:%S')} "
+                f"candidates={len(candidates)} rejected={rejected}"
+            )
+            return {"status": "no_verified_rows", "written": 0,
+                    "candidates": len(candidates), "rejected": rejected,
+                    "source_frame": observed_at.strftime("%H:%M:%S")}
+        frame = pd.DataFrame(accepted)
+        frame.attrs["auction_observed_at"] = observed_at
+        written = await self.save_auction_data(session, frame, trade_date)
+        distinct = len({item["source_quote_at"] for item in accepted if item["source_quote_at"]})
+        return {
+            "status": "ok", "written": written, "accepted": len(accepted),
+            "candidates": len(candidates), "rejected": rejected,
+            "source_frame": observed_at.strftime("%H:%M:%S"),
+            "distinct_source_quote_at": distinct,
+        }
+
+    @staticmethod
+    def _eastmoney_secid(code: str) -> str:
+        code = str(code).zfill(6)
+        return ("1." if code[0] in "56" else "0.") + code
+
+    async def _fetch_eastmoney_quotes(self, codes: list[str]) -> dict[str, dict]:
+        """按 secid 批量取东财行情；返回 {code: row}。主机按可用性回退。
+
+        `clist/get` 的 `pz` 实测上限 100，全市场要 56 页；而
+        `ulist.np/get` 支持一次传 300 个 secid（实测 0.27s 返回 300 行），
+        所以这里用 ulist 批量取，全市场约 10 个请求。
+        """
+        import httpx
+
+        wanted = {str(code).zfill(6) for code in codes}
+        result: dict[str, dict] = {}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0),
+                                     trust_env=False) as client:
+            for host in EASTMONEY_QUOTE_HOSTS:
+                batches = [
+                    [c for c in sorted(wanted)][i:i + EASTMONEY_AUCTION_BATCH]
+                    for i in range(0, len(wanted), EASTMONEY_AUCTION_BATCH)
+                ]
+                collected: dict[str, dict] = {}
+                try:
+                    for batch in batches:
+                        response = await client.get(
+                            f"https://{host}/api/qt/ulist.np/get",
+                            params={
+                                "secids": ",".join(self._eastmoney_secid(c) for c in batch),
+                                "fltt": 2, "invt": 2,
+                                "fields": EASTMONEY_AUCTION_FIELDS,
+                            },
+                            headers={"User-Agent": "Mozilla/5.0",
+                                     "Referer": "https://quote.eastmoney.com/"},
+                        )
+                        response.raise_for_status()
+                        diff = ((response.json().get("data") or {}).get("diff") or [])
+                        for row in diff:
+                            code = str(row.get("f12") or "").zfill(6)
+                            if code in wanted:
+                                collected[code] = row
+                    if collected:
+                        return collected
+                except Exception as exc:           # noqa: BLE001 — 换主机重试
+                    logger.warning(f"东财竞价行情 {host} 失败: {type(exc).__name__}: {exc}")
+                    continue
+        return result
+
+    async def collect_eastmoney_auction_evidence(
+        self,
+        session: AsyncSession,
+        trade_date: date | None = None,
+        *,
+        now: datetime | None = None,
+        codes: list[str] | None = None,
+    ) -> dict:
+        """用东财行情做**第二来源**的 09:25 终场竞价帧。
+
+        为什么需要第二个来源
+        --------------------
+        闸门分子是 `multi_frame_complete_count`，要求每只标的有
+        **>=2 个不同 `source_quote_at` 的 ok 帧**（`minimum_positive_frames=2`）。
+        而 09:25–09:30 是无成交窗口：
+          * 实测腾讯 field[30] 在报价不变时**不推进**
+            （盘后连采 3 轮、间隔 8 秒，全部钉在 16:14:xx）；
+          * `<09:25` 的那条分支（`indicative_match/indicative_matched`）实测不可用：
+            9/14–9/17 全部 09:15–09:24 帧的 `auction_volume` **100% 为 0**。
+        两条路都堵住时，同一来源在 30 秒窗口里只能给 1 帧。
+        东财 `f124` 是按代码的行情更新时间戳（实测 300 只里有 42~51 个不同值），
+        与腾讯是两个独立来源，其时间戳通常与腾讯不同 →
+        一轮采样即可凑出 2 个不同 `source_quote_at`。
+
+        单位：东财 `f5` 为**手**（实测 `f6/(f5*100)` 与均价吻合，
+        且 600000 的 f5=456711 与腾讯的 volume=456711 完全一致）。
+        所以 `volume_unit="lot100"`，`amount_unit="CNY"`。
+
+        自检同上：只写契约判定 `ok` 的行。
+        """
+        target_date = trade_date or date.today()
+        precheck = local_clock(now if now is not None else datetime.now())
+        if precheck is None or precheck.date() != target_date:
+            return {"status": "not_today", "written": 0}
+        if not time(9, 25) <= precheck.time() <= time(9, 25, 30):
+            return {"status": "outside_evidence_window", "written": 0,
+                    "observed_at": precheck.isoformat()}
+        if codes is None:
+            code_rows = (await session.execute(
+                select(StockTag.code).where(
+                    StockTag.board_tag == TAG_TRADEABLE,
+                    func.coalesce(StockTag.is_st, False).is_(False),
+                    func.coalesce(StockTag.is_suspended, False).is_(False),
+                    func.coalesce(StockTag.is_delisting, False).is_(False),
+                )
+            )).all()
+            codes = [str(code) for (code,) in code_rows if code]
+        if not codes:
+            return {"status": "no_universe", "written": 0}
+
+        quotes = await self._fetch_eastmoney_quotes(list(codes))
+        observed_at = local_clock(now if now is not None else datetime.now())
+        if observed_at is None or not time(9, 25) <= observed_at.time() <= time(9, 25, 30):
+            return {"status": "outside_evidence_window", "written": 0,
+                    "observed_at": observed_at.isoformat() if observed_at else None,
+                    "reason": "取数耗时已越过 09:25:30 证据窗"}
+        snapshot_time = observed_at.strftime("%H:%M:%S")
+        candidates = []
+        for code, row in quotes.items():
+            candidates.append(AuctionData(
+                code=code, trade_date=target_date, auction_time=snapshot_time,
+                auction_price=self._safe_float(row.get("f17")),
+                auction_volume=int(self._safe_float(row.get("f5")) or 0),
+                auction_amount=self._safe_float(row.get("f6")),
+                prev_close=self._safe_float(row.get("f18")),
+                volume_ratio=self._safe_float(row.get("f10")),
+                source="eastmoney",
+                source_version=EASTMONEY_AUCTION_SOURCE_VERSION,
+                source_quote_at=eastmoney_quote_clock(row.get("f124")),
+                received_at=observed_at,
+                observed_at=observed_at,
+                price_basis="auction_opening",
+                volume_basis="auction_matched",
+                volume_unit="lot100",
+                amount_unit="CNY",
+            ))
+        result = await self._save_verified_auction_candidates(
+            session, candidates, observed_at, target_date, source_label="东财",
+        )
+        result["quotes_fetched"] = len(quotes)
+        return result
+
     async def collect_tencent_auction_evidence(
         self,
         session: AsyncSession,
@@ -437,17 +633,14 @@ class AuctionCollector:
                     "observed_at": observed_at.isoformat() if observed_at else None,
                     "reason": "取数耗时已越过 09:25:30 证据窗"}
         snapshot_time = observed_at.strftime("%H:%M:%S")
-        accepted: list[dict] = []
-        rejected: dict[str, int] = {}
+        candidates = []
         for record in records:
             if not isinstance(record, dict):
                 continue
             code = self._normalize_code(record.get("code", ""))
             if not code:
                 continue
-            source_quote_at = local_clock(record.get("source_quote_at"))
-            received_at = local_clock(record.get("received_at")) or observed_at
-            candidate = AuctionData(
+            candidates.append(AuctionData(
                 code=code, trade_date=target_date, auction_time=snapshot_time,
                 auction_price=self._safe_float(record.get("open")),
                 auction_volume=int(self._safe_float(record.get("volume")) or 0),
@@ -456,64 +649,20 @@ class AuctionCollector:
                 volume_ratio=self._safe_float(record.get("volume_ratio")),
                 source="tencent",
                 source_version=TENCENT_AUCTION_SOURCE_VERSION,
-                source_quote_at=source_quote_at,
-                received_at=received_at,
+                source_quote_at=local_clock(record.get("source_quote_at")),
+                received_at=local_clock(record.get("received_at")) or observed_at,
                 observed_at=observed_at,
                 price_basis="auction_opening",
                 volume_basis="auction_matched",
                 volume_unit="lot100",
                 amount_unit="CNY",
-            )
-            status = auction_evidence_status(candidate, decision_at=observed_at)
-            if status != "ok":
-                rejected[status] = rejected.get(status, 0) + 1
-                continue
-            accepted.append({
-                "code": code,
-                "open": candidate.auction_price,
-                "prev_close": candidate.prev_close,
-                "volume": candidate.auction_volume,
-                "amount": candidate.auction_amount,
-                "volume_ratio": candidate.volume_ratio,
-                "source": candidate.source,
-                "source_version": candidate.source_version,
-                "source_quote_at": source_quote_at,
-                "received_at": received_at,
-                "price_basis": candidate.price_basis,
-                "volume_basis": candidate.volume_basis,
-                "volume_unit": candidate.volume_unit,
-                "amount_unit": candidate.amount_unit,
-            })
-
-        distinct_source_frames = len({
-            item["source_quote_at"] for item in accepted if item["source_quote_at"]
-        })
-        if not accepted:
-            logger.warning(
-                "腾讯竞价证据自检全部未通过，未写入任何行: "
-                f"observed={snapshot_time} candidates={len(records)} rejected={rejected}"
-            )
-            return {"status": "no_verified_rows", "written": 0,
-                    "candidates": len(records), "rejected": rejected,
-                    "observed_at": observed_at.isoformat()}
-
-        frame = pd.DataFrame(accepted)
-        frame.attrs["auction_observed_at"] = observed_at
-        written = await self.save_auction_data(session, frame, target_date)
-        # `multi_frame_complete_count` 是闸门的**分子**：每只标的需要 >=2 个
-        # 不同 source_quote_at 的 ok 帧。本方法一次只产出一帧，
-        # 由调度器在同一 30 秒窗口内多次调用累加；这里报告本轮贡献的时间戳，
-        # 便于次日直接看出"供应商时间戳是否在窗口内推进"。
-        return {
-            "status": "ok",
-            "written": written,
-            "accepted": len(accepted),
-            "candidates": len(records),
-            "rejected": rejected,
-            "source_frame": snapshot_time,
-            "distinct_source_quote_at": distinct_source_frames,
-            "observed_at": observed_at.isoformat(),
-        }
+            ))
+        result = await self._save_verified_auction_candidates(
+            session, candidates, observed_at, target_date, source_label="腾讯",
+        )
+        result["candidates"] = len(records)
+        result["observed_at"] = observed_at.isoformat()
+        return result
 
     async def get_snapshot_health(
         self,
