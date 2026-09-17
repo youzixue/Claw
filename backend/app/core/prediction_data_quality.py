@@ -15,7 +15,12 @@ from app.config.settings import settings
 from app.data.fund_flow_clock import evidence_clock, fund_clock_status, main_fund_values_valid
 from app.data.main_fund import main_fund_source_supported
 from app.core.trade_calendar import is_official_closed_day
-from app.models.governance import DataQualityIssue, DataQualityRun, DataWatermark
+from app.models.governance import (
+    DataQualityIssue,
+    DataQualityRun,
+    DataWatermark,
+    DataWatermarkRevision,
+)
 from app.models.signal import PromotionPredictionRecord
 from app.models.stock import AuctionData, FundFlow, LimitUpPool, StockKline, StockSpot, StockTag
 
@@ -40,6 +45,27 @@ class QualityFinding:
         result["evidence"] = self.evidence or {}
         result["blocking"] = self.blocking
         return result
+
+
+def _watermark_revision(row: DataWatermark) -> DataWatermarkRevision:
+    """把即将被 upsert 覆盖的水位整行拷贝成 append-only 版本。
+
+    只复制叶子字段，不持有 ORM 对象引用；`replaced_at` 取当前时刻，
+    `observed_at` 保留旧版本自己的观测时刻，两者不可混用。
+    """
+    return DataWatermarkRevision(
+        dataset=row.dataset,
+        trade_date=row.trade_date,
+        observed_at=row.observed_at,
+        max_available_at=row.max_available_at,
+        record_count=int(row.record_count or 0),
+        expected_count=row.expected_count,
+        completeness=float(row.completeness or 0.0),
+        status=str(row.status or "missing"),
+        details_json=str(row.details_json or "{}"),
+        replaced_at=datetime.now(),
+        replacement_kind="superseded",
+    )
 
 
 def _json(value: object) -> str:
@@ -604,6 +630,10 @@ class PredictionDataQualityAuditor:
             if row is None:
                 row = DataWatermark(dataset=item["dataset"], trade_date=trade_date_value)
                 db.add(row)
+            else:
+                # upsert 会销毁上一版状态，而"当时那一刻闸门看到的是什么"
+                # 正是事故复盘要回答的问题。覆盖前先整行留档。
+                db.add(_watermark_revision(row))
             row.observed_at = datetime.fromisoformat(item["observed_at"])
             row.max_available_at = (
                 datetime.fromisoformat(item["max_available_at"])

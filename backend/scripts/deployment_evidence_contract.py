@@ -7,12 +7,14 @@ REVISIONS = (
     "027_fund_order_breakdown", "028_factor_evaluation_runs", "029_news_evidence_versions",
     "030_kline_observations", "031_paper_sale_accounting",
     "032_anomaly_candidate_evidence", "033_factor_computation_runs",
+    "034_data_watermark_revisions",
 )
 TABLE_SINCE = {
     "factor_evaluation_run": 28,
     "news_content_version": 29, "news_analysis_version": 29,
     "stock_kline_observation": 30, "paper_sale_accounting": 31,
     "anomaly_candidate_evidence": 32, "factor_computation_run": 33,
+    "data_watermark_revision": 34,
 }
 GUARD_MESSAGES = {
     "news_content_version": "news evidence is append-only",
@@ -21,6 +23,7 @@ GUARD_MESSAGES = {
     "paper_sale_accounting": "sale accounting evidence is append-only",
     "anomaly_candidate_evidence": "anomaly candidate evidence is append-only",
     "factor_computation_run": "factor computation evidence is append-only",
+    "data_watermark_revision": "watermark history is append-only",
 }
 REPLACE_CONDITIONS = {
     "paper_sale_accounting": "trade_id=NEW.trade_id OR id=NEW.id",

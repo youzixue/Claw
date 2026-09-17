@@ -23,7 +23,7 @@ def test_empty_evidence_cannot_authorize_release():
 
 @pytest.fixture(scope="module")
 def pair(tmp_path_factory):
-    return release_pair(tmp_path_factory.mktemp("release-gate"), "033_factor_computation_runs")
+    return release_pair(tmp_path_factory.mktemp("release-gate"), "034_data_watermark_revisions")
 
 
 @pytest.fixture
@@ -32,7 +32,7 @@ def reports(pair):
 
 
 def gate(reports, **kwargs):
-    return compare(*reports, expected_revision="033_factor_computation_runs", **kwargs)
+    return compare(*reports, expected_revision="034_data_watermark_revisions", **kwargs)
 
 
 def test_complete_real_audits_pass_and_default_does_not_silently_advance(reports):
@@ -92,7 +92,7 @@ def test_reversed_clock_and_newer_baseline_rejected(reports):
     assert "baseline revision newer than release target" in compare(after, deepcopy(after))
 
 
-@pytest.mark.parametrize("name", sorted(TRIGGERS_BY_REVISION["033_factor_computation_runs"]))
+@pytest.mark.parametrize("name", sorted(TRIGGERS_BY_REVISION["034_data_watermark_revisions"]))
 def test_trigger_name_without_effective_body_does_not_pass(reports, name):
     reports[1]["trigger_definitions"][name]["sql"] = f"CREATE TRIGGER {name} BEFORE UPDATE ON stock_daily BEGIN SELECT 1; END"
     assert any("trigger body mismatch" in problem for problem in gate(reports))
@@ -171,7 +171,7 @@ def test_unexpected_new_trigger_is_not_an_automatic_release_change(reports):
 
 
 def test_actual_wrong_same_named_trigger_is_visible_without_testing_writes_on_production(tmp_path):
-    before, after = release_pair(tmp_path, "033_factor_computation_runs")
+    before, after = release_pair(tmp_path, "034_data_watermark_revisions")
     path = Path(after["database"])
     with sqlite3.connect(path) as db:
         db.execute("DROP TRIGGER factor_computation_run_no_update")
@@ -180,7 +180,7 @@ def test_actual_wrong_same_named_trigger_is_visible_without_testing_writes_on_pr
     bad = audit_database(path)
     assert bad["counts"] == after["counts"] and bad["core_digests"] == after["core_digests"]
     assert any("trigger body mismatch" in message for message in compare(
-        before, bad, expected_revision="033_factor_computation_runs"))
+        before, bad, expected_revision="034_data_watermark_revisions"))
 
 
 @pytest.mark.parametrize("malformed", [False, True])
@@ -208,7 +208,7 @@ def test_successful_030_cli_does_not_claim_031_to_033_are_present(tmp_path):
     assert "031–033 schemas verified" not in result.stdout
 
 
-def test_real_030_to_033_and_disabled_full_lifespan_have_no_business_changes(tmp_path):
+def test_real_030_to_034_and_disabled_full_lifespan_have_no_business_changes(tmp_path):
     path = create_release_database(tmp_path)
     before = audit_database(path)
     backend = Path(__file__).resolve().parents[1]
@@ -216,7 +216,7 @@ def test_real_030_to_033_and_disabled_full_lifespan_have_no_business_changes(tmp
            "CLAW_DISABLE_SCHEDULER": "1", "PYTHONDONTWRITEBYTECODE": "1",
            "QUOTE_ROUND_ARCHIVE_ENABLED": "false", "SQL_ECHO": "false",
            "SCHEDULER_PREVENT_IDLE_SLEEP": "false"}
-    child = subprocess.run([sys.executable, "-B", "-m", "alembic", "upgrade", "033_factor_computation_runs"],
+    child = subprocess.run([sys.executable, "-B", "-m", "alembic", "upgrade", "034_data_watermark_revisions"],
                            cwd=backend, env=env, capture_output=True, text=True, timeout=40)
     assert child.returncode == 0, child.stderr
     program = """
@@ -242,7 +242,7 @@ asyncio.run(smoke())
                            cwd=backend, env=env, capture_output=True, text=True, timeout=40)
     assert child.returncode == 0, child.stderr
     after = audit_database(path)
-    assert compare(before, after, expected_revision="033_factor_computation_runs") == []
+    assert compare(before, after, expected_revision="034_data_watermark_revisions") == []
     assert after["counts"]["trade_order"] == after["counts"]["paper_trade_log"] == 0
     assert all(after["counts"][table] == 0 for table in (
         "paper_sale_accounting", "anomaly_candidate_evidence", "factor_computation_run"))

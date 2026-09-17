@@ -6,6 +6,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    DDL,
     Float,
     ForeignKey,
     Index,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 
 from app.db.session import Base
@@ -128,3 +130,56 @@ class DataWatermark(Base):
     completeness = Column(Float, nullable=False, default=0.0)
     status = Column(String(20), nullable=False, default="missing")
     details_json = Column(Text, nullable=False, default="{}")
+
+
+class DataWatermarkRevision(Base):
+    """被覆盖掉的那一版水位（append-only）。
+
+    `data_watermark` 是 `(dataset, trade_date)` 唯一 + upsert，只保留最新状态，
+    **历史时刻看到的是什么无法回溯**：事故复盘时只能间接靠
+    `data_quality_run.summary_json` 的冻结快照还原，而不是水位本身。
+
+    本表在 upsert 覆盖前把旧状态整行留档。字段与 `data_watermark` 对齐
+    （`observed_at` 即该版本原本的观测时刻），额外加 `replaced_at`
+    （被替换的写入时刻）与 `replacement_kind`。
+
+    这不是重算历史：不回溯、不补齐、不用当前数据回填过去，
+    只把"当时那一刻已经落库的状态"留下来。
+    """
+
+    __tablename__ = "data_watermark_revision"
+    __table_args__ = (
+        Index(
+            "ix_data_watermark_revision_lookup",
+            "dataset",
+            "trade_date",
+            "observed_at",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset = Column(String(40), nullable=False)
+    trade_date = Column(Date, nullable=False)
+    observed_at = Column(DateTime, nullable=False)
+    max_available_at = Column(DateTime)
+    record_count = Column(Integer, nullable=False, default=0)
+    expected_count = Column(Integer)
+    completeness = Column(Float, nullable=False, default=0.0)
+    status = Column(String(20), nullable=False, default="missing")
+    details_json = Column(Text, nullable=False, default="{}")
+    replaced_at = Column(DateTime, nullable=False, default=datetime.now)
+    # superseded = 被后续观测取代；initial_seed = 迁移时对现存最新状态的首次留档
+    replacement_kind = Column(String(20), nullable=False, default="superseded")
+
+
+# append-only 保护必须同时挂在 ORM 上：`init_db()` 走的是
+# `Base.metadata.create_all`，不会执行 Alembic 迁移，若只在迁移里建触发器，
+# 开发库/测试库就完全没有保护（实测发布契约测试会报
+# "required append-only triggers missing"）。
+# 与 paper_sale_accounting / factor_computation_run 同一套写法。
+for _action in ("UPDATE", "DELETE"):
+    event.listen(DataWatermarkRevision.__table__, "after_create", DDL(
+        f"CREATE TRIGGER IF NOT EXISTS data_watermark_revision_no_{_action.lower()} "
+        f"BEFORE {_action} ON data_watermark_revision "
+        "BEGIN SELECT RAISE(ABORT, 'watermark history is append-only'); END"
+    ).execute_if(dialect="sqlite"))
