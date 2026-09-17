@@ -18,7 +18,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -51,10 +51,12 @@ def _tag(code, name, board_tag="tradeable", **kw):
     )
 
 
-def _bar(code, source="tencent_close"):
+def _bar(code, trade_date=None, source="tencent_close"):
+    # 第二个参数是**日期**，不是 source —— 曾把它当 source 传，导致
+    # "5 天前的K线"其实写成了当天，把边界用例悄悄变成恒真。
     return StockKline(
-        code=code, trade_date=DAY, open=10.0, close=10.5, high=10.6, low=9.9,
-        volume=1000, amount=10_000.0, source=source,
+        code=code, trade_date=trade_date or DAY, open=10.0, close=10.5,
+        high=10.6, low=9.9, volume=1000, amount=10_000.0, source=source,
     )
 
 
@@ -62,25 +64,33 @@ def _bar(code, source="tencent_close"):
 async def test_uncovered_codes_are_named_with_reasons(tmp_path):
     engine, maker = await _maker(tmp_path)
     try:
+        # 注意：自 2026-09-18 起，"回看窗口内从未有过任何K线"的代码会被
+        # **移出分母**（结构性不可观测，见
+        # tests/test_close_snapshot_denominator_20260918.py）。所以本用例要测
+        # "未覆盖分类"，必须让这三只**曾经有过K线**（在窗口内）才会留在分母里。
+        older = DAY - timedelta(days=5)
         async with maker() as db:
             db.add_all([
                 _tag("600000", "浦发银行"),
                 _tag("600001", "观察池股", board_tag="observe_only"),
-                # 有收盘：不应出现在未覆盖名单
+                # 有当日收盘：不应出现在未覆盖名单
                 _bar("600000"), _bar("600001"),
-                # 退市标记 + 从未有过日K → delisting_flagged
+                # 退市标记 + 窗口内曾有K线、今天没有 → delisting_flagged
                 _tag("600355", "*ST精伦", board_tag="blocked", is_st=True, is_delisting=True),
-                # 停牌 → suspended（本身已被 scope 过滤，这里造一个未停牌但对不上账的）
+                _bar("600355", older),
                 # 板块标记异常但 ST 兜底进 scope → board_blocked
                 _tag("600002", "齐鲁石化", board_tag="blocked", is_st=True),
-                # scope 内、无明显标记、就是没有收盘 → 需要追查
+                _bar("600002", older),
+                # scope 内、无明显标记、就是今天没有收盘 → 需要追查
                 _tag("600003", "正常股"),
+                _bar("600003", older),
             ])
             await db.commit()
             health = await DataScheduler()._close_snapshot_health(db, DAY)
 
         assert health["ready"] is False
         # uncovered = scope 内但当日无任何K线的代码（与 canonical 差额语义不同）
+        assert health["structurally_unobservable_count"] == 0
         assert health["uncovered_count"] == 3
         assert health["uncovered_count"] == len(health["uncovered_codes"])
         codes = set(health["uncovered_codes"])

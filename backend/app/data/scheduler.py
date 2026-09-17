@@ -504,6 +504,19 @@ STOCK_STATUS_ALERT_THRESHOLD = 2
 # 汇总告警（2026-09-16）：扫 data_source_health 里所有持续失败的 (source, api)。
 # 阈值取 3 —— 与 record_failure 里「连续 3 次标记 down」的口径一致。
 SOURCE_ALERT_FAIL_STREAK = 3
+# 收盘快照判定的分母修正：只把**结构性不可观测**的代码排除出分母。
+#
+# 9/17 事故：`canonical=5182/5240 completeness=0.988931`，判定要求 >=0.99
+# （需 5188），差 6 只 → 20:00 正式批次被连拒 142 次 → 次日全路线无候选。
+# 其中 3 只（`000638 / 300029 / 600355`）是退市整理期 *ST：
+# `is_delisting=1`、board_tag=blocked、**整个历史一根日K都没有**、
+# spot 价 0.12/0.89/0.58。行情源结构性覆盖不到它们，却仍被计入分母，
+# 使这条闸门天生就少 3 只余量。
+#
+# 判据必须能从数据自证，且**不能掩盖真实的覆盖丢失**：
+#   只有"在回看窗口内一根K线都没有出现过"的代码才算结构性不可观测；
+#   曾经有K线、只是今天缺的代码**照样计入分母**（那才是真缺口，必须继续拦）。
+CLOSE_SNAPSHOT_UNOBSERVED_LOOKBACK_DAYS = 60
 # 同一 (source, api) 每小时最多报一次，避免每 5 分钟刷屏把告警淹掉 ——
 # 这正是当初 2,626 次失败没能引起注意的原因。
 SOURCE_ALERT_REPEAT_SEC = 3600
@@ -4734,6 +4747,26 @@ class DataScheduler:
         canonical_count = sum(
             valid_sources.get(source, 0) for source in FORMAL_CLOSE_SOURCES - {"tencent_close"}
         ) + qualified_tencent_close_count
+        # 结构性不可观测：回看窗口内**从未出现过任何K线**的 scope 代码。
+        # 判据来自数据本身，不用硬编码名单；源开始覆盖它们时会自动回到分母。
+        unobserved_since = target_date - timedelta(days=CLOSE_SNAPSHOT_UNOBSERVED_LOOKBACK_DAYS)
+        observable_codes = scoped_codes
+        structurally_unobservable: list[str] = []
+        if use_tag_scope and scoped_codes:
+            ever_covered = {
+                str(code)
+                for (code,) in (await session.execute(
+                    select(func.distinct(StockKline.code)).where(
+                        StockKline.code.in_(tuple(scoped_codes)),
+                        StockKline.trade_date >= unobserved_since,
+                        StockKline.trade_date <= target_date,
+                    )
+                )).all()
+            }
+            structurally_unobservable = sorted(scoped_codes - ever_covered)
+            observable_codes = scoped_codes & ever_covered
+        expected_raw = expected
+        expected = len(observable_codes) if use_tag_scope else expected
         completeness = min(canonical_count / expected, 1.0) if expected else 0.0
         ready = bool(
             expected > 0
@@ -4753,7 +4786,7 @@ class DataScheduler:
         covered_codes = {
             str(code) for (code,) in (await session.execute(covered_query)).all()
         }
-        uncovered = sorted(scoped_codes - covered_codes) if use_tag_scope else []
+        uncovered = sorted(observable_codes - covered_codes) if use_tag_scope else []
         uncovered_reasons: dict[str, int] = {}
         for code in uncovered:
             row = (
@@ -4799,6 +4832,12 @@ class DataScheduler:
             # 这里只**追加**一份有界样本，不改判定口径、不改阈值、不放行任何东西：
             # `uncovered_codes` 列出在 scope 内但没有 canonical 收盘的代码，
             # 让人一眼看到缺的是谁、属于哪一类。
+            # 原有分母（scope 全量）与修正后分母（排除结构性不可观测）都报出，
+            # 便于审计"这次判定到底把谁算进去了"。
+            "expected_count_raw": expected_raw,
+            "structurally_unobservable_count": len(structurally_unobservable),
+            "structurally_unobservable_codes": structurally_unobservable[:20],
+            "unobserved_lookback_days": CLOSE_SNAPSHOT_UNOBSERVED_LOOKBACK_DAYS,
             # uncovered = 在 scope 内、但**当日一根K线都没有**的代码数
             # （与 canonical 的差额另由 canonical_count 表达；两者含义不同：
             #  canonical 还要求 spot 新鲜，uncovered 只看有没有bar）
