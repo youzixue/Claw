@@ -236,6 +236,11 @@ class SectorPersistence(Base):
     fund_flow = Column(Float)                   # 板块资金净流入(亿)
     change_pct = Column(Float)                  # 板块涨跌幅%
     strength_score = Column(Float)              # 板块强度评分
+    # 2026-09-17 复盘修复：本表按 (sector_code, trade_date) upsert，盘中写入的行
+    # 会被盘后终值覆盖，此前没有任何观测时点字段，导致"09:31 读到强度0.0、
+    # 15:20 终值为3.5"这类事无法回溯（生产个案：605580 恒盛能源止损证据里的
+    # 第三代半导体强度0.0）。补上写入时刻，使板块归因证据可审计、可回放。
+    observed_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("sector_code", "trade_date", name="uq_persistence_sector_date"),

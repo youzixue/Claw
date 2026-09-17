@@ -1238,6 +1238,17 @@ async def _pending_order_version_reason(db, order, metadata, *, now: datetime) -
     This exception is only for an internally generated, position-bound reduction.
     It never authorizes stale buys/adds or replaces the original exit parameters.
     Quote/depth, pre-trade risk and the broker's T+1 checks still run afterwards.
+
+    2026-09-17 复盘修复：原实现用 ``order.strategy_id == "paper-auto-short"``
+    与 ``order.source == "position"`` 作为豁免前置条件，即按"订单来自哪条代码路径"
+    判定，而不是按"它是不是持仓绑定的保护性减仓"判定。
+    实际生产中同一个持仓 603980 在同一天产生过两个卖出订单
+    （order 2283 ``paper-challenger-forward``/``momentum_first_retest`` 被拦，
+    order 2284 ``paper-auto-short``/``position`` 成交），两者的
+    position_id / exit_policy / exit_parameters / exit_trigger_reason / 入场版本
+    逐字段相同，仅来源标签不同 —— 2284 的成交证明了 2283 的绑定证据是充分的。
+    现改为只按证据判定：paper 卖单 + 入场版本存在 + 退出决策在当前版本下作出，
+    其后的 position_id / exit_policy / T+1 时钟 / 可卖数量校验全部保持强制。
     """
     from app.api.v1 import paper
     from app.models.paper import PaperAccount, PaperPosition
@@ -1250,13 +1261,10 @@ async def _pending_order_version_reason(db, order, metadata, *, now: datetime) -
         f"decision={order.strategy_version or 'legacy_unversioned'}，"
         f"current={current_version}"
     )
-    if not (
-        order.broker == "paper" and order.side == "sell"
-        and order.strategy_id == "paper-auto-short" and order.source == "position"
-        and order.strategy_version
-        and metadata.get("exit_decision_strategy_version") == current_version
-    ):
-        return reason
+    if not (order.broker == "paper" and order.side == "sell" and order.strategy_version):
+        return reason + "；非保护性减仓订单"
+    if metadata.get("exit_decision_strategy_version") != current_version:
+        return reason + "；退出决策未在当前版本下作出"
     position_id = metadata.get("position_id")
     candidate = metadata.get("candidate")
     if type(position_id) is not int or position_id <= 0 or not isinstance(candidate, dict):

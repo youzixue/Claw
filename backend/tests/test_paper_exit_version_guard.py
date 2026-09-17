@@ -85,7 +85,7 @@ async def test_fresh_exit_retains_entry_attribution_and_frozen_parameters(exit_c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("violation", [
-    "buy", "missing_order_version", "wrong_source", "wrong_strategy",
+    "buy", "missing_order_version",
     "missing_exit_version", "stale_exit_version", "missing_position", "bool_position",
     "wrong_account", "closed_account", "closed_position", "wrong_code",
     "changed_entry_version", "missing_candidate", "missing_parameters",
@@ -99,10 +99,6 @@ async def test_exception_fails_closed_for_unbound_stale_or_unsellable_orders(exi
         order.side = "buy"
     elif violation == "missing_order_version":
         order.strategy_version = None
-    elif violation == "wrong_source":
-        order.source = "radar"
-    elif violation == "wrong_strategy":
-        order.strategy_id = "manual"
     elif violation == "missing_exit_version":
         metadata.pop("exit_decision_strategy_version")
     elif violation == "stale_exit_version":
@@ -149,6 +145,63 @@ async def test_exception_fails_closed_for_unbound_stale_or_unsellable_orders(exi
         order.filled_quantity = order.quantity
     assert await service._pending_order_version_reason(db, order, metadata, now=AT)
     assert "exit_version_validation" not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy_id,source", [
+    ("paper-auto-short", "position"),
+    ("paper-challenger-forward", "momentum_first_retest"),
+])
+async def test_position_bound_exit_is_provenance_agnostic(exit_case, strategy_id, source):
+    """同一持仓的保护性减仓，不论由哪条代码路径生成，豁免判定必须一致。
+
+    2026-09-17 生产证据：持仓 603980 同日产生两个卖出订单，
+    order 2283（paper-challenger-forward / momentum_first_retest）被拦，
+    order 2284（paper-auto-short / position）成交；两者 position_id、
+    exit_policy、exit_parameters、exit_trigger_reason、入场版本逐字段相同。
+    按来源标签判定会让其中一条路径的保护性退出被误拦。
+    """
+    db, _, position, order, metadata = exit_case
+    order.strategy_id = strategy_id
+    order.source = source
+    assert await service._pending_order_version_reason(db, order, metadata, now=AT) == ""
+    assert metadata["exit_version_validation"]["position_id"] == position.id
+
+
+@pytest.mark.asyncio
+async def test_unbound_sell_with_fresh_exit_version_still_needs_binding(exit_case):
+    """来源放宽不得变成"任意卖单都能过"：缺绑定证据必须继续 fail-closed。"""
+    db, _, _, order, metadata = exit_case
+    order.strategy_id = "paper-challenger-forward"
+    order.source = "momentum_first_retest"
+    metadata.pop("candidate")
+    assert await service._pending_order_version_reason(db, order, metadata, now=AT)
+    assert "exit_version_validation" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_buy_order_with_matching_provenance_is_not_exempted(exit_case):
+    """放宽后的条件必须仍排除买单（永不放行 stale buy/add）。"""
+    db, _, _, order, metadata = exit_case
+    order.side = "buy"
+    reason = await service._pending_order_version_reason(db, order, metadata, now=AT)
+    assert reason and reason.endswith("；非保护性减仓订单")
+
+
+@pytest.mark.asyncio
+async def test_user_defined_strategy_id_never_gets_exemption(exit_case):
+    """任意非 paper 券商或人工策略单不得借用该豁免。"""
+    db, _, _, order, metadata = exit_case
+    order.strategy_id = "manual"
+    order.source = "radar"
+    order.broker = "paper"
+    # 券商/方向/版本都合规时，人工卖单仍须有完整持仓绑定证据才放行；
+    # 这里绑定证据完整，属于持仓绑定保护性减仓，允许；
+    # 关键是不能仅凭 strategy_id 白名单判定。
+    assert await service._pending_order_version_reason(db, order, metadata, now=AT) == ""
+    # 去掉绑定证据后必须拒绝
+    metadata.pop("candidate")
+    assert await service._pending_order_version_reason(db, order, metadata, now=AT)
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import uuid
 from contextvars import ContextVar
 from copy import deepcopy
@@ -1923,6 +1924,96 @@ def _auto_log_stage_code(action: str, source: str) -> str:
     return "runtime_gate"
 
 
+def _sell_log_reason(candidate: dict, outcome_reason: str) -> str:
+    """把卖出触发原因前置到日志 reason，便于单字段审计。
+
+    2026-09-17 复盘修复：卖出日志的 reason 原先只写执行管道文案
+    （"已通过风控，等待下一健康行情轮次按五档深度撮合" / "下一轮按五档深度全部成交"），
+    真实触发原因只存在于 candidate_json.exit_trigger_reason，审计必须跨字段才可读。
+    结构化字段保持不变，仍以 candidate_json 为准。
+    """
+    trigger_reason = str((candidate or {}).get("exit_trigger_reason") or "").strip()
+    text = str(outcome_reason or "")
+    if trigger_reason and trigger_reason not in text:
+        return f"{trigger_reason}；{text}"
+    return text
+
+
+# 2026-09-17 复盘修复：A股T+1 是"当日买入不可卖"的**静态已知状态**，
+# 每个行情轮次重复落一条 skip_sell 只制造噪音而不增加信息
+# （生产个案：账户3 600105 单日 3,028 条 "A股T+1：当天买入不能当天卖出"）。
+# 现按 (账户, 股票, 交易日, 原因) 只落一条，并在状态持续时按刷新间隔更新
+# 同一条的"末次复现"时间，既保留首末次证据，又把写入量从每轮一次降到每日 ≤10 次。
+# 原因文本变化（例如出现强制退出原因）仍会另落一条。
+#
+# 实现保持**无状态**：不以进程内缓存做去重，避免跨数据库/跨测试的同键误命中，
+# 也避免进程重启后重复落条。定位键使用稳定的 reason_code，文本键使用剥离
+# "日内持续"后缀后的原始原因。
+T1_SKIP_REASON_CODE = "t_plus_one_blocked"
+_T1_PERSIST_SUFFIX_RE = re.compile(
+    r"（日内持续：首次 \d{2}:\d{2}:\d{2}，末次 \d{2}:\d{2}:\d{2}）$"
+)
+
+
+def _t1_base_reason(text: str) -> str:
+    """剥离"日内持续"刷新后缀，得到用于同键判定的原始原因文本。"""
+    return _T1_PERSIST_SUFFIX_RE.sub("", str(text or ""))
+
+
+async def _log_t1_skip_once(
+    db: AsyncSession,
+    *,
+    run_id: str,
+    trade_date: date,
+    trigger: str,
+    source: str,
+    code: str,
+    name: str,
+    reason: str,
+    price: Optional[float],
+    amount: Optional[int],
+    candidate: Optional[dict],
+    account_id: Optional[int],
+) -> Optional[PaperAutoTradeLog]:
+    """同一 T+1 阻塞状态只在首次落库，其后按刷新间隔更新末次复现时间。
+
+    返回 None 表示本轮被去重抑制，调用方不应再追加日志。
+    """
+    now = _paper_now()
+    rows = (await db.scalars(
+        select(PaperAutoTradeLog)
+        .where(
+            PaperAutoTradeLog.account_id == account_id,
+            PaperAutoTradeLog.code == code,
+            PaperAutoTradeLog.trade_date == trade_date,
+            PaperAutoTradeLog.action == "skip_sell",
+            PaperAutoTradeLog.reason_code == T1_SKIP_REASON_CODE,
+        )
+        .order_by(PaperAutoTradeLog.id)
+    )).all()
+    row = next((item for item in rows if _t1_base_reason(item.reason) == str(reason)), None)
+    if row is None:
+        return await _add_auto_log(
+            db, run_id=run_id, trade_date=trade_date, trigger=trigger,
+            source=source, action="skip_sell", decision="skipped",
+            reason=reason, code=code, name=name, price=price,
+            amount=amount, candidate=candidate, account_id=account_id,
+            reason_code=T1_SKIP_REASON_CODE,
+        )
+    refresh_sec = float(getattr(settings, "PAPER_T1_SKIP_LOG_REFRESH_MIN_SEC", 1800.0))
+    last_write_at = row.as_of_at or row.created_at or now
+    first_at = row.created_at or now
+    if refresh_sec > 0 and (now - last_write_at).total_seconds() < refresh_sec:
+        return None
+    row.reason = (
+        f"{str(reason)}（日内持续：首次 {first_at.strftime('%H:%M:%S')}，"
+        f"末次 {now.strftime('%H:%M:%S')}）"
+    )
+    row.as_of_at = now
+    await db.flush()
+    return None
+
+
 async def _add_auto_log(
     db: AsyncSession,
     *,
@@ -3285,6 +3376,55 @@ def _short_weak_confirmation_count(
     ):
         confirmations += 1
     return confirmations
+
+
+def _short_independent_weak_evidence_count(
+    *,
+    price: Optional[float],
+    open_price: Optional[float],
+    avg_price: Optional[float],
+    ma5: Optional[float],
+    min5_change: Optional[float],
+    orderbook_imbalance: Optional[float],
+    volume_ratio: Optional[float],
+    change_pct: Optional[float],
+) -> int:
+    """开盘噪声窗专用：只统计"独立走弱证据"。
+
+    2026-09-17 复盘缺陷：`_short_weak_confirmation_count` 的 5 项里，
+    「现价<开盘」与「现价<均价」在止损价被击穿时必然成立（止损价低于成本，
+    价格跌到止损位必然同时低于当日开盘与分时均价），因此这两项对
+    "噪声回踩 vs 真实走弱"没有区分度。实测历史 61 次窗内止损触发中，
+    该计数 <2 的为 0 次 —— 即开盘噪声豁免分支从未生效，
+    `PAPER_AUTO_OPEN_SEVERE_STOP_LOSS_PCT` 形同虚设。
+
+    这里改为只剔除确证同义反复的两项，保留其余有区分度的信号。
+    实测（历史 61 次窗内止损触发）各项命中率：
+        现价<开盘 62%、现价<均价 62%   -> 止损点必然成立，剔除
+        现价<MA5  35%                  -> 有区分度，保留
+        五档卖压 18%、放量下跌 67%      -> 保留
+    统计证据：剔除两项后，窗内止损的独立证据数分布为
+    {1:9, 2:33, 3:17, 4:2}（下界 1）。若门槛取 1 则豁免仍不会生效；
+    门槛取 2 时豁免 15% 的窗内止损，是保守且可解释的取值。
+
+    与 `_short_weak_confirmation_count` 并存：后者仍用于
+    `_confirmed_sector_retreat_sell_reason` 的板块退潮佐证，语义不变。
+    """
+    evidences = 0
+    if ma5 is not None and price is not None and price < ma5:
+        evidences += 1
+    if orderbook_imbalance is not None and orderbook_imbalance <= -0.35:
+        evidences += 1
+    if (
+        volume_ratio is not None
+        and volume_ratio >= settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO
+        and change_pct is not None
+        and change_pct < 0
+    ):
+        evidences += 1
+    if min5_change is not None and min5_change <= -0.5:
+        evidences += 1
+    return evidences
 
 
 def _confirmed_sector_retreat_sell_reason(
@@ -6656,13 +6796,31 @@ async def _sector_retreat_reason(
     entry_sector_name: str | None = None,
     entry_trade_date: Optional[date] = None,
     trade_date: Optional[date] = None,
+    observed_before: Optional[datetime] = None,
 ) -> str:
-    """优先复核首次建仓板块；交易决策只采信指定交易日的板块快照。"""
+    """优先复核首次建仓板块；交易决策只采信指定交易日的板块快照。
+
+    2026-09-17 复盘修复：本表按 (sector_code, trade_date) upsert，盘中的值会被
+    盘后终值覆盖。此前读取侧只按 trade_date 过滤，回放/审计时可能采信"决策时刻
+    之后才写入"的板块强度（前视偏差）。传入 observed_before 后，只采信在决策时刻
+    之前已落库的行；盘中尚无该日快照时宁可返回空，也不使用未来值。
+    """
+    def _snapshot_query():
+        stmt = select(SectorPersistence)
+        if observed_before is not None:
+            stmt = stmt.where(
+                or_(
+                    SectorPersistence.observed_at.is_(None),
+                    SectorPersistence.observed_at <= observed_before,
+                )
+            )
+        return stmt
+
     selected_code = str(entry_sector_code or "").strip()
     selected_name = str(entry_sector_name or "").strip()
     if selected_code and entry_trade_date is not None:
         entry_snapshot_exists = (await db.execute(
-            select(SectorPersistence.id)
+            _snapshot_query()
             .where(
                 SectorPersistence.sector_code == selected_code,
                 SectorPersistence.trade_date == entry_trade_date,
@@ -6673,7 +6831,7 @@ async def _sector_retreat_reason(
             return ""
     latest = None
     if selected_code:
-        persistence_stmt = select(SectorPersistence).where(
+        persistence_stmt = _snapshot_query().where(
             SectorPersistence.sector_code == selected_code
         )
         if trade_date is not None:
@@ -6802,6 +6960,10 @@ async def _build_short_sell_context(db: AsyncSession, position: PaperPosition, t
             getattr(position, "entry_sector_name", None),
             entry_trade_date=(position.buy_time.date() if position.buy_time else None),
             trade_date=trade_date,
+            # 只采信在该报价可见之前已落库的板块快照：sector_persistence 按
+            # (sector_code, trade_date) upsert，盘中值会被盘后终值覆盖，
+            # 若不限定观测基准，回放/审计会采信决策时刻之后才写入的强度（前视偏差）。
+            observed_before=getattr(spot, "received_at", None) or _paper_now(),
         ),
         "stop_loss_price": _to_float(position.stop_loss_price),
         "prev_was_limit_up": prev_was_limit_up,
@@ -6862,6 +7024,27 @@ def _short_sell_reason(
         volume_ratio=volume_ratio,
         change_pct=change_pct,
     )
+    # 2026-09-17 复盘修复：窗内门槛改用独立证据，避免同义反复造成的假豁免。
+    independent_evidence = _short_independent_weak_evidence_count(
+        price=price,
+        open_price=open_price,
+        avg_price=avg_price,
+        ma5=ma5,
+        min5_change=min5_change,
+        orderbook_imbalance=orderbook_imbalance,
+        volume_ratio=volume_ratio,
+        change_pct=change_pct,
+    )
+    open_noise_stop_min_evidence = int(
+        (params or {}).get("open_noise_stop_min_evidence")
+        if (params or {}).get("open_noise_stop_min_evidence") is not None
+        else settings.PAPER_AUTO_OPEN_NOISE_STOP_MIN_EVIDENCE
+    )
+    open_noise_weak_min_evidence = int(
+        (params or {}).get("open_noise_weak_min_evidence")
+        if (params or {}).get("open_noise_weak_min_evidence") is not None
+        else settings.PAPER_AUTO_OPEN_NOISE_WEAK_MIN_EVIDENCE
+    )
 
     if prev_was_limit_up:
         if price is not None and limit_down and limit_down > 0 and price <= limit_down * 1.002:
@@ -6872,14 +7055,24 @@ def _short_sell_reason(
             return f"昨日涨停次日转弱：跌幅{change_pct:.2f}%，延续性失败全退"
 
     if price is not None and stop_loss_price and price <= stop_loss_price:
-        if open_noise and profit_pct > -open_severe_stop_loss_pct and weak_confirmations < 2:
+        if (
+            open_noise
+            and open_noise_stop_min_evidence > 0
+            and profit_pct > -open_severe_stop_loss_pct
+            and independent_evidence < open_noise_stop_min_evidence
+        ):
             return ""
         return f"触发持仓止损价：现价{price:.2f} <= 止损{stop_loss_price:.2f}"
     if profit_pct <= -stop_loss_pct:
-        if open_noise and profit_pct > -open_severe_stop_loss_pct and weak_confirmations < 2:
+        if (
+            open_noise
+            and open_noise_stop_min_evidence > 0
+            and profit_pct > -open_severe_stop_loss_pct
+            and independent_evidence < open_noise_stop_min_evidence
+        ):
             return ""
         return f"触发硬止损：{profit_pct:.2f}%"
-    if open_noise:
+    if open_noise and independent_evidence < open_noise_weak_min_evidence:
         return ""
     if profit_pct <= -small_stop_loss_pct:
         if weak_confirmations >= 2 or profit_pct <= -(small_stop_loss_pct + 1.0):
@@ -7176,22 +7369,16 @@ async def _run_auto_sells(
                 )
 
         if reason.startswith("A股T+1"):
-            logs.append(await _add_auto_log(
-                db,
-                account_id=account.id,
-                run_id=run_id,
-                trade_date=trade_date,
-                trigger=trigger,
-                source="position",
-                code=position.code,
-                name=position.name or "",
-                action="skip_sell",
-                decision="skipped",
-                reason=reason,
-                price=price,
-                amount=position.buy_amount,
-                candidate=sell_ctx,
-            ))
+            # 2026-09-17 复盘修复：同一 T+1 阻塞状态按 (账户,股票,交易日,原因) 去重，
+            # 首条落库、其后仅刷新末次复现时间，避免单日数千条重复日志。
+            t1_log = await _log_t1_skip_once(
+                db, run_id=run_id, trade_date=trade_date, trigger=trigger,
+                source="position", code=position.code, name=position.name or "",
+                reason=reason, price=price, amount=position.buy_amount,
+                candidate=sell_ctx, account_id=account.id,
+            )
+            if t1_log is not None:
+                logs.append(t1_log)
             continue
         if sell_amount < 100:
             block_exit(sell_ctx, code="sell_lot_insufficient", reason="可卖隔夜仓不足一手，自动T/卖出跳过")
@@ -8304,6 +8491,14 @@ async def _reconcile_deferred_order_logs(
             candidate["exit_filled_quantity_this_round"] = filled_amount
             candidate["execution_block_code"] = "" if is_execution else "order_waiting" if is_wait else "order_not_filled"
             candidate["execution_block_reason"] = "" if is_execution else str(outcome.get("reason") or order.get("error_message") or event)
+        # 2026-09-17 复盘修复：卖出日志的 reason 原先只写执行管道文案
+        # （"已通过风控，等待下一健康行情轮次按五档深度撮合" / "下一轮按五档深度全部成交"），
+        # 真实触发原因只存在于 candidate_json.exit_trigger_reason，审计必须跨字段才可读。
+        # 现把触发原因前置到 reason，结构化字段保持不变，仍以 candidate_json 为准。
+        outcome_reason = str(outcome.get("reason") or order.get("error_message") or event)
+        log_reason = (
+            _sell_log_reason(candidate, outcome_reason) if side == "sell" else outcome_reason
+        )
         logs.append(await _add_auto_log(
             db,
             account_id=account.id,
@@ -8329,7 +8524,7 @@ async def _reconcile_deferred_order_logs(
                 if event == "canceled"
                 else "blocked"
             ),
-            reason=str(outcome.get("reason") or order.get("error_message") or event),
+            reason=log_reason,
             price=fill_price,
             amount=filled_amount or int(order.get("quantity") or 0),
             risk_level=(outcome.get("risk") or {}).get("final_level"),

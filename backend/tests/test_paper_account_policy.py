@@ -37,6 +37,9 @@ def test_sell_profile_contains_every_implicit_short_exit_dependency():
         "breakeven_protect_low_pct", "breakeven_protect_high_pct",
         "volume_negative_ratio", "open_noise_end", "trade_t_enabled",
         "t_sell_pct", "t_weak_sell_pct", "short_full_exit_profit_max_amount",
+        # 2026-09-17 复盘修复：开盘噪声窗的独立走弱证据门槛也是隐式退出依赖，
+        # 必须随账户参数冻结并进入 exit_parameters 审计，否则窗内豁免无法回放。
+        "open_noise_stop_min_evidence", "open_noise_weak_min_evidence",
     }
 
     for account_name in ACCOUNT_NAMES:

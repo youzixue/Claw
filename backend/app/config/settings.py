@@ -755,6 +755,22 @@ class Settings(BaseSettings):
     # === 2026-08-31 复盘放宽：胜率 48.7%/盈亏比 0.57 期望值为负 ===
     # 把剥头皮式的紧止损止盈放宽到波段式, 给趋势更多空间, 让盈利单跑出去。
     PAPER_AUTO_OPEN_SEVERE_STOP_LOSS_PCT: float = 6.5
+    # === 2026-09-17 复盘修复：开盘噪声窗的"独立走弱证据"门槛 ===
+    # 缺陷：窗内止损豁免写成 weak_confirmations < 2，而 weak 计数包含
+    # 「现价<开盘」「现价<均价」两项——止损价被击穿时这两项必然成立（同义反复），
+    # 历史 61 次窗内止损中 <2 的为 0 次，open_severe_stop_loss_pct 从未生效。
+    # 现在只统计与"处于日内低位"不构成同义反复的独立证据：五档卖压 / 放量下跌 / 5分钟急跌。
+    # 2 = 修正后默认（窗内止损需 ≥2 项独立证据，或亏损超过 open_severe_stop_loss_pct）
+    # 0 = 关闭豁免，等价于修复前的实际行为（窗内止损一律放行）
+    PAPER_AUTO_OPEN_NOISE_STOP_MIN_EVIDENCE: int = 2
+    # 窗内弱触发（跌破分时均价/开盘价/MA5、冲高回落、收弱、板块退潮等）的最低独立证据数。
+    # 修复前为"窗内一律硬禁止"，导致 09:45 整点解除时集中释放（历史 52% 的定时卖出挤在该 5 分钟）。
+    # 改为门槛后，自带独立证据的弱触发可提前生效；99 = 恢复修复前的硬禁止行为。
+    PAPER_AUTO_OPEN_NOISE_WEAK_MIN_EVIDENCE: int = 1
+    # A股T+1 阻塞日志的同键刷新间隔（秒）。同一 (账户,股票,交易日,原因) 只在
+    # 首次落一条 skip_sell，其后每满该间隔把同一条的"末次复现"时间刷新一次。
+    # 生产个案：账户3 600105 单日 3,028 条重复日志。0 = 每个行情轮次都刷新（仅用于诊断）。
+    PAPER_T1_SKIP_LOG_REFRESH_MIN_SEC: float = 1800.0
     PAPER_AUTO_TAKE_PROFIT_PCT: float = 5.5
     PAPER_AUTO_BREAKEVEN_PROTECT_HIGH_PROFIT_PCT: float = 3.0
     PAPER_AUTO_BREAKEVEN_PROTECT_LOW_PCT: float = -0.2

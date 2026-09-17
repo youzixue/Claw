@@ -236,6 +236,9 @@ def account_sell_params(account_name: str) -> dict[str, Any]:
             if account_name == "default" else -99.0
         ),
         "max_hold_days": max_hold,
+        # 2026-09-17 复盘修复：开盘噪声窗独立证据门槛随账户参数冻结并进入 exit_parameters 审计。
+        "open_noise_stop_min_evidence": settings.PAPER_AUTO_OPEN_NOISE_STOP_MIN_EVIDENCE,
+        "open_noise_weak_min_evidence": settings.PAPER_AUTO_OPEN_NOISE_WEAK_MIN_EVIDENCE,
     }
 
 

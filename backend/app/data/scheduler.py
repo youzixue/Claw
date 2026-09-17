@@ -2749,7 +2749,16 @@ class DataScheduler:
                 # Coverage numerator and sum must use the same audited source,
                 # finite pair and fresh clock contract as API/B1 consumption.
                 from app.data.main_fund import current_main_fund_evidence, current_main_fund_status
-                fund_decision_at = datetime.now()
+                # 2026-09-17 复盘修复：这里是"当日收盘聚合"，不是盘中信号。
+                # 供应商资金流（腾讯 hsfundtab）在 14:56 后不再更新，而本批处理在
+                # 19:59 运行；若以墙钟 now 作为 decision_at，
+                # FUND_FLOW_SOURCE_MAX_AGE_SEC=600 会把当日全部资金流行判为 stale，
+                # 主力资金覆盖恒为 0%，main_net_inflow 恒为 None，情绪记录退化为
+                # 不可交易哨兵值并让熔断器 block_buy（9/15–9/17 连续三日）。
+                # 日度聚合的新鲜度应以当日收盘时刻为基准，而非批处理实际运行时刻；
+                # 盘中信号消费者仍各自使用真实 now，本改动不影响其保护窗口。
+                session_close = datetime.combine(today, time(15, 0))
+                fund_decision_at = session_close if datetime.now() >= session_close else datetime.now()
                 observed_funds = ff_result.scalars().all()
                 fund_status_counts = Counter(current_main_fund_status(
                     row, trade_date=today, decision_at=fund_decision_at,
@@ -5333,6 +5342,10 @@ class DataScheduler:
         - 涨停池(LimitUpPool) → limit_up_count (按板块统计)
         - 连续天数 → 和前一交易日比较
         """
+        # 本行写入时刻：本表按 (sector_code, trade_date) upsert，盘中的值会被
+        # 盘后终值覆盖；记录写入时刻后，退出决策读到的板块强度才能回溯，
+        # 读取侧也可据此拒绝"观测时刻晚于决策时刻"的行（前视偏差防护）。
+        observed_at = datetime.now()
         # 获取概念板块资金流(行业资金流可能报错, 容错)
         ak_src = self._sources["akshare"]
         try:
@@ -5503,6 +5516,7 @@ class DataScheduler:
                         "fund_flow": round(fund_flow or 0, 2),
                         "change_pct": round(change_pct or 0, 2),
                         "strength_score": score,
+                        "observed_at": observed_at,
                     })
                 elif sector_type == "industry":
                     # 行业名匹配一级/二级: 将资金流均匀分配到子行业
@@ -5548,6 +5562,7 @@ class DataScheduler:
                                 "fund_flow": round(per_code_flow or 0, 2),
                                 "change_pct": round(change_pct or 0, 2),
                                 "strength_score": sub_score,
+                                "observed_at": observed_at,
                             })
 
         if records:
@@ -5555,7 +5570,7 @@ class DataScheduler:
                 session, SectorPersistence, records,
                 unique_cols=["sector_code", "trade_date"],
                 update_cols=["sector_name", "consecutive_days", "limit_up_count",
-                             "fund_flow", "change_pct", "strength_score"],
+                             "fund_flow", "change_pct", "strength_score", "observed_at"],
             )
             logger.info(f"板块持续性更新: {len(records)}条")
 

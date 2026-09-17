@@ -275,6 +275,11 @@ async def _ensure_quote_round_execution_columns(conn):
             "decision_round_id": "VARCHAR(64)",
             "fill_round_id": "VARCHAR(64)",
         },
+        # 2026-09-17 复盘修复：sector_persistence 按 (sector_code, trade_date) upsert，
+        # 盘中值会被盘后终值覆盖，此前无观测时点导致板块归因证据无法回溯。
+        "sector_persistence": {
+            "observed_at": "DATETIME",
+        },
     }
     for table_name, columns in table_columns.items():
         result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
