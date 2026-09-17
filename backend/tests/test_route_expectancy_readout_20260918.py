@@ -47,11 +47,17 @@ def test_open_metric_is_documented_as_optimistic():
 def test_readout_criteria_are_pinned():
     """四条判据逐条固定：样本量、净CI下界、两段同号、以引擎结算为准。"""
     body = READOUT.read_text(encoding="utf-8")
-    assert "MIN_SETTLED = 120" in body
+    # 样本量门槛必须**按路线自身 σ 算**，不得再写死通用数字（120 曾被当成通用门槛，
+    # 但它源自 σ=7% 的假设，会把 σ=2.70% 的 relay_fillup 无谓推迟 6 倍时间）。
+    assert "MIN_SETTLED" not in body, "样本量门槛不得回退为写死常量"
+    assert "TARGET_DELTA_PCT = 2.0" in body
+    assert "N_FLOOR = 30" in body
+    assert "def power_n(" in body and "def positive_ci_n(" in body
     assert "FRICTION_PCT = 0.15" in body
     assert 'DISCOVERY = ("2026-09-01", "2026-09-16")' in body
     assert "两段窗口不同号" in body
     assert "继续观察" in body and "否决" in body and "可开单" in body
+    assert "未证明为正" in body, "必须区分「样本不够」「未证明为正」「方向为负」三态"
     # 数据源必须是引擎结算表，不得自算收益
     assert "promotion_prediction_record" in body
     assert "actual_close_change_pct" in body
@@ -63,31 +69,66 @@ def test_readout_uses_engine_settled_values_not_own_prices():
     assert "stock_kline" not in body, "权威判据必须用引擎结算值，不能自算"
 
 
-def test_verdict_requires_all_four_conditions():
+def test_verdict_distinguishes_four_states():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("readout", READOUT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    pos = {"n": 500, "mean": 0.8, "ci_lo_net": 0.5}
+    pos = {"n": 500, "mean": 0.8, "sd": 4.0, "net": 0.65, "ci_lo_net": 0.5}
     state, reasons = module.verdict(pos, pos, pos)
     assert state == "可开单" and reasons == []
 
-    # 样本不足 → 继续观察（不是否决）
-    state, reasons = module.verdict(pos, pos, {"n": 39, "mean": 0.8, "ci_lo_net": 0.5})
+    # 样本不足 → 继续观察（不是否决）；门槛按 σ 算，σ=4% → 51
+    small = {"n": 39, "mean": 0.8, "sd": 4.0, "net": 0.65, "ci_lo_net": 0.5}
+    assert module.power_n(4.0) == 41, module.power_n(4.0)
+    state, reasons = module.verdict(small, small, small)
     assert state == "继续观察" and "39" in reasons[0]
 
     # 两段不同号 → 否决（即使合并看起来为正）
     state, reasons = module.verdict({"mean": -0.1}, {"mean": 0.3}, pos)
     assert state == "否决" and any("同号" in r for r in reasons)
 
-    # 净CI下界不过 → 否决
-    state, reasons = module.verdict(pos, pos, {"n": 9000, "mean": 0.003, "ci_lo_net": -0.214})
-    assert state == "否决" and any("CI 下界" in r for r in reasons)
+    # 样本够、方向为正、只有净CI下界不过 → 第三态「未证明为正」，不是否决
+    third = {"n": 39, "mean": 0.858, "sd": 2.70, "net": 0.708, "ci_lo_net": -0.140}
+    state, reasons = module.verdict(
+        {"n": 32, "mean": 0.792}, {"n": 7, "mean": 1.157}, third)
+    assert state == "未证明为正", state
+    assert any("还差 17 条" in r for r in reasons), reasons
+
+    # 方向为负 → 否决
+    neg = {"n": 9000, "mean": 0.003, "sd": 3.3, "net": -0.147, "ci_lo_net": -0.214}
+    state, reasons = module.verdict({"mean": 0.138}, {"mean": -0.148}, neg)
+    assert state == "否决" and any("方向为负" in r for r in reasons)
 
 
 def test_documented_retraction_is_recorded_in_the_module_docstring():
     doc = (REPO / "scripts" / "route_expectancy_readout.py").read_text(encoding="utf-8")
     assert "该结论经引擎结算口径复核后被证伪" in doc
     assert "oversold_reversal_start" in doc
+
+def test_required_n_follows_route_sigma_not_a_constant():
+    """门槛必须随 σ 变化，且负期望路线判定为"再多样本也不达标"。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("readout_n", READOUT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # σ 越小需求越低 —— 这正是 relay_fillup(σ=2.70%) 不该等 120 的原因
+    # (1) 设计门槛：σ=7% 才需要 ~120 —— 这正是 120 这个数字的出处
+    assert 120 <= module.power_n(7.0) <= 126, module.power_n(7.0)
+    # σ 越小门槛越低：relay_fillup 实测 σ=2.70% → 门槛仅 30（被 N_FLOOR 兜住）
+    assert module.power_n(2.70) == module.N_FLOOR
+    assert module.power_n(5.07) < module.power_n(7.0)
+    # 兜底：σ 极小也不能低于 N_FLOOR
+    assert module.power_n(0.1) == module.N_FLOOR
+    # (2) 参考进度：relay_fillup σ=2.70%、净 +0.708% → 56 条净CI下界才转正
+    assert module.positive_ci_n(2.70, 0.708) == 56, module.positive_ci_n(2.70, 0.708)
+    # 点估计为负 → 累积样本不可能转正，而不是一个巨大但可达的数字
+    assert module.positive_ci_n(3.0, -0.147) is None
+    assert module.positive_ci_n(3.0, 0.0) is None
+    assert module.need_text(None) == "n/a（点估计为负）"
+    # (3) 两个函数不得合流：设计门槛必须与点估计无关
+    assert module.power_n(2.70) == module.power_n(2.70)

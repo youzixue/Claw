@@ -67,8 +67,24 @@ TENCENT_AUCTION_SOURCE_VERSION = "tencent_qt_auction_open_v1"
 # 因此按可用性顺序回退；实测 push2delay 可用且字段齐全。
 EASTMONEY_AUCTION_SOURCE_VERSION = "eastmoney_qt_auction_open_v1"
 EASTMONEY_QUOTE_HOSTS = ("push2delay.eastmoney.com", "push2.eastmoney.com")
+# 300 是实测上限：`ulist.np/get` 一次传 300 个 secid 约 0.27s 返回 300 行，
+# 全市场约 2,994 只 → 10 个请求/轮。旧路径 `clist/get` 的 `pz` 硬上限 100，
+# 全市场要 30~56 页，且每交易日 09:15–09:25 每分钟跑一轮 —— 那才是过去被限频的成因。
 EASTMONEY_AUCTION_BATCH = 300
+# 批次间隔：10 个请求集中在 0.9s 内是 ~11 req/s 的突发。加一点间隔把突发压平，
+# 30 秒证据窗内完全装得下（实测整轮 腾讯+东财 合计约 2.5s）。
+EASTMONEY_AUCTION_PACE_SEC = 0.08
+EASTMONEY_AUCTION_RETRY = 3          # 单个批次的重试次数
+EASTMONEY_AUCTION_BACKOFF_SEC = 0.35  # 被限频/出错后的退避基数（× 尝试序号）
 EASTMONEY_AUCTION_FIELDS = "f12,f14,f17,f18,f5,f6,f10,f124"
+
+
+class EastmoneyThrottled(RuntimeError):
+    """东财限频/拒服务（HTTP 429、5xx、或返回非 JSON 的错误页）。
+
+    单独建类是为了把"被限频"和"网络不可达"区分开：前者的正确反应是退避并
+    换主机，后者是重试当前主机。混在一起会让日志无法回答"到底是不是被限频"。
+    """
 
 
 class AuctionCollector:
@@ -430,48 +446,145 @@ class AuctionCollector:
         code = str(code).zfill(6)
         return ("1." if code[0] in "56" else "0.") + code
 
-    async def _fetch_eastmoney_quotes(self, codes: list[str]) -> dict[str, dict]:
+    @staticmethod
+    def _eastmoney_batches(sorted_codes: list[str]) -> list[list[str]]:
+        return [
+            sorted_codes[i:i + EASTMONEY_AUCTION_BATCH]
+            for i in range(0, len(sorted_codes), EASTMONEY_AUCTION_BATCH)
+        ]
+
+    async def _fetch_eastmoney_quotes(
+        self,
+        codes: list[str],
+        *,
+        diagnostics: dict | None = None,
+    ) -> dict[str, dict]:
         """按 secid 批量取东财行情；返回 {code: row}。主机按可用性回退。
 
-        `clist/get` 的 `pz` 实测上限 100，全市场要 56 页；而
+        `clist/get` 的 `pz` 实测上限 100，全市场要 30~56 页；而
         `ulist.np/get` 支持一次传 300 个 secid（实测 0.27s 返回 300 行），
-        所以这里用 ulist 批量取，全市场约 10 个请求。
+        所以这里用 ulist 批量取，全市场约 10 个请求 —— 请求数比旧路径低一个量级。
+
+        限频对策（这是本方法的主要复杂度来源）
+        --------------------------------------
+        1. **批次间加 `EASTMONEY_AUCTION_PACE_SEC` 间隔**，把 10 个请求的突发压平；
+        2. **每个批次独立重试**（`EASTMONEY_AUCTION_RETRY` 次，退避递增）。
+           旧版是"任一批次抛异常 → 整个主机放弃"，于是被限频时会换主机
+           **从第 0 批重新开始**，请求量翻倍、还白扔 30 秒证据窗；
+        3. **区分限频与网络故障**：限频（429/5xx/非 JSON 错误页）→ 换主机；
+           普通网络故障 → 重试当前主机后跳过该批次，**保留已取到的批次**；
+        4. 诊断计数写入 `diagnostics`，供次日核对"到底有没有被限频"。
+
+        部分成功也返回：闸门是按 code 统计帧数的，拿到 8 成比拿 0 成好；
+        缺口由 `diagnostics["missing_codes"]` 如实记录，不伪装成全量。
         """
+        import asyncio as _asyncio
+
         import httpx
 
         wanted = {str(code).zfill(6) for code in codes}
+        sorted_codes = sorted(wanted)
+        batches = self._eastmoney_batches(sorted_codes)
+        diag = diagnostics if diagnostics is not None else {}
+        diag.update({
+            "hosts_tried": [], "host_used": None, "batches": len(batches),
+            "attempts": 0, "retries": 0, "rate_limited": False,
+            "throttled_batches": 0, "failed_batches": 0, "batch_errors": [],
+        })
+
         result: dict[str, dict] = {}
         async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0),
                                      trust_env=False) as client:
             for host in EASTMONEY_QUOTE_HOSTS:
-                batches = [
-                    [c for c in sorted(wanted)][i:i + EASTMONEY_AUCTION_BATCH]
-                    for i in range(0, len(wanted), EASTMONEY_AUCTION_BATCH)
+                if len(result) >= len(wanted):
+                    break
+                diag["hosts_tried"].append(host)
+                # 只打**仍有缺口**的批次。旧实现在换主机后从第 0 批重来，
+                # 把已取到的批次又取一遍 —— 被限频时正好是双倍加压。
+                pending = [
+                    (index, batch) for index, batch in enumerate(batches)
+                    if any(code not in result for code in batch)
                 ]
+                diag.setdefault("batches_by_host", {})[host] = len(pending)
                 collected: dict[str, dict] = {}
-                try:
-                    for batch in batches:
-                        response = await client.get(
-                            f"https://{host}/api/qt/ulist.np/get",
-                            params={
-                                "secids": ",".join(self._eastmoney_secid(c) for c in batch),
-                                "fltt": 2, "invt": 2,
-                                "fields": EASTMONEY_AUCTION_FIELDS,
-                            },
-                            headers={"User-Agent": "Mozilla/5.0",
-                                     "Referer": "https://quote.eastmoney.com/"},
-                        )
-                        response.raise_for_status()
-                        diff = ((response.json().get("data") or {}).get("diff") or [])
-                        for row in diff:
-                            code = str(row.get("f12") or "").zfill(6)
-                            if code in wanted:
-                                collected[code] = row
-                    if collected:
-                        return collected
-                except Exception as exc:           # noqa: BLE001 — 换主机重试
-                    logger.warning(f"东财竞价行情 {host} 失败: {type(exc).__name__}: {exc}")
+                host_throttled = False
+                for position, (index, batch) in enumerate(pending):
+                    if position:
+                        # pacing 按"本主机实际要发的第几个请求"算，
+                        # 与原始批次序号无关（备用主机只补缺口，序号不连续）。
+                        await _asyncio.sleep(EASTMONEY_AUCTION_PACE_SEC)
+                    diff = None
+                    for attempt in range(1, EASTMONEY_AUCTION_RETRY + 1):
+                        diag["attempts"] += 1
+                        try:
+                            response = await client.get(
+                                f"https://{host}/api/qt/ulist.np/get",
+                                params={
+                                    "secids": ",".join(self._eastmoney_secid(c) for c in batch),
+                                    "fltt": 2, "invt": 2,
+                                    "fields": EASTMONEY_AUCTION_FIELDS,
+                                },
+                                headers={"User-Agent": "Mozilla/5.0",
+                                         "Referer": "https://quote.eastmoney.com/"},
+                            )
+                            if response.status_code == 429 or response.status_code >= 500:
+                                raise EastmoneyThrottled(f"HTTP {response.status_code}")
+                            response.raise_for_status()
+                            payload = response.json()
+                            if not isinstance(payload, dict):
+                                # 正常响应必是 JSON 对象；否则是反爬/错误页
+                                raise EastmoneyThrottled("响应不是 JSON 对象（疑似错误页）")
+                            diff = ((payload.get("data") or {}).get("diff") or [])
+                            break
+                        except EastmoneyThrottled as exc:
+                            diag["rate_limited"] = True
+                            diag["retries"] += 1
+                            diag["batch_errors"].append(
+                                f"{host} batch#{index} 限频/拒服务: {exc}")
+                            logger.warning(
+                                f"东财竞价行情疑似被限频 {host} batch#{index} "
+                                f"(第 {attempt}/{EASTMONEY_AUCTION_RETRY} 次): {exc}")
+                            if attempt < EASTMONEY_AUCTION_RETRY:
+                                await _asyncio.sleep(
+                                    EASTMONEY_AUCTION_BACKOFF_SEC * attempt)
+                        except Exception as exc:       # noqa: BLE001 — 网络类故障
+                            diag["retries"] += 1
+                            diag["batch_errors"].append(
+                                f"{host} batch#{index} {type(exc).__name__}: {exc}")
+                            logger.warning(
+                                f"东财竞价行情 {host} batch#{index} 失败 "
+                                f"(第 {attempt}/{EASTMONEY_AUCTION_RETRY} 次): "
+                                f"{type(exc).__name__}: {exc}")
+                            if attempt < EASTMONEY_AUCTION_RETRY:
+                                await _asyncio.sleep(
+                                    EASTMONEY_AUCTION_BACKOFF_SEC * attempt)
+                    if diff is None:
+                        # 该批次最终失败。限频时换主机（继续硬打只会加重限频），
+                        # 其他故障则跳过本批次、继续后面的批次。
+                        diag["failed_batches"] += 1
+                        if diag["rate_limited"]:
+                            diag["throttled_batches"] += 1
+                            host_throttled = True
+                            break
+                        continue
+                    for row in diff:
+                        if not isinstance(row, dict):
+                            continue
+                        code = str(row.get("f12") or "").zfill(6)
+                        if code in wanted:
+                            collected[code] = row
+                if collected:
+                    result.update(collected)
+                    diag["host_used"] = host
+                    diag["fetched"] = len(result)
+                if host_throttled and len(result) < len(wanted):
+                    logger.warning(
+                        f"东财竞价行情 {host} 被限频，改用下一个主机补缺口"
+                        f"（已取 {len(result)}/{len(wanted)}）")
                     continue
+                if len(result) >= len(wanted):
+                    break
+        diag["missing_codes"] = len(wanted) - len(result)
         return result
 
     async def collect_eastmoney_auction_evidence(
@@ -524,7 +637,21 @@ class AuctionCollector:
         if not codes:
             return {"status": "no_universe", "written": 0}
 
-        quotes = await self._fetch_eastmoney_quotes(list(codes))
+        diagnostics: dict = {}
+        quotes = await self._fetch_eastmoney_quotes(list(codes), diagnostics=diagnostics)
+        # 限频必须留痕到 data_quality_guard，而不是只写一行 warning ——
+        # 否则"到底是不是被限频"无法在 health 面板上回答（用户此前正是问这个）。
+        if diagnostics.get("rate_limited"):
+            from app.data import data_quality_guard
+
+            await data_quality_guard.record_failure(
+                session, "eastmoney", "auction_quote_rate_limit",
+                EastmoneyThrottled(
+                    f"限频批次={diagnostics.get('throttled_batches')} "
+                    f"失败批次={diagnostics.get('failed_batches')} "
+                    f"主机={diagnostics.get('host_used')}"),
+                latency_ms=None,
+            )
         observed_at = local_clock(now if now is not None else datetime.now())
         if observed_at is None or not time(9, 25) <= observed_at.time() <= time(9, 25, 30):
             return {"status": "outside_evidence_window", "written": 0,
@@ -554,6 +681,7 @@ class AuctionCollector:
             session, candidates, observed_at, target_date, source_label="东财",
         )
         result["quotes_fetched"] = len(quotes)
+        result["fetch_diagnostics"] = diagnostics
         return result
 
     async def collect_tencent_auction_evidence(

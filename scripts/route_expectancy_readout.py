@@ -17,11 +17,30 @@
 判据（预先固定，不得事后调整）
 ------------------------------
 某条路线被判定为"可开单"，必须同时满足：
-  1. `n >= MIN_SETTLED`（120）—— 按 δ≈3%、σ≈8% 估 n_min≈53 的 2 倍余量；
+  1. **样本量按该路线自身的 σ 算**：`n >= max(N_FLOOR, power_n(σ, δ=2%))`，
+     其中 `power_n = 1.3 × (z_{α/2}+z_β)² × σ² / δ²`；
   2. 合并样本**扣 0.15% 往返摩擦后**的 95%CI 下界 > 0；
-  3. **发现窗与样本外窗口同号且都为正**（防止区间依赖）；
-  4. 两个口径（次日开盘 / 信号日收盘）**都为正**。
-全部满足 → `可开单`；否则 `继续观察` 或 `否决`。
+  3. **发现窗与样本外窗口同号且都为正**（防止区间依赖）。
+
+### 关于旧的固定门槛 120（已废弃）
+旧版本把判据 1 写死成 `n >= 120`，来源是"δ≈3%、σ≈8% → n_min≈53，再取 2 倍余量"。
+这个数字有两个问题：
+  a. σ=8% 是拍的通用值。各路线实测 σ 差很多（relay_fillup 2.70%、
+     second_board_promotion 5.07%、oversold_reversal_start 3.34%），
+     用 σ=8% 会**系统性高估**需求，把低波动路线无谓地推迟数倍时间；
+  b. "×2 余量"没有任何统计含义，叠加在 53 之上更放大了误差。
+现在改为按各路线自身 σ 计算，并用 `N_FLOOR=30` 兜住小样本。
+
+### 三态而非两态
+  - `继续观察`：样本量还没到设计门槛 —— **不能说任何方向的话**；
+  - `未证明为正`：样本量够了、点估计为正、两段同号，但净 CI 下界仍 ≤ 0
+    —— 不达开单条件，但属可继续累积的候选；
+  - `否决`：点估计为负或两段不同号 —— 方向已错，累积样本不会改变结论。
+把后两者合并成"否决"会丢掉"该不该继续观察"这个信息，故拆开。
+
+注意 `positive_ci_n(σ, 净均值)`（= `(z·σ/均值)²`，即"按当前点估计还需多少条
+才能让净 CI 下界转正"）**只是进度条，不是判据**：它依赖会在观测中漂移的点估计，
+因此不能写进预注册门槛，只能用来估"还要等多久"。
 
 数据源
 ------
@@ -41,7 +60,53 @@ REPO = Path(__file__).resolve().parent.parent
 DB = REPO / "backend" / "claw.db"
 
 FRICTION_PCT = 0.15
-MIN_SETTLED = 120
+# 判据 (a) 的样本量**按每条路线自己的波动率算**，不写死一个通用数字。
+#
+# 为什么改：此前把门槛写成固定 120，来源是"σ=7%、δ=2%"的通用假设
+# （n_min = 1.3 × (1.96+0.842)² × σ²/δ² ≈ 125）。但实测各路线 σ 差很多：
+#   relay_fillup             σ=2.70%  → δ=2% 只需 n≈19
+#   second_board_promotion   σ=5.07%  → δ=2% 只需 n≈66
+#   oversold_reversal_start  σ=3.34%  → δ=2% 只需 n≈28
+# 用 120 卡 `relay_fillup`（σ 只有 2.70%）会把它无谓地推迟 6 倍时间。
+# 因此改为：先按自身 σ 算 n_min(δ)，再取 `max(N_FLOOR, n_min)`。
+# N_FLOOR=30 是"再快也不能少于 30 条"的兜底，防止小样本直接判开门。
+TARGET_DELTA_PCT = 2.0          # 要检出的最小可判定效应 δ
+N_FLOOR = 30                    # 兜底：再快也不能少于 30 条
+Z_ALPHA, Z_BETA = 1.96, 0.842   # α=0.05 双侧, power=80%
+
+
+def power_n(sigma_pct: float, delta_pct: float = TARGET_DELTA_PCT) -> int:
+    """**设计门槛**（预注册）：80% 检验力下检出 δ 所需样本量。
+
+         n = 1.3 × (z_{α/2} + z_β)² × σ² / δ²
+
+    这是可以事先写死、不随观测漂移的门槛，因此用它当 gate。
+    """
+    if sigma_pct <= 0:
+        return N_FLOOR
+    need = 1.3 * (Z_ALPHA + Z_BETA) ** 2 * sigma_pct ** 2 / max(delta_pct, 1e-9) ** 2
+    return max(N_FLOOR, int(math.ceil(need)))
+
+
+def positive_ci_n(sigma_pct: float, mean_net_pct: float) -> int | None:
+    """**参考进度**（非 gate）：按当前点估计，还需多少条才能让净 CI 下界转正。
+
+         mean > t·σ/√n  →  n > (t·σ/mean)²
+
+    只能当进度条用：点估计本身在漂，这个数字会随样本变化，所以不写进判据。
+    返回 None = 点估计已为负，靠累积样本不可能转正。
+    """
+    if mean_net_pct <= 0:
+        return None
+    if sigma_pct <= 0:
+        return N_FLOOR
+    return max(N_FLOOR, int(math.ceil((Z_ALPHA * sigma_pct / mean_net_pct) ** 2)))
+
+
+def need_text(need: int | None) -> str:
+    return "n/a（点估计为负）" if need is None else f"n≈{need}"
+
+
 DISCOVERY = ("2026-09-01", "2026-09-16")
 WATCHLIST = ("relay_fillup", "oversold_reversal_start", "mainline_spread_start",
              "pre_board_probe_start", "second_board_promotion", "news_catalyst_start",
@@ -84,6 +149,7 @@ def summarise(values: list[float]) -> dict:
         return {"n": 0}
     return {
         "n": n, "mean": st.mean(values), "median": st.median(values),
+        "sd": st.stdev(values) if n > 1 else 0.0,
         "win": sum(1 for x in values if x > 0) / n * 100,
         "net": st.mean(values) - FRICTION_PCT,
         "ci_lo_net": ci_lower(values, FRICTION_PCT),
@@ -92,23 +158,49 @@ def summarise(values: list[float]) -> dict:
 
 def verdict(discovery: dict, out_of_sample: dict, combined: dict) -> tuple[str, list[str]]:
     reasons: list[str] = []
-    if combined.get("n", 0) < MIN_SETTLED:
-        return "继续观察", [f"已结算 n={combined.get('n', 0)} < {MIN_SETTLED}"]
-    if not combined["ci_lo_net"] > 0:
-        reasons.append(f"合并样本净期望 CI 下界 {combined['ci_lo_net']:+.3f}% ≤ 0")
-    if not (discovery.get("mean", 0) > 0 and out_of_sample.get("mean", 0) > 0):
+    n = combined.get("n", 0)
+    gate = power_n(combined.get("sd", 0.0)) if n else N_FLOOR
+    if n < gate:
+        return "继续观察", [
+            f"已结算 n={n} < 设计门槛 {gate}"
+            f"（σ={combined.get('sd', 0):.2f}%、δ={TARGET_DELTA_PCT}%；"
+            f"按当前点估计需 {need_text(positive_ci_n(combined.get('sd', 0.0), combined.get('net', 0.0)))}）"
+        ]
+    two_windows_positive = discovery.get("mean", 0) > 0 and out_of_sample.get("mean", 0) > 0
+    ci_ok = combined["ci_lo_net"] > 0
+    if ci_ok and two_windows_positive:
+        return "可开单", []
+    if not two_windows_positive:
         reasons.append("两段窗口不同号（区间依赖）")
-    return ("可开单" if not reasons else "否决"), reasons
+    if not ci_ok:
+        reasons.append(
+            f"合并样本净期望 CI 下界 {combined['ci_lo_net']:+.3f}% ≤ 0"
+        )
+    # 第三态：样本量够、点估计为正、两段同号，只有 CI 下界还压在 0 以下。
+    # 这与"点估计为负"是两回事 —— 前者是可继续累积的候选，后者是方向已错。
+    if (not ci_ok) and two_windows_positive and combined.get("net", 0) > 0:
+        prog = positive_ci_n(combined.get("sd", 0.0), combined.get("net", 0.0))
+        gap = "—" if prog is None else str(max(0, prog - n))
+        return "未证明为正", reasons + [
+            f"点估计净={combined['net']:+.3f}% 与两段同号均支持为正，但按该 σ 需 n≈{prog}"
+            f"（还差 {gap} 条）方能使下界转正 —— 属可继续累积的候选，不是方向为负"
+        ]
+    if combined.get("net", 0) <= 0:
+        return "否决", reasons + [
+            f"点估计净={combined['net']:+.3f}% ≤ 0，方向为负"
+        ]
+    return "否决", reasons
 
 
 def main() -> int:
-    print(f"判据：n≥{MIN_SETTLED} 且 净CI下界>0 且 两段窗口同号为正（摩擦 {FRICTION_PCT}%）")
+    print(f"判据：n≥设计门槛 max({N_FLOOR}, power_n(σ,δ={TARGET_DELTA_PCT})) "
+          f"且 净CI下界>0 且 两段窗口同号为正（摩擦 {FRICTION_PCT}%）")
     print(f"发现窗 {DISCOVERY[0]}~{DISCOVERY[1]}；样本外 = 该窗之前\n")
     header = (f"{'路线':<26}{'n':>7}{'均值':>9}{'中位':>9}{'胜率':>7}"
               f"{'净均值':>9}{'净CI下界':>11}  判定")
     print(header)
     print("-" * len(header))
-    watch: list[str] = []
+    watch: list[tuple[str, str]] = []
     for route in WATCHLIST:
         rows = load_settled(route)
         disc = [v for d, v in rows if DISCOVERY[0] <= d <= DISCOVERY[1]]
@@ -126,16 +218,27 @@ def main() -> int:
         print(detail)
         if reasons:
             print(f"    未通过原因：{'；'.join(reasons)}")
-        if state == "继续观察":
-            watch.append(f"{route}（已结算 {comb['n']}，距 {MIN_SETTLED} 还差 "
-                         f"{MIN_SETTLED - comb['n']}）")
+        if state in ("继续观察", "未证明为正"):
+            gate = power_n(comb["sd"])
+            prog = positive_ci_n(comb["sd"], comb["net"])
+            d_gap = str(max(0, gate - comb["n"]))
+            c_gap = "—" if prog is None else str(max(0, prog - comb["n"]))
+            watch.append((state, f"{route}（已结算 {comb['n']}，σ={comb['sd']:.2f}%，"
+                                 f"设计门槛 {gate}[还差 {d_gap}]，"
+                                 f"净CI转正参考 {need_text(prog)}[还差 {c_gap}]）"))
     print()
-    if watch:
-        print("仍在观察池（样本不足，继续累积）：")
-        for item in watch:
+    for state, title, note in (
+        ("继续观察", "样本量不足，尚不能判定：", "先攒够设计门槛再读。"),
+        ("未证明为正", "样本量已够、方向为正但净CI下界未转正：", "不达开单条件，但值得继续累积。"),
+    ):
+        items = [t for st, t in watch if st == state]
+        if not items:
+            continue
+        print(f"{title}（{note}）")
+        for item in items:
             print(f"  - {item}")
-    else:
-        print("观察池为空（没有路线处于'样本不足'档）。")
+    if not watch:
+        print("观察池为空。")
     return 0
 
 

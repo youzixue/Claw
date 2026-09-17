@@ -645,6 +645,15 @@ def _research_universe_filters() -> tuple:
             StockTag.name.is_(None),
             and_(~StockTag.name.like("退%"), ~StockTag.name.like("%退")),
         ),
+        # 注意：**不要**在这里加 `is_delisting.is_(False)`。实测（2026-09-18）
+        # 本库 `is_delisting=1` 且落在旧 scope 内的有 130 只，其中 **127 只在
+        # 2026-09-17 有正常K线**（如 002647 仁东控股、600107 *ST尔雅、
+        # 600228 返利科技）—— 本库这个标记表达的更像"有退市风险"而非"已退市"，
+        # 且 tag 行会过期。该过滤在本函数被收盘快照判定、腾讯行情采集、盘后K线
+        # 采集**共用**，加上这个条件会一次性把 127 只活跃标的从采集宇宙里踢掉。
+        # 真正不可观测的那 3 只（000638/300029/600355，K线总数为 0、tag 行过期
+        # 数月）由 `_close_snapshot_health` 如实报进 `uncovered_codes`，
+        # 靠 0.99 阈值容差吸收，而不是从分母里抹掉。
         # 行情源结构性不可覆盖
         *(~StockTag.code.like(pattern) for pattern in _UNOBSERVABLE_CODE_PATTERNS),
     )
@@ -4748,9 +4757,16 @@ class DataScheduler:
             valid_sources.get(source, 0) for source in FORMAL_CLOSE_SOURCES - {"tencent_close"}
         ) + qualified_tencent_close_count
         # 结构性不可观测：回看窗口内**从未出现过任何K线**的 scope 代码。
-        # 判据来自数据本身，不用硬编码名单；源开始覆盖它们时会自动回到分母。
+        # **只作诊断，不从分母扣除。**
+        #
+        # 曾经把它从分母里减掉，那是错的：`scoped_codes` 里"从未有K线"
+        # 既可能是"源结构性不覆盖"，也可能是"**今天真的漏采**"，两者在数据上
+        # 无法区分。扣除会把真实缺口正好从分母里抹掉，把破洞美化成 100%
+        # （`tests/test_research_universe_scope_20260917.py::
+        # test_main_board_gap_still_blocks` 就是为拦住这个而写的）。
+        # 真实成因（3 只 tag 行过期的 *ST 退市股）已由
+        # `_research_universe_filters()` 的 `is_delisting` 条件精确排除。
         unobserved_since = target_date - timedelta(days=CLOSE_SNAPSHOT_UNOBSERVED_LOOKBACK_DAYS)
-        observable_codes = scoped_codes
         structurally_unobservable: list[str] = []
         if use_tag_scope and scoped_codes:
             ever_covered = {
@@ -4764,9 +4780,7 @@ class DataScheduler:
                 )).all()
             }
             structurally_unobservable = sorted(scoped_codes - ever_covered)
-            observable_codes = scoped_codes & ever_covered
         expected_raw = expected
-        expected = len(observable_codes) if use_tag_scope else expected
         completeness = min(canonical_count / expected, 1.0) if expected else 0.0
         ready = bool(
             expected > 0
@@ -4786,7 +4800,9 @@ class DataScheduler:
         covered_codes = {
             str(code) for (code,) in (await session.execute(covered_query)).all()
         }
-        uncovered = sorted(observable_codes - covered_codes) if use_tag_scope else []
+        # 未覆盖 = 宇宙内有、今天却没有合法收盘K线的代码。这里用**完整** scope，
+        # 不扣除任何"结构性不可观测"代码 —— 正是要让它显现出来。
+        uncovered = sorted(scoped_codes - covered_codes) if use_tag_scope else []
         uncovered_reasons: dict[str, int] = {}
         for code in uncovered:
             row = (

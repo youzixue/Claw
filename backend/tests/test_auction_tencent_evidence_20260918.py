@@ -264,8 +264,11 @@ def _patch_em(monkeypatch, rows, *, fail_first_host=False):
     calls = {"hosts": []}
 
     class _Resp:
-        def __init__(self, payload):
+        # status_code 是 httpx.Response 的标准属性，生产代码会用它区分
+        # 429/5xx（限频）与普通故障，所以测试替身必须一并提供。
+        def __init__(self, payload, status_code: int = 200):
             self._payload = payload
+            self.status_code = status_code
 
         def raise_for_status(self):
             return None
