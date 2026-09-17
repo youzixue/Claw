@@ -4565,12 +4565,14 @@ class DataScheduler:
             StockKline.low <= StockKline.close,
         )
         scope_filters = _research_universe_filters()
-        expected = int(
-            await session.scalar(
-                select(func.count()).select_from(StockTag).where(*scope_filters)
-            )
-            or 0
-        )
+        # 只用于诊断的 in-scope 代码集合；判定仍走下面的计数口径。
+        scoped_codes = {
+            str(code)
+            for (code,) in (await session.execute(
+                select(StockTag.code).where(*scope_filters)
+            )).all()
+        }
+        expected = len(scoped_codes)
         use_tag_scope = expected > 0
         source_rows = (
             await session.execute(
@@ -4687,6 +4689,37 @@ class DataScheduler:
             and invalid_formal_count == 0
             and unsupported_source_count == 0
         )
+        # 未覆盖代码的有界样本 + 粗分类；只用于诊断，不参与判定。
+        covered_query = select(StockKline.code).where(StockKline.trade_date == target_date)
+        if use_tag_scope:
+            covered_query = covered_query.join(
+                StockTag, StockTag.code == StockKline.code
+            ).where(*scope_filters)
+        covered_codes = {
+            str(code) for (code,) in (await session.execute(covered_query)).all()
+        }
+        uncovered = sorted(scoped_codes - covered_codes) if use_tag_scope else []
+        uncovered_reasons: dict[str, int] = {}
+        for code in uncovered:
+            row = (
+                await session.execute(
+                    select(StockTag.is_suspended, StockTag.is_delisting, StockTag.board_tag)
+                    .where(StockTag.code == code)
+                )
+            ).first()
+            if row is None:
+                kind = "tag_missing"
+            elif row[1]:
+                kind = "delisting_flagged"
+            elif row[0]:
+                kind = "suspended"
+            elif str(row[2] or "") not in {"tradeable", "observe_only"}:
+                kind = f"board_{row[2] or 'unknown'}"
+            else:
+                kind = "unexplained_missing_close"
+            uncovered_reasons[kind] = uncovered_reasons.get(kind, 0) + 1
+        uncovered_sample = uncovered[:20]
+
         return {
             "trade_date": target_date.isoformat(),
             "status": "ok" if ready else "blocked",
@@ -4702,6 +4735,21 @@ class DataScheduler:
             "unsupported_source_count": unsupported_source_count,
             "completeness": round(completeness, 6),
             "source_counts": source_counts,
+            # === 2026-09-18 新增可诊断性：未覆盖的代码名单 ===
+            # 9/17 事故：20:00 正式批次被 142 次拒绝，全部只给一个比值
+            # `canonical=5182/5240 completeness=0.988931`，缺 6 只才够 0.99。
+            # 运维拿到这个比值**无法知道缺的是谁**，只能翻日志猜原因
+            # （实际是 3 只从未有过任何日K的退市整理期 *ST 加 55 只当日无收盘
+            #  但仍在 scope 内的代码）。
+            # 这里只**追加**一份有界样本，不改判定口径、不改阈值、不放行任何东西：
+            # `uncovered_codes` 列出在 scope 内但没有 canonical 收盘的代码，
+            # 让人一眼看到缺的是谁、属于哪一类。
+            # uncovered = 在 scope 内、但**当日一根K线都没有**的代码数
+            # （与 canonical 的差额另由 canonical_count 表达；两者含义不同：
+            #  canonical 还要求 spot 新鲜，uncovered 只看有没有bar）
+            "uncovered_count": len(uncovered),
+            "uncovered_codes": uncovered_sample,
+            "uncovered_reasons": uncovered_reasons,
         }
 
     @staticmethod
