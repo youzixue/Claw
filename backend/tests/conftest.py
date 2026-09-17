@@ -59,9 +59,10 @@ def isolated_test_database_guard():
     shutil.rmtree(_TEST_DATABASE_DIR, ignore_errors=True)
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """会话级事件循环"""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+# 2026-09-18：原先这里有一个 session 作用域的自定义 `event_loop` fixture。
+# 该写法在 pytest-asyncio 0.24（requirements-dev.txt 的钉版）里是**被弃用但生效**的，
+# 会让会话级循环与函数级用例互相踩状态，实测整套 8,200 项里
+# 3,033 项失败 + 207 项报错（`RuntimeError: There is no current event loop`），
+# 而单文件运行 157/157 通过 —— 是跨用例污染，不是被测代码的问题。
+# pytest-asyncio >=1.0 已移除该 fixture（重定义不生效），所以本项目实际一直
+# 依赖 1.x 的行为。此处删除：1.x 下是死代码，0.24 下是有害代码。
