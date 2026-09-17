@@ -37,7 +37,9 @@ CODE_PREFIX_MAP = {
     "003": BOARD_TYPE_MAIN_SZ,  # 深市主板新代码段
     "300": BOARD_TYPE_GEM,
     "301": BOARD_TYPE_GEM,
+    "302": BOARD_TYPE_MAIN_SZ,   # 深市主板新代码段（与 price_limit_rules 的默认 main 一致）
     "688": BOARD_TYPE_STAR,
+    "689": BOARD_TYPE_STAR,      # 科创板 CDR（存托凭证）；price_limit_rules 亦按 688/689 同规则
     "83":  BOARD_TYPE_BSE,
     "87":  BOARD_TYPE_BSE,
     "43":  BOARD_TYPE_BSE,
@@ -249,15 +251,32 @@ class StockTagger:
 
     async def batch_tag(self, session: AsyncSession,
                         stocks: list[dict]) -> int:
-        """批量标记股票列表
-        
+        """批量标记股票列表；**单个未登记号段不得中断整批**。
+
         stocks: [{"code": "600xxx", "name": "XX", "is_st": False, ...}]
+
+        2026-09-17：原先逐个 `tag_stock`，而 `tag_stock` 对
+        `get_board_type(code) == "unknown"` 直接抛 `ValueError` —— 于是
+        列表中任意一个新号段就会让**整批标记全部丢失**（且已 add 的 tag 未提交）。
+        实测当日盘后：映射写入 81,187 条成功，紧随其后的 `股票标记写入`
+        整行缺失（对照 8/17、8/18、8/24 均写入 3,400~4,962 只），
+        原因就是 `689009`（科创板 CDR）与 `302132`（深主板新号段）两个号段
+        当时尚未登记。
+
+        改为**逐项失败隔离**：未登记号段跳过并汇总告警，其余照常标记。
+        跳过的股票不会失去既有 `StockTag`（`tag_stock` 是增量标记，且映射缺失
+        不构成摘帽或复牌证据），只是本轮不刷新。
         """
         count = 0
+        skipped: list[str] = []
         for s in stocks:
+            code = str(s.get("code") or "")
+            if self.get_board_type(code) == "unknown":
+                skipped.append(code)
+                continue
             await self.tag_stock(
                 session,
-                code=s["code"],
+                code=code,
                 name=s.get("name", ""),
                 is_st=s.get("is_st"),
                 is_suspended=s.get("is_suspended"),
@@ -266,6 +285,12 @@ class StockTagger:
                 ipo_date=s.get("ipo_date"),
             )
             count += 1
+        if skipped:
+            logger.warning(
+                f"批量标记跳过 {len(skipped)} 只未登记号段的股票（不中断整批）: "
+                f"{skipped[:10]}{'...' if len(skipped) > 10 else ''}；"
+                "请在 CODE_PREFIX_MAP 登记号段后重跑"
+            )
         logger.info(f"批量标记完成: {count}只股票")
         return count
 
