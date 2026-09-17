@@ -2434,6 +2434,18 @@ def _annotate_prediction_record_metadata(
         execution_metadata = {
             "prediction_trade_gate_passed": trade_gate_passed,
             "prediction_actionable": formal_actionable,
+            # === 2026-09-18 可诊断性：把"没入榜"与"路线说不"分开 ===
+            # `formal_actionable = ranked_selected and (...)`，于是 `actionable=0`
+            # 同时可能是两种完全不同的原因：候选没进正式榜，或路线级判定就是否。
+            # 实测 9/16 有 3 只 mainline 候选 `rank_scope=ranked` 但 `watch_only=1`
+            # ——即已入榜却仍被判不可执行；而 9/17 全部 8 只 `pool_unranked`。
+            # 两者的处置方式完全不同（前者要查门槛、后者要查排序），此前混在一个
+            # 0 里，是排查缓慢的直接原因。这两个字段是**纯附加**，不参与任何判定。
+            "prediction_ranked_selected": ranked_selected,
+            "prediction_formal_actionable": formal_actionable,
+            "prediction_route_actionable": (
+                not bool(execution_item.get("prediction_watch_only"))
+            ),
             "prediction_watch_only": bool(
                 execution_item.get("prediction_watch_only")
                 or execution_item.get("prediction_only")
