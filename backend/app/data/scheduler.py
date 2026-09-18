@@ -659,6 +659,31 @@ def _research_universe_filters() -> tuple:
     )
 
 
+# 关键窗口任务：这些任务只在**一个不可回溯的时间窗**内有效，错过即当日永久丢失。
+#
+# 为什么单列：`_on_scheduler_job_event` 只写一行 warning，而
+# `operational_health.job_alerts_today` 是 `current_process_only` 的内存列表、
+# 只保留 100 条。实测 2026-09-18 因"电池+合盖"被系统睡眠打断，
+# 仅 `intraday_fast` 就 missed 139 次，把 09:25 竞价证据采样那条冲掉了 ——
+# 结果是"任务从未执行"与"执行了但写入 0"在数据上**无法区分**，
+# 排查时会误判成"修复失败"。这里把它持久化。
+#
+# 说明为什么不能靠 misfire_grace_time 补救：竞价证据契约要求
+# `observed_at` 落在 09:25:00–09:25:30 内，迟到执行只会返回
+# `outside_evidence_window` 并写 0 行 —— 晚跑等于没跑。
+CRITICAL_WINDOW_JOB_IDS = {
+    "auction_evidence_0925": "09:25 双来源竞价证据的唯一采样窗（09:25:00-09:25:30）",
+    "auction_collect_0920": "竞价不可撤单阶段证据窗",
+    "auction_collect_0924": "竞价最终快照窗",
+    "auction_collect_0925": "竞价最终快照窗",
+    "promotion_prediction_0925": "开盘前正式批次窗",
+    "promotion_prediction_0935": "开盘确认正式批次窗",
+    "promotion_prediction_1510": "收盘后正式批次窗",
+    "promotion_prediction_2000": "收盘后正式批次窗",
+    "close_snapshot_finalize": "当日收盘固化窗",
+}
+
+
 class DataScheduler:
     """数据采集调度器 — 采集+写入一体化"""
 
@@ -667,6 +692,8 @@ class DataScheduler:
         self._jobs_initialized = False
         self._pipeline_runtime_health = PipelineRuntimeHealth()
         self._runtime_listener_registered = False
+        # 关键窗口 missed 的内存快照（有界）；同时在 DataSourceHealth 里持久留证。
+        self._critical_window_misses: list[dict] = []
         self._pipeline_health_task: asyncio.Task | None = None
         self._anomaly_snapshot_refreshing = False
         self._anomaly_snapshot_pending = False
@@ -1452,6 +1479,59 @@ class DataScheduler:
         observation = self._pipeline_runtime_health.observe_job(event)
         if observation["status"] in {"error", "missed", "max_instances", "business_degraded"}:
             logger.warning("调度运行异常（不等同业务批次完成）: {}", observation)
+        # 关键窗口丢失：必须**持久**留证，否则"从未执行"会被误读成"执行了但失败"。
+        if (observation["status"] == "missed"
+                and observation.get("job_id") in CRITICAL_WINDOW_JOB_IDS):
+            self._record_critical_window_miss(observation)
+
+    def _record_critical_window_miss(self, observation: dict) -> None:
+        """把关键窗口的 missed 记进内存快照 + DataSourceHealth（持久）。
+
+        成员检查放在**方法内部**，而不是只放在调用点 —— 否则直接调用本方法
+        （测试、将来的其它调用点）会绕过检查，把高频任务的噪音混进这份记录，
+        关键窗口又会被冲掉。
+        """
+        job_id = str(observation.get("job_id") or "")
+        if job_id not in CRITICAL_WINDOW_JOB_IDS:
+            return
+        record = {
+            "job_id": job_id,
+            "window": CRITICAL_WINDOW_JOB_IDS.get(job_id, ""),
+            "scheduled_at": str(observation.get("scheduled_at")),
+            "observed_at": str(observation.get("observed_at")),
+            "finish_lateness_sec": observation.get("finish_lateness_sec"),
+        }
+        self._critical_window_misses.append(record)
+        del self._critical_window_misses[:-20]        # 有界
+        logger.error(
+            "关键窗口任务未执行（当日数据永久缺失，非业务失败）: {} 窗={} 迟到{}秒",
+            job_id, record["window"], record["finish_lateness_sec"],
+        )
+        # 同步监听器里不能 await；在运行中的事件循环上排一个写库任务。
+        try:
+            import asyncio as _asyncio
+
+            loop = _asyncio.get_running_loop()
+        except RuntimeError:
+            return                                     # 无事件循环（如单元测试直调）时只留内存
+        loop.create_task(self._persist_critical_window_miss(job_id, record))
+
+    @staticmethod
+    async def _persist_critical_window_miss(job_id: str, record: dict) -> None:
+        from app.core.data_quality import data_quality_guard
+
+        try:
+            async with async_session() as session:
+                await data_quality_guard.record_failure(
+                    session, "scheduler", f"missed_window:{job_id}",
+                    "关键窗口任务未执行：窗={} 计划={} 观测={} 迟到={}秒".format(
+                        record.get("window"), record.get("scheduled_at"),
+                        record.get("observed_at"), record.get("finish_lateness_sec"),
+                    ),
+                    latency_ms=0,
+                )
+        except Exception as exc:                       # noqa: BLE001 — 留证失败不得影响调度
+            logger.warning("关键窗口丢失落库失败 {}: {}", job_id, type(exc).__name__)
 
     def get_pipeline_runtime_status(self) -> dict:
         from app.news.engine import news_engine
@@ -1488,6 +1568,8 @@ class DataScheduler:
             "recent_events": [dict(event) for event in self._promotion_runtime_audit[-30:]],
             "confirmation_windows_changed": False,
             "process_awake": self._process_awake_guard.status(),
+            # 关键窗口（不可回溯）丢失记录：与"执行了但写入 0 行"是两回事。
+            "critical_window_misses": [dict(item) for item in self._critical_window_misses],
             "operational_health": self._pipeline_runtime_health.snapshot(),
             "sentiment_funds": {
                 **self._sentiment_fund_health,
