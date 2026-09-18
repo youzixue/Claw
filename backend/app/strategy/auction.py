@@ -642,15 +642,23 @@ class AuctionCollector:
         # 限频必须留痕到 data_quality_guard，而不是只写一行 warning ——
         # 否则"到底是不是被限频"无法在 health 面板上回答（用户此前正是问这个）。
         if diagnostics.get("rate_limited"):
-            from app.data import data_quality_guard
+            # 正确路径是 `app.core.data_quality`（`data_quality_guard` 是那里的单例）。
+            # 写成 `from app.data import ...` 会 ImportError，而本调用在
+            # try/except 里，结果是**限频记账静默失效** —— 已由测试锁住。
+            from app.core.data_quality import data_quality_guard
 
+            # 注意：`record_failure(error_msg: str, latency_ms: int = 0)` 内部会做
+            # `error_msg[:500]`，传异常对象会 TypeError；`latency_ms=None` 也不是合法入参。
+            # 这条路径只在被限频时才走，所以必须显式给 str 和 int。
             await data_quality_guard.record_failure(
                 session, "eastmoney", "auction_quote_rate_limit",
-                EastmoneyThrottled(
-                    f"限频批次={diagnostics.get('throttled_batches')} "
-                    f"失败批次={diagnostics.get('failed_batches')} "
-                    f"主机={diagnostics.get('host_used')}"),
-                latency_ms=None,
+                "限频批次={} 失败批次={} 主机={} 明细={}".format(
+                    diagnostics.get("throttled_batches"),
+                    diagnostics.get("failed_batches"),
+                    diagnostics.get("host_used"),
+                    "; ".join(diagnostics.get("batch_errors") or [])[:300],
+                ),
+                latency_ms=0,
             )
         observed_at = local_clock(now if now is not None else datetime.now())
         if observed_at is None or not time(9, 25) <= observed_at.time() <= time(9, 25, 30):

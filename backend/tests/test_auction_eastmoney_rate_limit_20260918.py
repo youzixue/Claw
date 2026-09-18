@@ -282,3 +282,53 @@ def test_pacing_and_retry_constants_are_documented_for_the_window():
                              for i in range(1, EASTMONEY_AUCTION_RETRY)))
     assert worst < 25, f"最坏耗时 {worst:.1f}s 会越过证据窗"
     assert EastmoneyThrottled is not None
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_is_recorded_to_data_source_health_with_correct_types(patch_client):
+    """被限频时必须真的写进 DataSourceHealth，而不是抛 TypeError。
+
+    这是一个**只在限频路径才触发**的缺陷：`record_failure` 的签名是
+    `(source, api_name, error_msg: str, latency_ms: int = 0)`，内部还会做
+    `error_msg[:500]`。第一版传的是 `EastmoneyThrottled` **异常对象**、且
+    `latency_ms=None` —— 两者都不合法。因为正常路径不经过这里，
+    全套测试都不会发现，只有真被限频的那天才炸。
+    """
+    from datetime import date, datetime
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from app.core.data_quality import DataSourceHealth
+    from app.db.session import Base
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        # 两个主机都 429 → 必然走到记账分支
+        patch_client([lambda url: _Resp({}, status_code=429)])
+
+        async with maker() as session:
+            # 显式传 codes，避免依赖 StockTag 种子数据。
+            at = datetime(2026, 9, 18, 9, 25, 10)
+            result = await AuctionCollector().collect_eastmoney_auction_evidence(
+                session, date(2026, 9, 18), now=at,
+                codes=[f"60{i:04d}" for i in range(3)],
+            )
+            health = (await session.scalars(
+                select(DataSourceHealth).where(
+                    DataSourceHealth.source == "eastmoney",
+                    DataSourceHealth.api_name == "auction_quote_rate_limit",
+                )
+            )).all()
+    finally:
+        await engine.dispose()
+
+    assert result["written"] == 0
+    assert result["fetch_diagnostics"]["rate_limited"] is True
+    assert health, "限频必须留下 DataSourceHealth 记录"
+    assert isinstance(health[0].latency_ms, int), health[0].latency_ms
+    assert "限频批次" in (health[0].error_msg or "")
+    assert health[0].status in {"degraded", "down"}
