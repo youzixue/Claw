@@ -108,7 +108,8 @@ async def paper_ledger_section(db):
 
 
 async def finish_account_write(db):
-    if paper_transaction_active(db):
+    from app.paper.portfolio_reservation import reservation_active
+    if paper_transaction_active(db) or reservation_active(db):
         await db.flush()
     else:
         await db.commit()
@@ -128,14 +129,35 @@ class _Scope:
     immediate_evidence_json: str = ""
     lock_checked_at: datetime | None = None
     ledger_timing: dict | None = None
+    transaction_identity: object = None
+    resource_consumption_used: bool = False
+    fixed_candidate: object = None
 
 
 @contextmanager
-def _paper_execution_scope(db, req, *, immediate_evidence_json=""):
+def _paper_execution_scope(db, req, *, immediate_evidence_json="", fixed_candidate=None,
+                           _partial_candidate=None):
+    if _partial_candidate is not None:
+        from app.trading import paper_after_hours_execution as execution
+        from app.trading import paper_after_hours_resources as resources
+        if (fixed_candidate is not None
+                or type(_partial_candidate) is not execution._FrozenPartialFixedPriceCandidate
+                or req.order_type != execution.MODE or not paper_transaction_active(db)
+                or immediate_evidence_json != resources._json(resources._partial_resource_contract(_partial_candidate))):
+            raise HTTPException(403, "分片落账必须绑定原服务事务与精确分片候选，JSON不是授权")
+    elif fixed_candidate is not None:
+        from app.trading.paper_after_hours_execution import MODE, _FrozenFixedPriceCandidate
+        if (type(fixed_candidate) is not _FrozenFixedPriceCandidate or req.order_type != MODE
+                or not paper_transaction_active(db)
+                or immediate_evidence_json != fixed_candidate.contract_json):
+            raise HTTPException(403, "盘后落账必须绑定原服务事务与精确冻结候选，JSON不是授权")
     if not isinstance(immediate_evidence_json, str):
         raise HTTPException(403, "模拟成交依据必须为服务冻结的JSON文本")
     scope = _Scope(db, req, _request_values(req), asyncio.current_task(),
-                   immediate_evidence_json=immediate_evidence_json)
+                   immediate_evidence_json=immediate_evidence_json,
+                   fixed_candidate=_partial_candidate if _partial_candidate is not None else fixed_candidate)
+    session = getattr(db, "sync_session", None)
+    scope.transaction_identity = session.get_transaction() if session is not None else None
     token = _SCOPE.set(scope)
     try:
         yield
@@ -144,11 +166,24 @@ def _paper_execution_scope(db, req, *, immediate_evidence_json=""):
         _SCOPE.reset(token)
 
 
+@contextmanager
+def _paper_partial_execution_scope(db, req, *, candidate):
+    """Service-private exact partial entry; the legacy full entry stays full-only."""
+    from app.trading import paper_after_hours_resources as resources
+    with _paper_execution_scope(db, req,
+            immediate_evidence_json=resources._json(resources._partial_resource_contract(candidate)),
+            _partial_candidate=candidate):
+        yield
+
+
 def _current(db, stage):
     scope = _SCOPE.get()
     if (scope is None or scope.db is not db or scope.stage != stage
             or scope.task is not asyncio.current_task()
-            or scope.values != _request_values(scope.request)):
+            or scope.values != _request_values(scope.request)
+            or (scope.fixed_candidate is not None and (not paper_transaction_active(db)
+                or scope.transaction_identity is None
+                or scope.transaction_identity is not db.sync_session.get_transaction()))):
         raise HTTPException(403, "模拟成交只能由统一交易服务已验收的请求落账")
     return scope
 
@@ -176,6 +211,47 @@ def authorize_ledger_request(db, req, *, side, account_name):
     scope.stage = "ledger"
 
 
+def fixed_price_account_identity(db, account_name):
+    """An active fixed-price ledger must never create/reopen a same-name account."""
+    scope = _SCOPE.get()
+    if scope is None or scope.request.order_type != "after_hours_fixed":
+        return None
+    scope = _current(db, "ledger")
+    if scope.fixed_candidate is None or scope.request.account_name != account_name:
+        raise HTTPException(403, "盘后账务缺少原数值账户授权")
+    contract = json.loads(scope.immediate_evidence_json)
+    identity = contract.get("account_numeric_id")
+    if type(identity) is not int or identity <= 0:
+        raise HTTPException(403, "盘后账务缺少原数值账户身份")
+    return identity
+
+
+def _partial_ledger_candidate(db):
+    """Only an active typed original scope, never raw JSON or a metadata context."""
+    from app.trading import paper_after_hours_execution as execution
+    scope = _SCOPE.get()
+    if scope is None or type(scope.fixed_candidate) is not execution._FrozenPartialFixedPriceCandidate:
+        return None
+    return _current(db, "ledger").fixed_candidate
+
+
+def fixed_price_fragment_request_identity(db):
+    candidate = _partial_ledger_candidate(db)
+    if candidate is None:
+        return None
+    return json.loads(candidate.contract_json)["request_id"]
+
+
+def fixed_price_fragment_fee_settings(db):
+    candidate = _partial_ledger_candidate(db)
+    if candidate is None:
+        return None
+    from app.trading import paper_after_hours_execution as execution
+    model = json.loads(candidate.contract_json)["fee_preview"]["model"]
+    return execution._FrozenPaperFeeSettings(*(model[key] for key in
+        ("commission_rate", "minimum_commission", "stamp_tax_rate")))
+
+
 def _local_clock(value):
     if isinstance(value, str):
         value = datetime.fromisoformat(value)
@@ -195,6 +271,34 @@ def validate_ledger_clock(db, *, phase):
     if not scope.immediate_evidence_json:
         raise HTTPException(409, "模拟落账缺少服务端冻结的成交时钟合同")
     from app.api.v1 import paper
+    if scope.request.order_type == "after_hours_fixed" and scope.fixed_candidate is not None:
+        from app.trading import paper_after_hours_execution as execution
+        partial = type(scope.fixed_candidate) is execution._FrozenPartialFixedPriceCandidate
+        validate = execution._validate_partial_candidate_clock if partial else execution._validate_candidate_clock
+        now, timing = validate(scope.fixed_candidate, scope.request,
+            phase=phase, clock=paper._public_order_clock,
+            lock_checked_at=scope.lock_checked_at, ledger_timing=scope.ledger_timing)
+        if partial and timing is not None:
+            from app.trading import paper_after_hours_resources as resources
+            from app.trading import paper_after_hours_allocation as allocator
+            contract = json.loads(scope.fixed_candidate.contract_json)
+            timing = resources._partial_resource_timing(scope.fixed_candidate, timing)
+            # Conversion hashes the full typed material AFTER the pure predicate.
+            # Sample once more immediately before book mutation; no parse/hash/replay
+            # may follow this sample or borrow the earlier pre-conversion clock.
+            expires_at = allocator._clock(contract["quote_expires_at"])
+            policy_matches = execution._partial_fee_parameters_match(contract["fee_preview"])
+            final = allocator._clock(paper._public_order_clock())
+            if (not now <= final < expires_at
+                    or not allocator.clock_valid(final) or not policy_matches):
+                raise HTTPException(409, "分片落账typed时钟转换后已到期、回退或费用漂移")
+            now = final
+            timing["before_mutation_checked_at"] = now.isoformat()
+        if phase == "lock_acquired":
+            scope.lock_checked_at = now
+        else:
+            scope.ledger_timing = timing
+        return now
     attempted = None
     try:
         attempted = paper._public_order_clock()
@@ -203,6 +307,10 @@ def validate_ledger_clock(db, *, phase):
         req = scope.request
         if not isinstance(p, dict):
             raise ValueError("invalid_execution_contract")
+        # Aggregate-only fixed-price intent has NO fill contract. It cannot reuse
+        # an ordinary immediate/pending certificate, even during daytime hours.
+        if req.order_type != "limit":
+            raise ValueError("ordinary_fill_contract_requires_limit_order")
         pending = p.get("contract_version") == "pending_paper_fill_timing_v1_20260914"
         immediate = p.get("contract_version") == "immediate_paper_fill_v2_20260914"
         if (not (pending or immediate)

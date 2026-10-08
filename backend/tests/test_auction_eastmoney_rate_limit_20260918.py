@@ -264,12 +264,11 @@ async def test_empty_diff_is_not_treated_as_throttle(patch_client):
     assert diag["failed_batches"] == 0
 
 
-def test_pacing_and_retry_constants_are_documented_for_the_window():
-    """pacing + 重试必须仍装得进 09:25:00–09:25:30 的 30 秒证据窗。
+def test_planned_pacing_and_backoff_are_bounded_not_a_latency_guarantee():
+    """只检查计划sleep预算，绝不把它冒充网络最坏耗时或自然验收。
 
-    实测：10 个批次 × 0.08s pacing ≈ 0.8s，整轮 腾讯+东财 ≈ 2.5s；
-    最坏情况（每批都重试到上限）也必须在窗口内，否则第 3 轮 09:25:25
-    只剩 5 秒必然失败 —— 这正是必须把重试次数写小的原因。
+    这里未包含网络连接/读取超时；总请求截止由collector传入的真实
+    09:25:30及单调钟预算约束，独立边界测试覆盖阻塞尾批与取消。
     """
     from app.strategy.auction import (
         EASTMONEY_AUCTION_BACKOFF_SEC,
@@ -277,10 +276,10 @@ def test_pacing_and_retry_constants_are_documented_for_the_window():
     )
 
     batches = 10
-    worst = (batches * EASTMONEY_AUCTION_PACE_SEC
-             + batches * sum(EASTMONEY_AUCTION_BACKOFF_SEC * i
-                             for i in range(1, EASTMONEY_AUCTION_RETRY)))
-    assert worst < 25, f"最坏耗时 {worst:.1f}s 会越过证据窗"
+    planned_sleep = (batches * EASTMONEY_AUCTION_PACE_SEC
+                     + batches * sum(EASTMONEY_AUCTION_BACKOFF_SEC * i
+                                     for i in range(1, EASTMONEY_AUCTION_RETRY)))
+    assert planned_sleep < 25, f"仅sleep预算已达 {planned_sleep:.1f}s"
     assert EastmoneyThrottled is not None
 
 

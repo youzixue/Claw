@@ -28,12 +28,25 @@ class SubmitOrderRequest(BaseModel):
     quantity: int = Field(ge=100)
     broker: str = "paper"
     account_id: str = "default"
-    order_type: str = Field(default="limit", pattern="^(limit|market)$")
+    order_type: str = Field(default="limit", pattern="^(limit|market|after_hours_fixed)$")
     strategy_id: str = ""
     signal_id: str = ""
     source: str = ""
     reason: str = ""
     execute: bool = True
+    idempotency_key: str = Field(default="", max_length=160)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fixed_price_raw_numeric_parameters(cls, value):
+        # Only the dedicated protocol rejects raw quantity aliases and validates
+        # exact cents BEFORE ordinary float/int coercion. Keep limit/market input
+        # compatibility; board/min/max gates remain in the shared service.
+        if isinstance(value, dict) and value.get("order_type") == "after_hours_fixed":
+            from app.trading.paper_after_hours_allocation import _integer, _price
+            _integer(value.get("quantity"))
+            _price(value.get("price"))
+        return value
 
     @model_validator(mode="after")
     def finite_order_amount(self):
@@ -45,8 +58,9 @@ class SubmitOrderRequest(BaseModel):
 async def create_order(req: SubmitOrderRequest, db: AsyncSession = Depends(get_db)):
     """公开委托不可冒用内部Challenger身份；paper即时成交另验真实深度。"""
     from app.api.v1 import paper
-    if req.account_id in paper.PAPER_CHALLENGER_ACCOUNTS:
-        raise HTTPException(403, "隔离候选账户只接受内部前向确认事件委托")
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+    if req.account_id in (*paper.PAPER_CHALLENGER_ACCOUNTS, PORTFOLIO_ACCOUNT):
+        raise HTTPException(403, "隔离候选/共享组合账户只接受内部前向确认事件及持仓保护委托")
     return await submit_order(
         db,
         SubmitOrderCommand(
@@ -64,6 +78,8 @@ async def create_order(req: SubmitOrderRequest, db: AsyncSession = Depends(get_d
             execute=req.execute,
             require_immediate_quote=req.broker == "paper",
             decision_at=paper._public_order_clock(),
+            idempotency_key=req.idempotency_key,
+            after_hours_manual_intent=req.order_type == "after_hours_fixed",
         ),
     )
 

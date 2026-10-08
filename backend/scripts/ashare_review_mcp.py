@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only MCP stdio facade for Claw's governed A-share APIs.
 
-The server deliberately exposes GET endpoints only. Model training, snapshot
+Audited GET readers and isolated local SELECT-only evidence are exposed. Model training, snapshot
 creation, parameter changes, notes, orders, and database writes are outside this
 boundary and remain explicit application/user actions.
 """
@@ -9,22 +9,28 @@ boundary and remain explicit application/user actions.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import re
 import os
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 SERVER_NAME = "claw-ashare-readonly"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.3.2"
 DEFAULT_API_BASE = "http://127.0.0.1:8000/api/v1"
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REFERENCE_ROOT = PROJECT_ROOT / ".dsh" / "skills" / "ashare-daily-review" / "references"
+# The stdio process is independent of Claw's already-running application.
+sys.path.insert(0, str(PROJECT_ROOT / "backend"))
+from scripts.claw_evidence_contract import EVIDENCE_TOOLS, MODEL_READ_TOOLS
 
 
 TOOLS: dict[str, dict[str, Any]] = {
@@ -150,7 +156,77 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "paper_experiment_report": {
+        "description": "Read current-protocol complete-cycle statistics for the twelve independent paper accounts; generated now, not a historical PIT snapshot. Never creates or refreshes accounts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_name": {"type": "string", "enum": [
+                    "default", "promotion", "mainline", "auction", "tenbagger", "reversal",
+                    "challenger_a", "challenger_b", "challenger_c", "challenger_d",
+                    "challenger_e", "challenger_f2",
+                ]},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "paper_daily_outcomes": {
+        "description": "Read already-finalized daily scan/order/fill outcomes and separately flagged control samples. Does not finalize, scan, replay, or write anything.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_date": {"type": "string", "format": "date"},
+                "account_name": {"type": "string", "enum": [
+                    "default", "promotion", "mainline", "auction", "tenbagger", "reversal",
+                    "challenger_a", "challenger_b", "challenger_c", "challenger_d",
+                    "challenger_e", "challenger_f2",
+                ]},
+            },
+            "required": ["target_date"],
+            "additionalProperties": False,
+        },
+    },
+    "paper_candidate_shadow": {
+        "description": "Read bounded immutable same-candidate observation files for an explicit trade date. Keep truncation, missing coverage and failure denominators; reference-price labels are not executed net returns.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "trade_date": {"type": "string", "format": "date"},
+                "route": {"type": "string", "enum": [
+                    "A", "A2", "B", "B2", "C", "C2", "C3", "D", "D2", "E", "E2", "F", "F2",
+                ]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+            },
+            "required": ["trade_date"],
+            "additionalProperties": False,
+        },
+    },
+    "paper_c3_events": {
+        "description": "Read SELECT-only C3 research events and existing notification receipts for an explicit date. C3 has no execution account; confirmed and sent are not fills or user-received evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "trade_date": {"type": "string", "format": "date"},
+                "keyword": {"type": "string", "maxLength": 80},
+                "event_type": {"type": "string", "enum": [
+                    "all", "confirmed", "eligible", "reset", "block", "confirmation_reset",
+                    "coverage_blocked", "evidence_blocked", "session_blocked", "outcome_blocked",
+                    "structural_pool", "confirmation_sample", "universe_audit", "control",
+                    "session_ready", "session_outcome",
+                ], "default": "confirmed"},
+                "version": {"type": "string", "enum": ["all", "current"], "default": "all"},
+                "page": {"type": "integer", "minimum": 1, "maximum": 1000000, "default": 1},
+                "page_size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            },
+            "required": ["trade_date"],
+            "additionalProperties": False,
+        },
+    },
 }
+
+
+TOOLS.update(EVIDENCE_TOOLS)
+LOCAL_READ_TOOLS = MODEL_READ_TOOLS | EVIDENCE_TOOLS.keys()
 
 
 RESOURCE_FILES = {
@@ -195,28 +271,60 @@ def _tool_request(name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, 
             arguments,
             {"start_date", "end_date", "primary_regime", "limit", "include_features"},
         )
-    if name == "ashare_prediction_runs":
-        return "/model-lab/runs", _clean_query(
-            arguments, {"trade_date", "snapshot_context", "model_version", "limit"}
-        )
-    if name == "ashare_training_runs":
-        return "/model-lab/training-runs", _clean_query(arguments, {"target_board", "limit"})
-    if name == "ashare_shadow_runs":
-        return "/model-lab/shadow-runs", _clean_query(
-            arguments, {"artifact_id", "target_board", "limit"}
-        )
-    if name == "ashare_shadow_evaluations":
-        return "/model-lab/shadow-evaluations", _clean_query(
-            arguments, {"artifact_id", "target_board", "limit"}
-        )
-    if name == "ashare_deployments":
-        return "/model-lab/deployments", {}
+    if name in LOCAL_READ_TOOLS:
+        raise ValueError("local-only evidence must not call business HTTP")
     if name == "ashare_prediction_quality":
         # Never pass refresh=true: this MCP boundary is intentionally read-only.
         return "/governance/prediction-quality", _clean_query(
             arguments, {"snapshot_context", "lookback_days"}
         )
+    if name == "paper_experiment_report":
+        return "/paper/experiment/report", _clean_query(arguments, {"account_name"})
+    if name == "paper_daily_outcomes":
+        return "/paper/audit/daily-outcomes", _clean_query(arguments, {"target_date", "account_name"})
+    if name == "paper_candidate_shadow":
+        return "/paper/research/candidate-shadow", _clean_query(
+            {"limit": 50, **arguments}, {"trade_date", "route", "limit"}
+        )
+    if name == "paper_c3_events":
+        return "/paper/research/c3/events", _clean_query(
+            arguments, {"trade_date", "keyword", "event_type", "version", "page", "page_size"}
+        )
     raise ValueError(f"unknown tool: {name}")
+
+
+def _validate_arguments(name: str, arguments: dict[str, Any]) -> None:
+    """Enforce the advertised flat schemas even for clients bypassing validation."""
+    schema = TOOLS[name]["inputSchema"]
+    properties = schema["properties"]
+    if set(arguments) - set(properties):
+        raise ValueError("unknown tool argument")
+    if set(schema.get("required", ())) - set(arguments):
+        raise ValueError("required tool argument missing")
+    for key, value in arguments.items():
+        rule = properties[key]
+        expected_type = {"string": str, "integer": int, "boolean": bool}[rule["type"]]
+        if type(value) is not expected_type:
+            raise ValueError(f"{key} must be {rule['type']}")
+        if "enum" in rule and value not in rule["enum"]:
+            raise ValueError(f"{key} has an unsupported value")
+        if rule["type"] == "integer" and (
+            value < rule.get("minimum", value) or value > rule.get("maximum", value)
+        ):
+            raise ValueError(f"{key} outside supported range")
+        if rule["type"] == "string" and len(value) > rule.get("maxLength", len(value)):
+            raise ValueError(f"{key} exceeds maximum length")
+        if rule.get("format") == "date" and date.fromisoformat(value).isoformat() != value:
+            raise ValueError(f"{key} must be YYYY-MM-DD")
+        if "pattern" in rule and re.fullmatch(rule["pattern"], value) is None:
+            raise ValueError(f"{key} has invalid format")
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    """A safe GET endpoint must not redirect into an unaudited endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _http_get(path: str, query: dict[str, str]) -> Any:
@@ -229,7 +337,7 @@ def _http_get(path: str, query: dict[str, str]) -> Any:
         headers={"Accept": "application/json", "User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}"},
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with build_opener(_NoRedirects()).open(request, timeout=30) as response:
             length = response.headers.get("Content-Length")
             if length and int(length) > MAX_RESPONSE_BYTES:
                 raise RuntimeError("Claw API response exceeds MCP size limit")
@@ -258,14 +366,27 @@ def _tool_result(payload: Any, *, is_error: bool = False) -> dict[str, Any]:
     return result
 
 
+def _local_read(name: str, arguments: dict[str, Any]) -> Any:
+    from app.review.evidence_dispatch import read_local
+    async def run():
+        return await asyncio.wait_for(read_local(name, arguments), timeout=45)
+    try:
+        return asyncio.run(run())
+    except asyncio.TimeoutError:
+        return {"status": "unavailable", "reason": "evidence_read_timeout", "tool": name, "read_only": True}
+
+
 def _call_tool(params: dict[str, Any]) -> dict[str, Any]:
     name = str(params.get("name") or "")
-    arguments = params.get("arguments") or {}
+    arguments = params.get("arguments", {})
     if name not in TOOLS:
         return _tool_result({"error": f"unknown tool: {name}"}, is_error=True)
     if not isinstance(arguments, dict):
         return _tool_result({"error": "tool arguments must be an object"}, is_error=True)
     try:
+        _validate_arguments(name, arguments)
+        if name in LOCAL_READ_TOOLS:
+            return _tool_result(_local_read(name, arguments))
         path, query = _tool_request(name, arguments)
         return _tool_result(_http_get(path, query))
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
@@ -302,7 +423,10 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | None:
     elif method == "tools/list":
         result = {
             "tools": [
-                {"name": name, **definition} for name, definition in TOOLS.items()
+                {"name": name, "annotations": {
+                    "readOnlyHint": True, "destructiveHint": False,
+                    "idempotentHint": True, "openWorldHint": False,
+                }, **definition} for name, definition in TOOLS.items()
             ]
         }
     elif method == "tools/call":

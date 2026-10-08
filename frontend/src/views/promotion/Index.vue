@@ -12,23 +12,45 @@
         </div>
       </div>
 
-      <div class="metrics-panel promotion-metrics-panel">
+      <div class="promotion-actions">
+        <el-button size="small" @click="refreshCurrentTab">刷新当前视图</el-button>
+          <el-dropdown trigger="click" @command="handlePromotionExport" class="export-dropdown">
+            <el-button size="small" type="primary" plain :disabled="!rankedFirstBoardCandidates.length && !rankedSecondBoardCandidates.length">
+              <el-icon><Download /></el-icon> 导出
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="xlsx">导出 Excel</el-dropdown-item>
+                <el-dropdown-item command="csv">导出 CSV</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        <span class="candidate-subtitle">候选/复盘按需加载；导出为已加载的分赛道候选，非交易指令。</span>
+      </div>
+      <div class="request-status-strip" aria-live="polite">
+        <div v-for="(state, key) in requestStates" :key="key" :data-testid="`request-${key}`">
+          <span>{{ state.label }}：{{ state.loading ? '加载中…' : state.error || (state.loaded ? '已加载' : '切换视图后加载') }}</span>
+          <el-button v-if="state.error" size="small" :disabled="state.loading" @click="loadSection(key)">重试</el-button>
+        </div>
+      </div>
+      <div v-loading="requestStates.height.loading" class="metrics-panel promotion-metrics-panel">
         <div class="stat-row">
           <div class="stat-card promotion-stat-card" data-testid="market-board-height">
             <div class="metric-head"><span>连板高度</span></div>
             <div class="stat-value text-red">{{ boardHeight.height ?? '--' }}</div>
           </div>
           <div class="stat-card promotion-stat-card" data-testid="market-limit-up-count">
-            <div class="metric-head"><span>全市场涨停</span></div>
+            <div class="metric-head"><span>统计池涨停</span></div>
             <div class="stat-value">{{ boardHeight.limit_up_count ?? '--' }}</div>
           </div>
           <div class="stat-card promotion-stat-card" data-testid="market-seal-rate">
-            <div class="metric-head"><span>{{ sealRateLabel }}</span></div>
-            <div class="stat-value">{{ boardHeight.seal_rate != null ? Number(boardHeight.seal_rate).toFixed(1) + '%' : '--' }}</div>
+            <div class="metric-head"><el-tooltip :content="boardHeight.seal_rate_method === 'verified_pool_state' ? '源验证统计池内：封住 / (封住 + 炸板)；缺少炸板口径时为未知，非全市场。' : '按接口标记的方法统计；历史零开板占比不等于实时封板率，缺失时不补零。'"><span>{{ sealRateLabel }}</span></el-tooltip></div>
+            <div class="stat-value">{{ formatPercentPoints(boardHeight.seal_rate) }}</div>
           </div>
           <div class="stat-card promotion-stat-card" data-testid="market-promotion-rate">
-            <div class="metric-head"><span>全市场续板率</span></div>
-            <div class="stat-value text-yellow">{{ boardHeight.promotion_rate != null ? (Number(boardHeight.promotion_rate) * 100).toFixed(1) + '%' : '--' }}</div>
+            <div class="metric-head"><span>统计池续板率</span></div>
+            <div class="stat-value text-yellow">{{ formatPercent(boardHeight.promotion_rate) }}</div>
+            <div v-if="boardHeight.promotion_rate_status" class="candidate-subtitle" data-testid="promotion-rate-status">续板口径：{{ promotionRateStatusLabel }}；前交易日 {{ boardHeight.previous_trade_date || '--' }}。缺失不跨日替代</div>
           </div>
         </div>
         <div v-if="boardScopeSummary" class="market-scope-note" data-testid="market-scope-note">
@@ -36,6 +58,13 @@
         </div>
       </div>
 
+      <el-alert
+        v-if="boardHeight.source_health?.ready === false || ['source_incomplete', 'missing'].includes(boardHeight.status)"
+        class="snapshot-alert" type="warning" show-icon :closable="false"
+        title="腾讯状态或问财补充字段不完整"
+        :description="`行情核验覆盖 ${formatPercent(boardHeight.source_health?.coverage)}；字段待补 ${boardHeight.source_health?.detail_unknown_count ?? '--'} 只，陈旧状态 ${boardHeight.source_health?.stale_state_count ?? '--'} 只。未知值不按零炸板或首板计算；不启用东财回退。`"
+        data-testid="limit-source-health"
+      />
       <el-alert
         v-if="predictionHealth.should_warn"
         class="snapshot-alert"
@@ -47,16 +76,17 @@
       />
       <div v-if="auctionHealth.trade_date" class="prediction-health-strip" data-testid="auction-health-strip">
         <el-tag :type="auctionHealth.status === 'ok' ? 'success' : 'warning'" effect="light">
-          竞价 {{ auctionHealth.status === 'ok' ? '完整' : auctionHealth.status === 'missing' ? '缺失' : '降级' }}
+          最终帧检查 {{ auctionEvidenceStatusLabel(auctionHealth.status) }}
         </el-tag>
         <span>最终帧 {{ auctionHealth.latest_snapshot_time || '--' }}</span>
-        <el-tooltip content="只校验快照时间落在 09:24-09:30，不代表成交字段完整">
-          <span>及时快照（仅时点） {{ auctionHealth.timely_snapshot_count || 0 }}/{{ auctionHealth.latest_code_count || 0 }}</span>
+        <el-tooltip content="仅按该响应的时点窗口统计，不代表成交四字段、多帧路径或来源证据完整">
+          <span>及时快照（仅时点） {{ formatCount(auctionHealth.timely_snapshot_count) }}/{{ formatCount(auctionHealth.latest_code_count) }}</span>
         </el-tooltip>
         <el-tooltip content="价格、增量成交量、成交额和量比四项同时有效才计为完整">
-          <span>竞价四字段完整 {{ auctionHealth.feed_complete_count || 0 }}/{{ auctionHealth.latest_code_count || 0 }}</span>
+          <span>竞价四字段完整 {{ formatCount(auctionHealth.feed_complete_count) }}/{{ formatCount(auctionHealth.latest_code_count) }}</span>
         </el-tooltip>
-        <span>强高开可执行（字段齐全） {{ auctionHealth.executable_strong_open_count || 0 }}/{{ auctionHealth.strong_open_count || 0 }}</span>
+        <span>强高开四字段齐全（非执行授权） {{ formatCount(auctionHealth.executable_strong_open_count) }}/{{ formatCount(auctionHealth.strong_open_count) }}</span>
+        <span>最终帧统计日 {{ auctionHealth.trade_date || '--' }}；最终帧检查通过不等于多帧路径或竞价路线通过</span>
         <span>独立快照上下文 {{ snapshotContextCount }}</span>
         <span>消息截止 {{ promotionCandidates.prediction_news_end_time || '--' }}</span>
         <span data-testid="current-prediction-model">当前候选模型 {{ promotionCandidates.prediction_model_version || '--' }}</span>
@@ -67,7 +97,26 @@
         <span>特征版本 {{ promotionCandidates.feature_version || '--' }}</span>
       </div>
 
-      <div class="section-block learning-review-section">
+      <div v-if="auctionWatermarks.length || auctionRouteGates.length" class="prediction-health-strip" data-testid="auction-path-evidence">
+        <span>独立质量审计 {{ promotionCandidates.quality_gate?.trade_date || '--' }} / {{ promotionCandidates.quality_gate?.snapshot_context || '--' }}（不覆盖最终帧检查，未知或异日上下文不合并）</span>
+        <span v-for="(watermark, index) in auctionWatermarks" :key="index">
+          竞价多帧证据 {{ auctionEvidenceStatusLabel(watermark.status) }} · 数据日 {{ watermark.trade_date || '--' }} ·
+          多帧完整 {{ formatCount(watermark.details?.auction_health?.multi_frame_complete_count) }} /
+          观测个股 {{ formatCount(watermark.details?.auction_health?.latest_code_count) }}
+        </span>
+        <span v-for="route in auctionRouteGates" :key="route.key">
+          依赖竞价的路线 {{ route.key }}：{{ route.gate.gate_passed === false ? '阻断' : route.gate.gate_passed === true && route.gate.status === 'ok' ? '该审计闸门通过（非执行授权）' : '状态未知' }}
+        </span>
+      </div>
+      <div role="tablist" aria-label="晋级预测视图" class="promotion-tabs">
+        <button v-for="tab in tabs" :key="tab.key" :id="`promotion-tab-${tab.key}`"
+          role="tab" :aria-selected="activeTab === tab.key" :aria-controls="`promotion-panel-${tab.key}`"
+          :tabindex="activeTab === tab.key ? 0 : -1" @click="selectTab(tab.key)" @keydown="onTabKeydown($event, tab.key)">
+          {{ tab.label }}
+        </button>
+      </div>
+      <div role="tabpanel" :id="`promotion-panel-${activeTab}`" :aria-labelledby="`promotion-tab-${activeTab}`" class="promotion-tab-panel" tabindex="0">
+      <div v-if="activeTab === 'review'" class="section-block learning-review-section">
         <div class="section-title-with-action">
           <div>
             <div class="section-title">预测复盘与每日学习</div>
@@ -79,11 +128,11 @@
             {{ learningRecommendation.label || '等待复盘数据' }}
           </el-tag>
         </div>
-        <div class="panel-card learning-review-card">
+        <div v-loading="requestStates.review.loading" class="panel-card learning-review-card">
           <div v-if="learningLatest.actual_trade_date" class="learning-review-meta">
             <span>最新复盘 {{ learningLatest.prediction_trade_date }} → {{ learningLatest.actual_trade_date }}</span>
-            <el-tag :type="learningLatest.snapshot_complete ? 'success' : 'warning'" size="small" effect="light">
-              {{ learningLatest.snapshot_complete ? '预测记录完整' : '预测记录不完整' }}
+            <el-tag :type="learningLatest.snapshot_complete === true ? 'success' : 'warning'" size="small" effect="light">
+              {{ learningLatest.snapshot_complete === true ? '预测记录完整' : learningLatest.snapshot_complete === false ? '预测记录不完整' : '预测记录状态未知' }}
             </el-tag>
             <span v-if="learningLatest.prediction_model_version" data-testid="review-prediction-model">
               复盘模型 {{ learningLatest.prediction_model_version }}
@@ -108,28 +157,39 @@
             </div>
             <div class="learning-directional-values">
               <span>完整上涨实际率 <b>{{ formatDirectionalPrecision(summary.metrics) }}</b></span>
-              <span>可评价 / 原预测 <b>{{ summary.metrics.directional_evaluable_count ?? '--' }} / {{ summary.metrics.predicted_count ?? '--' }}</b></span>
-              <span>未知 <b>{{ summary.metrics.directional_unknown_count ?? '--' }}</b></span>
-              <span>覆盖率 <b>{{ formatPercent(summary.metrics.directional_coverage) }}</b></span>
-              <span>已评价子集上涨率 <b>{{ formatPercent(summary.metrics.directional_observed_precision) }}</b></span>
+              <span>可评价 / 原预测 <b>{{ formalMetric(summary.metrics, 'directional_evaluable_count') }} / {{ formatPredictedCount(summary.metrics) }}</b></span>
+              <span>未知 <b>{{ formalMetric(summary.metrics, 'directional_unknown_count') }}</b></span>
+              <span>覆盖率 <b>{{ formalMetric(summary.metrics, 'directional_coverage', true) }}</b></span>
+              <span>已评价子集上涨率 <b>{{ formalMetric(summary.metrics, 'directional_observed_precision', true) }}</b></span>
               <span>原名单上涨率上下界 <b>{{ formatDirectionalBounds(summary.metrics) }}</b></span>
             </div>
             <div v-if="reviewEvaluationReasons(summary.metrics)" class="candidate-subtitle">
               评价原因：{{ reviewEvaluationReasons(summary.metrics) }}
             </div>
           </div>
+          <div class="learning-scope-note" data-testid="review-latest-scope">
+            下方卡片与分赛道成绩仅来自最新单日（latest）：预测日 {{ learningLatest.prediction_trade_date || '--' }} → 结果日 {{ learningLatest.actual_trade_date || '--' }}，
+            不是近 {{ learningReview.lookback_days || 10 }} 日汇总（aggregate）。上方累计原预测 {{ formatCount(learningReview.aggregate?.predicted_count) }} 条，窗口不同不可直接对比。
+            <span v-if="formalPredictionsMissing(learningLatest)">最新日暂无可用正式预测记录；接口记录数为 {{ formatCount(learningLatest.predicted_count) }}，不代表确认预测了零只，也不以近10日数据补位。</span>
+            <span v-if="learningLatest.outcome_universe_scope === 'current_risk_filtered_main_board'" data-testid="review-limit-up-universe-scope">
+              涨停实际首/二板统计按当前风险标签过滤主板，与市场梯队展示范围不同，数量可不一致；
+              当前标签不是历史时点证据，不认证历史可交易性或执行资格。上涨方向统计另按主板代码范围与有效结局行情评价，不套用上述涨停池过滤口径。
+            </span>
+            <span v-else data-testid="review-limit-up-universe-scope">涨停实际统计范围未明确返回，不推定历史可交易性或执行资格。</span>
+          </div>
           <div class="learning-metric-grid">
             <div class="learning-metric-card" data-testid="review-first-actual">
               <span>实际主板首板</span>
-              <strong>{{ learningFirstBoard.actual_count ?? '--' }}</strong>
+              <strong>{{ formatCount(learningFirstBoard.actual_count) }}</strong>
             </div>
             <div class="learning-metric-card" data-testid="review-first-predicted">
               <span>正式主板首板 Top12</span>
-              <strong>{{ learningFirstBoard.predicted_count ?? '--' }}</strong>
+              <strong :class="{ 'metric-unavailable': formalPredictionsMissing(learningFirstBoard) }">{{ formatPredictedCount(learningFirstBoard) }}</strong>
+              <span v-if="formalPredictionsMissing(learningFirstBoard)">原始记录数 0 · 快照缺失/不完整</span>
             </div>
             <div class="learning-metric-card" data-testid="review-first-hit">
               <span>主板首板命中</span>
-              <strong class="text-red">{{ learningFirstBoard.hit_count ?? '--' }}</strong>
+              <strong class="text-red">{{ formalMetric(learningFirstBoard, 'hit_count') }}</strong>
             </div>
             <div class="learning-metric-card" data-testid="review-first-pool-recall">
               <span>主板首板全池召回</span>
@@ -137,24 +197,24 @@
             </div>
             <div class="learning-metric-card" data-testid="review-first-top30-hit">
               <span>Top30 主板首板命中</span>
-              <strong v-if="learningFirstBoard.recall_ranked_available === true">{{ learningFirstBoard.recall_hit_count ?? 0 }}</strong>
+              <strong v-if="learningFirstBoard.recall_ranked_available === true">{{ formalMetric(learningFirstBoard, 'recall_hit_count') }}</strong>
               <strong v-else class="metric-unavailable">旧版未记录</strong>
             </div>
             <div class="learning-metric-card" data-testid="review-second-actual">
               <span>实际主板二板</span>
-              <strong>{{ learningSecondBoard.actual_count ?? '--' }}</strong>
+              <strong>{{ formatCount(learningSecondBoard.actual_count) }}</strong>
             </div>
             <div class="learning-metric-card" data-testid="review-second-hit">
               <span>主板二板命中</span>
-              <strong>{{ learningSecondBoard.hit_count ?? '--' }}</strong>
+              <strong>{{ formalMetric(learningSecondBoard, 'hit_count') }}</strong>
             </div>
             <div class="learning-metric-card" data-testid="review-first-precision">
               <span>主板首板精度</span>
-              <strong>{{ formatPercent(learningFirstBoard.precision) }}</strong>
+              <strong>{{ formalMetric(learningFirstBoard, 'precision', true) }}</strong>
             </div>
             <div class="learning-metric-card" data-testid="review-first-recall">
               <span>主板首板正式召回</span>
-              <strong>{{ formatPercent(learningFirstBoard.recall) }}</strong>
+              <strong>{{ formalMetric(learningFirstBoard, 'recall', true) }}</strong>
             </div>
           </div>
           <el-alert
@@ -169,31 +229,33 @@
           />
           <div class="learning-review-grid">
             <div>
-              <div class="candidate-title learning-subtitle">分赛道成绩</div>
-              <el-table :data="learningLaneRows" size="small" stripe empty-text="暂无分赛道复盘">
+              <div class="candidate-title learning-subtitle">分赛道成绩 · 最新单日（latest，非近10日汇总）</div>
+              <el-table data-testid="review-lanes" :data="learningLaneRows" size="small" stripe empty-text="暂无分赛道复盘">
                 <el-table-column prop="target_label" label="赛道" width="74" />
-                <el-table-column prop="actual_count" label="实际" width="64" align="center" />
-                <el-table-column prop="predicted_count" label="预测" width="64" align="center" />
-                <el-table-column prop="hit_count" label="命中" width="64" align="center" />
+                <el-table-column prop="actual_count" :formatter="formatCell" label="实际" width="64" align="center" />
+                <el-table-column label="预测" width="100" align="center">
+                  <template #default="{ row }">{{ formatPredictedCount(row) }}</template>
+                </el-table-column>
+                <el-table-column prop="hit_count" :formatter="formatFormalCell" label="命中" width="64" align="center" />
                 <el-table-column label="精度" width="76" align="center">
-                  <template #default="{ row }">{{ formatPercent(row.precision) }}</template>
+                  <template #default="{ row }">{{ formalMetric(row, 'precision', true) }}</template>
                 </el-table-column>
                 <el-table-column label="正式召回" width="82" align="center">
-                  <template #default="{ row }">{{ formatPercent(row.recall) }}</template>
+                  <template #default="{ row }">{{ formalMetric(row, 'recall', true) }}</template>
                 </el-table-column>
                 <el-table-column label="全池召回" width="82" align="center">
                   <template #default="{ row }">{{ formatPercent(row.pool_recall) }}</template>
                 </el-table-column>
                 <el-table-column label="宽召回命中" width="108" align="center">
                   <template #default="{ row }">
-                    {{ row.recall_ranked_available === true ? `${row.recall_hit_count || 0}/${row.recall_ranked_count || 0}` : '旧版未记录' }}
+                    {{ row.recall_ranked_available === true ? `${formalMetric(row, 'recall_hit_count')}/${formatCount(row.recall_ranked_count)}` : '旧版未记录' }}
                   </template>
                 </el-table-column>
                 <el-table-column label="可执行" width="76" align="center">
-                  <template #default="{ row }">{{ row.actionability_labeled_count ? row.actionable_predicted_count : '--' }}</template>
+                  <template #default="{ row }">{{ numericValue(row.actionability_labeled_count) > 0 ? formatCount(row.actionable_predicted_count) : '--' }}</template>
                 </el-table-column>
                 <el-table-column label="执行精度" width="84" align="center">
-                  <template #default="{ row }">{{ row.actionable_predicted_count ? formatPercent(row.actionable_precision) : '--' }}</template>
+                  <template #default="{ row }">{{ numericValue(row.actionable_predicted_count) > 0 ? formalMetric(row, 'actionable_precision', true) : '--' }}</template>
                 </el-table-column>
               </el-table>
             </div>
@@ -221,21 +283,21 @@
           <div class="mobile-table-wrap">
             <el-table :data="learningLaunchCohortRows" size="small" stripe empty-text="等待新版正式快照积累样本" data-testid="review-directional-cohorts">
               <el-table-column prop="label" label="证据组" min-width="150" />
-              <el-table-column prop="sample_count" label="样本" width="68" align="center" />
+              <el-table-column prop="sample_count" :formatter="formatCell" label="样本" width="68" align="center" />
               <el-table-column label="完整上涨实际率" width="126" align="center">
                 <template #default="{ row }">{{ formatDirectionalPrecision(row) }}</template>
               </el-table-column>
               <el-table-column label="可评价/原名单" width="120" align="center">
-                <template #default="{ row }">{{ row.directional_evaluable_count ?? '--' }} / {{ row.predicted_count ?? row.sample_count ?? '--' }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_evaluable_count') }} / {{ formalPredictionsMissing(row) ? '暂无记录' : formatCount(row.predicted_count ?? row.sample_count) }}</template>
               </el-table-column>
               <el-table-column label="未知" width="68" align="center">
-                <template #default="{ row }">{{ row.directional_unknown_count ?? '--' }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_unknown_count') }}</template>
               </el-table-column>
               <el-table-column label="覆盖率" width="82" align="center">
-                <template #default="{ row }">{{ formatPercent(row.directional_coverage) }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_coverage', true) }}</template>
               </el-table-column>
               <el-table-column label="已评价子集上涨率" width="138" align="center">
-                <template #default="{ row }">{{ formatPercent(row.directional_observed_precision) }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_observed_precision', true) }}</template>
               </el-table-column>
               <el-table-column label="原名单上涨率上下界" width="170" align="center">
                 <template #default="{ row }">{{ formatDirectionalBounds(row) }}</template>
@@ -259,16 +321,16 @@
                 <template #default="{ row }">{{ formatLift(row.strong_rise_lift) }}</template>
               </el-table-column>
               <el-table-column label="首板精度" width="88" align="center">
-                <template #default="{ row }">{{ formatPercent(row.limit_up_precision) }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'limit_up_precision', true) }}</template>
               </el-table-column>
               <el-table-column label="首板Lift" width="88" align="center">
                 <template #default="{ row }">{{ formatLift(row.limit_up_lift) }}</template>
               </el-table-column>
               <el-table-column label="可执行" width="74" align="center">
-                <template #default="{ row }">{{ row.actionable_count || '--' }}</template>
+                <template #default="{ row }">{{ formatCount(row.actionable_count) }}</template>
               </el-table-column>
               <el-table-column label="执行精度" width="88" align="center">
-                <template #default="{ row }">{{ row.actionable_count ? formatPercent(row.actionable_limit_up_precision) : '--' }}</template>
+                <template #default="{ row }">{{ numericValue(row.actionable_count) > 0 ? formatPercent(row.actionable_limit_up_precision) : '--' }}</template>
               </el-table-column>
             </el-table>
           </div>
@@ -276,34 +338,34 @@
           <div class="mobile-table-wrap">
             <el-table :data="learningDailyRows" size="small" stripe empty-text="暂无逐日复盘" data-testid="review-directional-daily">
               <el-table-column prop="actual_trade_date" label="结果日" width="110" />
-              <el-table-column prop="actual_target_limit_up_count" label="实际首/二板" width="100" align="center" />
-              <el-table-column prop="predicted_count" label="正式预测" width="86" align="center" />
-              <el-table-column prop="predicted_limit_up_hit_count" label="涨停命中" width="86" align="center" />
-              <el-table-column prop="underestimated_limit_up_hit_count" label="概率低估命中" width="100" align="center" />
+              <el-table-column prop="actual_target_limit_up_count" :formatter="formatCell" label="实际首/二板" width="100" align="center" />
+              <el-table-column label="正式预测" width="100" align="center"><template #default="{ row }">{{ formatPredictedCount(row) }}</template></el-table-column>
+              <el-table-column prop="predicted_limit_up_hit_count" :formatter="formatFormalCell" label="涨停命中" width="86" align="center" />
+              <el-table-column prop="underestimated_limit_up_hit_count" :formatter="formatFormalCell" label="概率低估命中" width="100" align="center" />
               <el-table-column label="精度" width="82" align="center">
-                <template #default="{ row }">{{ formatPercent(row.limit_up_precision) }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'limit_up_precision', true) }}</template>
               </el-table-column>
               <el-table-column label="可执行精度" width="96" align="center">
-                <template #default="{ row }">{{ row.actionable_predicted_count ? formatPercent(row.actionable_limit_up_precision) : '--' }}</template>
+                <template #default="{ row }">{{ numericValue(row.actionable_predicted_count) > 0 ? formalMetric(row, 'actionable_limit_up_precision', true) : '--' }}</template>
               </el-table-column>
               <el-table-column label="召回" width="82" align="center">
-                <template #default="{ row }">{{ formatPercent(row.limit_up_recall) }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'limit_up_recall', true) }}</template>
               </el-table-column>
-              <el-table-column prop="actual_rising_count" label="主板上涨" width="82" align="center" />
+              <el-table-column prop="actual_rising_count" :formatter="formatCell" label="主板上涨" width="82" align="center" />
               <el-table-column label="完整上涨实际率" width="126" align="center">
                 <template #default="{ row }">{{ formatDirectionalPrecision(row) }}</template>
               </el-table-column>
               <el-table-column label="可评价/原名单" width="120" align="center">
-                <template #default="{ row }">{{ row.directional_evaluable_count ?? '--' }} / {{ row.predicted_count ?? row.sample_count ?? '--' }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_evaluable_count') }} / {{ formalPredictionsMissing(row) ? '暂无记录' : formatCount(row.predicted_count ?? row.sample_count) }}</template>
               </el-table-column>
               <el-table-column label="未知" width="68" align="center">
-                <template #default="{ row }">{{ row.directional_unknown_count ?? '--' }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_unknown_count') }}</template>
               </el-table-column>
               <el-table-column label="覆盖率" width="82" align="center">
-                <template #default="{ row }">{{ formatPercent(row.directional_coverage) }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_coverage', true) }}</template>
               </el-table-column>
               <el-table-column label="已评价子集上涨率" width="138" align="center">
-                <template #default="{ row }">{{ formatPercent(row.directional_observed_precision) }}</template>
+                <template #default="{ row }">{{ formalMetric(row, 'directional_observed_precision', true) }}</template>
               </el-table-column>
               <el-table-column label="原名单上涨率上下界" width="170" align="center">
                 <template #default="{ row }">{{ formatDirectionalBounds(row) }}</template>
@@ -318,22 +380,30 @@
                 <template #default="{ row }">{{ reviewEvaluationLabel(row) }} {{ reviewEvaluationReasons(row) }}</template>
               </el-table-column>
               <el-table-column label="Brier误差" width="96" align="center">
-                <template #default="{ row }">{{ row.brier_score == null || String(row.brier_score).trim() === '' || !Number.isFinite(Number(row.brier_score)) ? '--' : Number(row.brier_score).toFixed(3) }}</template>
+                <template #default="{ row }">{{ formalPredictionsMissing(row) ? '--' : formatBrier(row.brier_score) }}</template>
               </el-table-column>
             </el-table>
           </div>
         </div>
       </div>
 
-      <div class="section-block">
+      <div v-if="activeTab === 'market'" class="section-block">
         <div class="section-title">连板梯队</div>
+        <div class="candidate-subtitle" data-testid="ladder-scope">
+          统计日 {{ ladderMeta.trade_date || '--' }} · {{ marketScopeLabel(ladderMeta.scope) }}
+        </div>
+        <el-alert v-if="ladderBlocked" type="warning" :closable="false" show-icon
+          title="梯队源数据不完整，暂不可用（不是零涨停）"
+          :description="`状态 ${sourceStatusLabel(ladderMeta.status)}；行情核验覆盖 ${formatPercent(ladderMeta.source_health?.coverage)}；未知数据不补零。`"
+          data-testid="ladder-source-health" />
         <div class="panel-card chart-card">
-          <v-chart :option="ladderChartOption" style="height: 350px" autoresize />
+          <v-chart v-if="ladderData.length" :option="ladderChartOption" style="height: 350px" autoresize />
+          <el-empty v-else :description="ladderEmptyText" />
         </div>
 
         <div class="panel-card">
           <div class="mobile-table-wrap">
-          <el-table :data="ladderData" stripe size="small" empty-text="暂无数据" row-key="consecutive_days"
+          <el-table data-testid="promotion-ladder" :data="ladderData" stripe size="small" :empty-text="ladderEmptyText" row-key="consecutive_days"
             :row-class-name="({ row }) => row.consecutive_days >= 4 ? 'high-ladder' : ''">
       <el-table-column prop="consecutive_days" label="连板" width="70" align="center">
         <template #default="{ row }">
@@ -342,16 +412,20 @@
           </strong>
         </template>
       </el-table-column>
-      <el-table-column prop="count" label="个数" width="60" align="center" />
-      <el-table-column prop="seal_rate" label="封板率" width="80" align="center">
-        <template #default="{ row }">{{ Number(row.seal_rate || 0).toFixed(1) }}%</template>
+      <el-table-column prop="count" :formatter="formatCell" label="个数" width="60" align="center" />
+      <el-table-column prop="seal_rate" label="零开板率" width="92" align="center">
+        <template #header><el-tooltip content="该梯队内 break_count = 0 的占比，非封住/(封住+炸板)的封板率；开板字段不齐时为未知。"><span>零开板率</span></el-tooltip></template>
+        <template #default="{ row }">{{ formatPercentPoints(row.seal_rate) }}</template>
       </el-table-column>
       <el-table-column label="个股" min-width="300">
         <template #default="{ row }">
-          <el-tag v-for="s in row.stocks?.slice(0, 5)" :key="s.code" size="small" class="stock-tag"
-            @click="$router.push(`/stocks/${s.code}`)">
-            {{ s.name }}({{ s.code }})
-          </el-tag>
+          <div class="candidate-subtitle">共 {{ row.count ?? '--' }} 只 · 返回 {{ row.stocks?.length ?? '--' }} 只</div>
+          <div class="ladder-stock-tags">
+            <el-tag v-for="s in row.stocks || []" :key="s.code" size="small" class="stock-tag"
+              @click="$router.push(`/stocks/${s.code}`)">
+              {{ s.name }}({{ s.code }})<span v-if="ladderStockLabel(s)"> · {{ ladderStockLabel(s) }}</span>
+            </el-tag>
+          </div>
         </template>
       </el-table-column>
           </el-table>
@@ -359,10 +433,11 @@
         </div>
       </div>
 
-      <div class="section-block">
-        <div class="section-title">晋级候选</div>
+      <component :is="activeTab === 'research' ? 'details' : 'div'" v-if="activeTab === 'candidates' || activeTab === 'research'" class="section-block">
+        <summary v-if="activeTab === 'research'" class="section-title research-summary">展开预备池、弱观察与未入池诊断</summary>
+        <div v-else class="section-title">晋级候选</div>
         <div class="candidate-grid">
-          <div class="panel-card">
+          <div v-if="activeTab === 'candidates'" class="panel-card">
             <div class="candidate-panel-head">
               <div class="candidate-title">首板冲刺候选</div>
               <div class="candidate-subtitle">优先展示 1-2 个交易日内点火的首板预判；当冲刺池过窄时，会优先补位准冲刺，其次才回落到普通观察</div>
@@ -446,7 +521,7 @@
             </el-table>
           </div>
 
-          <div class="panel-card">
+          <div v-if="activeTab === 'research'" class="panel-card">
             <div class="candidate-panel-head">
               <div class="candidate-title">板后贴板横盘预备池</div>
               <div class="candidate-subtitle">最近真实涨停后仍贴着涨停锚点/前高附近横盘，优先看十字星和再点火结构</div>
@@ -508,7 +583,7 @@
                 <div class="candidate-title">为什么没进贴板池</div>
                 <div class="candidate-subtitle">专门盯“离板锚点差多少 / 还差十字星还是差量窒息”，只看最近真实涨停后的那一圈票。</div>
                 <div class="diagnostic-overview">
-                  <el-tag size="small" type="info" effect="light">未进池样本 {{ limitUpPlatformDiagnostics.blocked_total || 0 }} 只</el-tag>
+                  <el-tag size="small" type="info" effect="light">未进池样本 {{ formatCount(limitUpPlatformDiagnostics.blocked_total) }} 只</el-tag>
                   <el-tag
                     v-for="note in limitUpPlatformDiagnostics.notes || []"
                     :key="note"
@@ -617,7 +692,7 @@
             </div>
           </div>
 
-          <div class="panel-card">
+          <div v-if="activeTab === 'research'" class="panel-card">
             <div class="candidate-panel-head">
               <div class="candidate-title">准冲刺</div>
               <div class="candidate-subtitle">静默蓄势里已经靠近临盘点火区，但涨幅还在 0.8%-1.2% 附近，优先看下一次放量和涨幅抬升</div>
@@ -631,7 +706,7 @@
                   <span>{{ group.label }}</span>
                   <el-tag :type="watchBucketTagType(group.bucket)" size="small" effect="light">{{ group.count }}只</el-tag>
                 </div>
-                <div class="diagnostic-summary-value">{{ group.main_uptrend_ready_count || 0 }}</div>
+                <div class="diagnostic-summary-value">{{ formatCount(group.main_uptrend_ready_count) }}</div>
                 <div class="diagnostic-summary-subtitle">临盘待点火</div>
               </div>
             </div>
@@ -644,7 +719,7 @@
                     <div class="candidate-subtitle">{{ group.description || '暂无说明' }}</div>
                   </div>
                   <el-tag :type="watchBucketTagType(group.bucket)" size="small" effect="light">
-                    {{ group.count }}只 / 主升浪预备 {{ group.main_uptrend_ready_count || 0 }}只
+                    {{ group.count }}只 / 主升浪预备 {{ formatCount(group.main_uptrend_ready_count) }}只
                   </el-tag>
                 </div>
                 <el-table :data="group.examples || []" stripe size="small" empty-text="暂无样例" row-key="code">
@@ -689,7 +764,7 @@
             </div>
           </div>
 
-          <div class="panel-card">
+          <div v-if="activeTab === 'research'" class="panel-card">
             <div class="candidate-panel-head">
               <div class="candidate-title">首板预测梯队</div>
               <div class="candidate-subtitle">未进 1-2 日冲刺主池，但仍保留在 3-5 日首板预测层继续跟踪；这里只保留收平到小红的观察预备样本</div>
@@ -703,7 +778,7 @@
                   <span>{{ group.label }}</span>
                   <el-tag :type="watchBucketTagType(group.bucket)" size="small" effect="light">{{ group.count }}只</el-tag>
                 </div>
-                <div class="diagnostic-summary-value">{{ group.main_uptrend_ready_count || 0 }}</div>
+                <div class="diagnostic-summary-value">{{ formatCount(group.main_uptrend_ready_count) }}</div>
                 <div class="diagnostic-summary-subtitle">主升浪预备</div>
               </div>
             </div>
@@ -716,7 +791,7 @@
                     <div class="candidate-subtitle">{{ group.description || '暂无说明' }}</div>
                   </div>
                   <el-tag :type="watchBucketTagType(group.bucket)" size="small" effect="light">
-                    {{ group.count }}只 / 主升浪预备 {{ group.main_uptrend_ready_count || 0 }}只
+                    {{ group.count }}只 / 主升浪预备 {{ formatCount(group.main_uptrend_ready_count) }}只
                   </el-tag>
                 </div>
                 <el-table :data="group.examples || []" stripe size="small" empty-text="暂无样例" row-key="code">
@@ -779,7 +854,7 @@
             </div>
           </div>
 
-          <div class="panel-card">
+          <div v-if="activeTab === 'research'" class="panel-card">
             <div class="candidate-panel-head">
               <div class="candidate-title">弱观察</div>
               <div class="candidate-subtitle">当天收绿但形态还没坏的样本单独放这里，只看止跌翻红和重新补确认K</div>
@@ -793,7 +868,7 @@
                   <span>{{ group.label }}</span>
                   <el-tag :type="watchBucketTagType(group.bucket)" size="small" effect="light">{{ group.count }}只</el-tag>
                 </div>
-                <div class="diagnostic-summary-value">{{ group.main_uptrend_ready_count || 0 }}</div>
+                <div class="diagnostic-summary-value">{{ formatCount(group.main_uptrend_ready_count) }}</div>
                 <div class="diagnostic-summary-subtitle">仍保留主升浪轮廓</div>
               </div>
             </div>
@@ -806,7 +881,7 @@
                     <div class="candidate-subtitle">{{ group.description || '暂无说明' }}</div>
                   </div>
                   <el-tag :type="watchBucketTagType(group.bucket)" size="small" effect="light">
-                    {{ group.count }}只 / 主升浪轮廓 {{ group.main_uptrend_ready_count || 0 }}只
+                    {{ group.count }}只 / 主升浪轮廓 {{ formatCount(group.main_uptrend_ready_count) }}只
                   </el-tag>
                 </div>
                 <el-table :data="group.examples || []" stripe size="small" empty-text="暂无样例" row-key="code">
@@ -856,7 +931,7 @@
             </div>
           </div>
 
-          <div class="panel-card">
+          <div v-if="activeTab === 'candidates'" class="panel-card">
             <div class="candidate-panel-head">
               <div class="candidate-title">二板候选</div>
               <div class="candidate-subtitle">从当日首板池里评估次日晋级二板的强弱顺序</div>
@@ -915,12 +990,12 @@
           </div>
         </div>
 
-        <div class="panel-card diagnostic-panel">
+        <div v-if="activeTab === 'research'" class="panel-card diagnostic-panel">
           <div class="candidate-panel-head">
             <div class="candidate-title">首板未入池诊断</div>
             <div class="candidate-subtitle">把被主筛选挡掉的票按主因分组。这样就算首板冲刺为空，也能看见今天到底卡在主线、记忆、量能还是结构。</div>
             <div class="diagnostic-overview">
-              <el-tag size="small" type="info" effect="light">未入池样本 {{ firstBoardDiagnostics.blocked_total || 0 }} 只</el-tag>
+              <el-tag size="small" type="info" effect="light">未入池样本 {{ formatCount(firstBoardDiagnostics.blocked_total) }} 只</el-tag>
               <el-tag
                 v-for="note in firstBoardDiagnostics.notes || []"
                 :key="note"
@@ -933,7 +1008,7 @@
             </div>
           </div>
 
-          <el-empty v-if="!firstBoardDiagnosticGroups.length" description="暂无首板未入池样本" />
+          <el-empty v-if="!firstBoardDiagnosticGroups.length" :description="firstBoardDiagnostics.blocked_total == null ? '尚未提供首板未入池诊断' : '暂无首板未入池样本'" />
 
           <template v-else>
             <div v-if="firstBoardDiagnosticsOverview.headline" class="diagnostic-headline-card">
@@ -1024,29 +1099,53 @@
             </div>
           </template>
         </div>
-      </div>
+      </component>
 
-      <div class="section-block" data-testid="direction-research-panel">
+      <div v-if="activeTab === 'research'" class="section-block" data-testid="direction-research-panel">
         <div class="section-title-with-action">
           <div class="section-title">次日上涨研究榜Top12</div>
-          <el-tag :type="directionResearch.status === 'available' ? 'info' : 'warning'" effect="light">
+          <el-tag :type="directionResearchContractSupported && !directionResearchPayloadError && directionResearch.status === 'available' ? 'info' : 'warning'" effect="light">
             {{ directionResearchStatusLabel }}
           </el-tag>
         </div>
         <div class="panel-card">
+          <div class="research-history-controls" data-testid="research-history-controls">
+            <el-button size="small" :loading="researchRunsLoading" @click="loadResearchRuns">查看历史研究批次</el-button>
+            <select v-if="researchRunsLoaded" v-model="selectedResearchRun" aria-label="研究批次" @change="loadHistoricalResearch">
+              <option value="">当前快照（不自动回退）</option>
+              <option v-for="run in researchRuns" :key="run.id" :value="String(run.id)">
+                {{ String(run.as_of_at || run.reference_trade_date || '').replace('T', ' ') }} · {{ run.snapshot_context }} · #{{ run.id }} · {{ run.status === 'completed' ? '已记录，需核验研究证据' : '批次未完成/阻断' }}
+              </option>
+            </select>
+          </div>
+          <div v-if="researchRunsError" class="candidate-subtitle">{{ researchRunsError }}</div>
+          <div v-if="selectedResearchRun" class="learning-scope-note" data-testid="research-history-context">
+            正在查看明确选择的历史批次 #{{ selectedResearchRun }}：
+            {{ historicalResearch?.run?.as_of_at?.replace('T', ' ') || '等待读取' }} · {{ historicalResearch?.run?.snapshot_context || '--' }}。
+            仅供历史研究，不替代当前最新榜，不解除最新批次的阻断。
+          </div>
+          <div v-if="historicalResearchLoading" class="candidate-subtitle">历史研究证据加载中…</div>
+          <div v-if="historicalResearchError" class="candidate-subtitle" data-testid="research-history-error">
+            {{ historicalResearchError }} <el-button size="small" @click="loadHistoricalResearch">重试所选批次</el-button>
+          </div>
           <div class="learning-scope-note">
             仅研究观察，不是买入建议，不代表新模型已通过验证。按独立次日上涨概率排序，与涨停经验主榜独立；
             不替换原榜、不自动执行，Champion 与交易风控不变。80% 是目标，未承诺、未认证。
           </div>
           <div class="learning-directional-values">
             <span>研究目标 {{ formatPercent(directionResearch.target_precision) }}</span>
-            <span>候选 {{ directionResearch.candidate_count ?? '--' }}</span>
-            <span>合资格 {{ directionResearch.eligible_count ?? '--' }}</span>
-            <span>缺方向概率 {{ directionResearch.missing_probability_count ?? '--' }}</span>
-            <span>已选 {{ directionResearch.selected_count ?? '--' }} / {{ directionResearch.rank_limit ?? '--' }}</span>
+            <span>候选 {{ directionResearchContractSupported ? formatCount(directionResearch.candidate_count) : '--' }}</span>
+            <span>合资格 {{ directionResearchContractSupported ? formatCount(directionResearch.eligible_count) : '--' }}</span>
+            <span>缺方向概率 {{ directionResearchContractSupported ? formatCount(directionResearch.missing_probability_count) : '--' }}</span>
+            <span data-testid="direction-research-recordability-gap">无法完整记录 {{ directionResearchContractSupported ? formatCount(directionResearch.missing_recordable_count) : '--' }}</span>
+            <span>已选 {{ directionResearchContractSupported ? formatCount(directionResearch.selected_count) : '--' }} / {{ directionResearchContractSupported ? formatCount(directionResearch.rank_limit) : '--' }}</span>
             <span>版本 {{ directionResearch.version || '--' }} / {{ directionResearch.label_version || '--' }}</span>
           </div>
-          <div v-if="directionResearch.reason" class="candidate-subtitle">{{ directionResearch.reason }}</div>
+          <div v-if="!selectedResearchRun && currentResearchEvidenceNote" class="candidate-subtitle" data-testid="current-research-evidence">{{ currentResearchEvidenceNote }}</div>
+          <div class="candidate-subtitle" data-testid="direction-research-persistence">{{ directionResearchPersistenceLabel }}</div>
+          <div v-if="!directionResearchContractSupported" class="candidate-subtitle">研究范围或合同不受支持，不能按次日上涨研究榜解释；不从生产榜补位。</div>
+          <div v-if="directionResearchPayloadError" class="candidate-subtitle" data-testid="direction-research-payload-error">{{ directionResearchPayloadError }}</div>
+          <div v-if="directionResearch.reason" class="candidate-subtitle">{{ evidenceReasonLabel(directionResearch.reason) }}</div>
           <div v-for="(note, index) in directionResearchNotes" :key="index" class="candidate-subtitle">{{ note }}</div>
           <div class="candidate-subtitle">候选数不是时间外验证样本数；概率方法含“样本不足”时只作研究观察，不能据此宣称80%达标。</div>
           <div class="mobile-table-wrap">
@@ -1074,20 +1173,10 @@
         </div>
       </div>
 
-      <div class="section-block">
+      <div v-if="activeTab === 'candidates'" class="section-block">
         <div class="section-title section-title-with-action">
           <span>分赛道概率榜</span>
-          <el-dropdown trigger="click" @command="handlePromotionExport" class="export-dropdown">
-            <el-button size="small" type="primary" plain :disabled="!rankedFirstBoardCandidates.length && !rankedSecondBoardCandidates.length">
-              <el-icon><Download /></el-icon> 导出
-            </el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="xlsx">导出 Excel</el-dropdown-item>
-                <el-dropdown-item command="csv">导出 CSV</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+
         </div>
         <div class="candidate-grid">
           <div class="panel-card">
@@ -1300,7 +1389,7 @@
         </div>
       </div>
 
-      <div class="section-block">
+      <div v-if="activeTab === 'candidates'" class="section-block">
         <div class="section-title">晋级概率查询</div>
         <div class="panel-card query-panel">
           <div class="query-row">
@@ -1385,22 +1474,32 @@
           </div>
         </div>
       </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { defineAsyncComponent, ref, computed, onMounted } from 'vue'
+import { defineAsyncComponent, ref, reactive, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 const VChart = defineAsyncComponent(() => import('vue-echarts'))
 import { Download, TrendCharts } from '@element-plus/icons-vue'
 import { ensureBarChartsRegistered } from '@/composables/echarts/bar'
-import { getPromotionLadder, getBoardHeight, getPromotionCandidates, getPromotionLearningReview, getPromotionProbability } from '@/api'
+import { getPromotionLadder, getBoardHeight, getPromotionCandidates, getPromotionLearningReview, getPromotionProbability, getPromotionPredictionRuns, getPromotionPredictionRun } from '@/api'
 import { notifySuccess } from '@/utils/message'
 
 ensureBarChartsRegistered()
 
 const ladderData = ref([])
+const ladderMeta = ref({})
+const ladderBlocked = computed(() => ['blocked', 'source_incomplete', 'missing'].includes(ladderMeta.value.status) || ladderMeta.value.source_health?.ready === false)
+const ladderEmptyText = computed(() => requestStates.ladder.loading ? '梯队加载中…' : requestStates.ladder.error || (ladderBlocked.value ? '源数据不完整，梯队未知（不是零涨停）' : '暂无可用梯队记录'))
 const boardHeight = ref({})
+const promotionRateStatusLabel = computed(() => ({
+  ok: '可评价',
+  previous_pool_empty: '前交易日统计池为空，分母不可评价',
+  previous_pool_missing_or_incomplete: '前交易日统计池缺失或不完整',
+  current_pool_incomplete: '当前统计池不完整',
+}[boardHeight.value.promotion_rate_status] || '口径状态未知，暂不可评价'))
 const promotionCandidates = ref({})
 const learningReview = ref({})
 const queryCode = ref('')
@@ -1408,28 +1507,39 @@ const queryTarget = ref(1)
 const querying = ref(false)
 const promotionResult = ref(null)
 
-const marketLadderCount = (days) => Number(
-  (boardHeight.value.ladder_summary || []).find(item => Number(item.days) === days)?.count || 0,
-)
+const marketLadderCount = (days) => {
+  const board = boardHeight.value
+  if (['blocked', 'source_incomplete', 'missing'].includes(board.status) || board.source_health?.ready === false) return null
+  const summary = board.ladder_summary
+  const row = Array.isArray(summary) ? summary.find(item => Number(item.days) === days) : null
+  if (row) return row.count == null ? null : Number(row.count)
+  // A complete distribution omits empty levels; absence of the distribution is unknown.
+  const complete = Array.isArray(summary) && (board.status === 'ok' || board.source_health?.ready === true
+    || (board.height != null && board.limit_up_count != null))
+  return complete || (board.height === 0 && board.limit_up_count === 0) ? 0 : null
+}
 const marketFirstBoardCount = computed(() => marketLadderCount(1))
 const marketSecondBoardCount = computed(() => marketLadderCount(2))
-const marketHigherBoardCount = computed(() => Math.max(
-  Number(boardHeight.value.limit_up_count || 0) - marketFirstBoardCount.value - marketSecondBoardCount.value,
-  0,
-))
+const marketHigherBoardCount = computed(() => {
+  if (boardHeight.value.limit_up_count == null || marketFirstBoardCount.value == null || marketSecondBoardCount.value == null) return null
+  return Math.max(Number(boardHeight.value.limit_up_count) - marketFirstBoardCount.value - marketSecondBoardCount.value, 0)
+})
 const sealRateLabel = computed(() => (
   boardHeight.value.seal_rate_method === 'historical_pool'
-    ? '零炸板占比'
+    ? '零开板率'
     : boardHeight.value.seal_rate_method === 'live_price_at_limit'
       ? '实时封板率'
-      : '封板率'
+      : boardHeight.value.seal_rate_method === 'verified_pool_state'
+        ? '源验证封板率'
+        : '封板率'
 ))
 const boardScopeSummary = computed(() => {
   if (!boardHeight.value.trade_date || boardHeight.value.limit_up_count == null) return ''
   return [
     `统计日 ${boardHeight.value.trade_date}`,
-    `全市场涨停池：首板 ${marketFirstBoardCount.value} + 二板 ${marketSecondBoardCount.value} + 三板及以上 ${marketHigherBoardCount.value} = ${Number(boardHeight.value.limit_up_count)}`,
-    '该口径过滤 ST/停牌/退市，但包含创业板、科创板、北交所等仅观察标的；下方复盘只考核可交易主板首/二板',
+    marketScopeLabel(boardHeight.value.scope),
+    `统计涨停池：首板 ${marketFirstBoardCount.value ?? '--'} + 二板 ${marketSecondBoardCount.value ?? '--'} + 三板及以上 ${marketHigherBoardCount.value ?? '--'} = ${Number(boardHeight.value.limit_up_count)}`,
+    '市场统计可能包含仅观察或受限标的，展示不代表允许交易；下方复盘按当前风险标签过滤主板首/二板，不认证历史时点交易资格',
   ].join('；')
 })
 
@@ -1507,34 +1617,183 @@ const modelRuntimeTagType = computed(() => (
   modelRuntimeMode.value === 'legacy' ? 'success' : modelRuntimeMode.value === 'shadow' ? 'warning' : 'info'
 ))
 const auctionHealth = computed(() => predictionHealth.value.auction_health || {})
+const auctionWatermarks = computed(() => {
+  const watermarks = promotionCandidates.value.quality_gate?.watermarks
+  return Array.isArray(watermarks) ? watermarks.filter(item => item?.dataset === 'auction_data') : []
+})
+const auctionRouteGates = computed(() => Object.entries(
+  promotionCandidates.value.quality_gate?.route_gates || {},
+).filter(([, gate]) => Array.isArray(gate?.required_datasets) && gate.required_datasets.includes('auction_data'))
+  .map(([key, gate]) => ({ key, gate })))
+function auctionEvidenceStatusLabel(status) {
+  return ({ ok: '通过（仅本项）', missing: '缺失', stale: '陈旧', degraded: '降级', blocked: '阻断' })[status] || '状态未知'
+}
 const snapshotContextCount = computed(() => {
-  const dates = predictionHealth.value.snapshot_context_counts || {}
+  const dates = predictionHealth.value.snapshot_context_counts
+  if (!dates || typeof dates !== 'object' || Array.isArray(dates)) return '--'
   return Object.values(dates).reduce((total, targets) => (
     total + Object.values(targets || {}).reduce((subtotal, contexts) => (
       subtotal + Object.keys(contexts || {}).length
     ), 0)
   ), 0)
 })
-const directionResearch = computed(() => promotionCandidates.value.direction_research || {})
+const researchRuns = ref([])
+const researchRunsLoaded = ref(false)
+const researchRunsLoading = ref(false)
+const researchRunsError = ref('')
+const selectedResearchRun = ref('')
+const historicalResearch = ref(null)
+const historicalResearchLoading = ref(false)
+const historicalResearchError = ref('')
+let researchRequestVersion = 0
+const currentResearchCount = ref(null)
+const currentResearchEvidenceNote = ref('')
+let currentResearchEvidenceVersion = 0
+let currentResearchEvidenceSource = null
+async function verifyCurrentResearchEvidence() {
+  const payload = promotionCandidates.value
+  const research = payload.direction_research || {}
+  const persistence = payload.prediction_health?.persistence
+  const ledger = persistence?.ledger
+  // Follow only the current snapshot's own immutable pointer, never a latest-run search.
+  if (disposed || activeTab.value !== 'research' || currentResearchEvidenceSource === payload
+    || research.status !== 'blocked' || research.missing_recordable_count != null
+    || !['eligible_candidates_not_recordable', 'direction_candidates_not_recordable'].includes(research.reason)
+    || payload.prediction_snapshot_source !== 'schedule'
+    || persistence?.ledger_recorded !== true || !Number.isInteger(ledger?.run_id) || ledger.run_id <= 0
+    || !Number.isInteger(ledger.snapshot_count) || ledger.snapshot_count <= 0
+    || [payload.first_board_trade_date || payload.trade_date, payload.prediction_snapshot_context, payload.prediction_model_version]
+      .some(value => typeof value !== 'string' || !value)) return
+  const version = ++currentResearchEvidenceVersion
+  currentResearchEvidenceSource = payload
+  currentResearchEvidenceNote.value = '正在核验当前快照引用的原始批次计数…'
+  try {
+    const data = await getPromotionPredictionRun(ledger.run_id, { direction_only: true })
+    if (disposed || version !== currentResearchEvidenceVersion || promotionCandidates.value !== payload) return
+    const proof = data.direction_research || {}, run = data.run || {}
+    if (run.id !== ledger.run_id || run.reference_trade_date !== (payload.first_board_trade_date || payload.trade_date)
+      || run.snapshot_context !== payload.prediction_snapshot_context || run.model_version !== payload.prediction_model_version
+      || run.candidate_count !== ledger.snapshot_count
+      || ['version', 'label_version', 'scope', 'status', 'reason', 'candidate_count', 'eligible_count'].some(key => proof[key] !== research[key])
+      || proof.production_unchanged !== true || proof.manual_review_eligible !== false
+      || !Number.isInteger(proof.missing_recordable_count) || proof.missing_recordable_count < 0) {
+      throw new Error('当前快照与原始批次证据不一致')
+    }
+    currentResearchCount.value = proof.missing_recordable_count
+    currentResearchEvidenceNote.value = `缺口计数已核验（原批次 #${ledger.run_id}）；不更改当前名单或阻断状态`
+  } catch {
+    if (version === currentResearchEvidenceVersion) {
+      currentResearchEvidenceSource = null
+      currentResearchEvidenceNote.value = '当前批次计数核验失败或证据不一致，保持未知；刷新可重试，不回退旧榜'
+    }
+  }
+}
+async function loadResearchRuns() {
+  if (disposed || researchRunsLoading.value) return
+  researchRunsLoading.value = true
+  researchRunsError.value = ''
+  try {
+    const data = await getPromotionPredictionRuns({
+      trade_date: boardHeight.value.trade_date || undefined, limit: 50, compact: true,
+    })
+    if (disposed) return
+    if (!Array.isArray(data?.runs)) throw new Error('历史批次响应异常')
+    researchRuns.value = data.runs.filter(run => run && Number.isInteger(run.id)
+      && ['promotion_1510', 'promotion_2000'].includes(run.snapshot_context))
+    researchRunsLoaded.value = true
+  } catch {
+    researchRunsError.value = '历史批次读取失败，可重试；未切换当前榜单'
+  } finally {
+    researchRunsLoading.value = false
+  }
+}
+async function loadHistoricalResearch() {
+  const version = ++researchRequestVersion
+  const id = selectedResearchRun.value
+  historicalResearch.value = null
+  historicalResearchError.value = ''
+  historicalResearchLoading.value = false
+  if (!id) return
+  historicalResearchLoading.value = true
+  try {
+    const data = await getPromotionPredictionRun(Number(id), { direction_only: true })
+    if (disposed || version !== researchRequestVersion || selectedResearchRun.value !== id) return
+    if (String(data.run?.id) !== id || typeof data.run?.as_of_at !== 'string'
+      || typeof data.run?.snapshot_context !== 'string' || !data.direction_research) {
+      throw new Error('历史批次身份不一致')
+    }
+    historicalResearch.value = data
+  } catch {
+    if (version === researchRequestVersion) historicalResearchError.value = '所选历史批次读取失败或身份不一致；不回退其他榜单'
+  } finally {
+    if (version === researchRequestVersion) historicalResearchLoading.value = false
+  }
+}
+const directionResearch = computed(() => selectedResearchRun.value
+  ? historicalResearch.value?.direction_research || {}
+  : currentResearchCount.value !== null
+    ? { ...promotionCandidates.value.direction_research, missing_recordable_count: currentResearchCount.value }
+    : promotionCandidates.value.direction_research || {})
+// Missing or incompatible contracts never grant research display qualification.
+const directionResearchContractSupported = computed(() => {
+  const data = directionResearch.value
+  return data.scope === 'research_only'
+    && data.version === 'direction_rank_research_v1'
+    && data.label_version === 'next_day_close_up_v1'
+    && data.production_unchanged === true
+    && data.manual_review_eligible === false
+})
+const directionResearchPayloadError = computed(() => {
+  const data = directionResearch.value
+  if (!directionResearchContractSupported.value || !['available', 'insufficient_candidates'].includes(data.status)) return ''
+  if (!Array.isArray(data.candidates) || data.candidates.some(row => (
+    !row || typeof row !== 'object' || Array.isArray(row)
+      || typeof row.code !== 'string' || !/^[0-9]{6}$/.test(row.code)
+  ))) return '研究候选结构异常，整榜停止展示，不删除异常行缩小名单'
+  if (new Set(data.candidates.map(row => row.code)).size !== data.candidates.length) {
+    return '研究候选代码重复，整榜停止展示，不去重缩小名单'
+  }
+  if (typeof data.selected_count !== 'number' || !Number.isInteger(data.selected_count)
+    || data.selected_count < 0 || data.selected_count !== data.candidates.length) {
+    return '已选数量未知或与候选行数不一致，整榜停止展示；保留接口原始计数，不重算分母'
+  }
+  return ''
+})
 const directionResearchRows = computed(() => (
-  directionResearch.value.scope === 'research_only'
+  directionResearchContractSupported.value && !directionResearchPayloadError.value
   && ['available', 'insufficient_candidates'].includes(directionResearch.value.status)
-  && Array.isArray(directionResearch.value.candidates)
     ? directionResearch.value.candidates : []
 ))
 const directionResearchNotes = computed(() => (
   Array.isArray(directionResearch.value.notes) ? directionResearch.value.notes.filter(note => typeof note === 'string') : []
 ))
-const directionResearchStatusLabel = computed(() => ({
-  available: '研究榜可用 · 非认证',
-  blocked: '研究榜阻塞 · 数据不足',
-  insufficient_candidates: '候选不足 · 不补齐旧榜',
-}[directionResearch.value.status] || '等待新冻结批次'))
+const directionResearchStatusLabel = computed(() => {
+  if (!directionResearchContractSupported.value) return '研究合同缺失或不支持 · 状态未知'
+  if (directionResearchPayloadError.value) return '研究榜阻塞 · 响应证据不一致'
+  return ({
+    available: '研究榜可用 · 非认证',
+    blocked: '研究榜阻塞 · 数据不足',
+    insufficient_candidates: '候选不足 · 不补齐旧榜',
+    unavailable: '等待新冻结批次',
+  })[directionResearch.value.status] || '研究状态未知'
+})
 const directionResearchEmptyText = computed(() => (
-  directionResearch.value.status === 'blocked' ? '方向研究证据不足，研究榜阻塞'
-    : directionResearch.value.status === 'insufficient_candidates' ? '候选不足，不用涨停榜补位'
-      : '等待新冻结批次，不补旧榜'
+  !directionResearchContractSupported.value ? '等待新冻结批次，不补旧榜；研究合同缺失或不支持'
+    : directionResearchPayloadError.value ? directionResearchPayloadError.value
+      : directionResearch.value.status === 'blocked' ? '方向研究证据不足，研究榜阻塞'
+      : directionResearch.value.status === 'insufficient_candidates' ? '候选不足，不用涨停榜补位'
+        : '等待新冻结批次，不补旧榜'
 ))
+const directionResearchPersistenceLabel = computed(() => {
+  const data = directionResearch.value
+  if (data.frozen === false || data.persistence_status === 'not_verified') {
+    return '本次展示未验证冻结持久化，不作合格训练材料；不解除证据阻断'
+  }
+  if (selectedResearchRun.value && data.frozen === true && data.persistence_status === 'immutable_ledger') {
+    return '读取所选批次的原始不可变记录；仍以本批完整性校验结果为准，本页不认证训练资格'
+  }
+  return '冻结持久化资格须由完整证据校验确认；本页不认证训练资格'
+})
 const learningLatest = computed(() => learningReview.value.latest || {})
 const learningDirectionalSummaries = computed(() => [
   { key: 'latest', label: '最新复盘', metrics: learningLatest.value },
@@ -1547,7 +1806,7 @@ const learningReviewScopeNote = computed(() => {
   if (!learningLatest.value.actual_trade_date) return ''
   const notes = [
     learningLatest.value.evaluation_scope_warning,
-    '“预测记录完整”只表示上一交易日收盘正式榜已独立持久化且数量达标，与上方竞价成交字段是否完整无关',
+    '“预测记录完整”只表示上一交易日收盘正式榜可读取且数量达标，不是不可变证据认证；兼容记录可能可变，与上方竞价成交字段是否完整无关',
   ]
   const reviewedModel = String(learningLatest.value.prediction_model_version || '').trim()
   const currentModel = String(promotionCandidates.value.prediction_model_version || '').trim()
@@ -1558,14 +1817,14 @@ const learningReviewScopeNote = computed(() => {
   }
   return notes.filter(Boolean).join('；')
 })
-const learningDailyRows = computed(() => learningReview.value.daily || [])
-const learningLaneRows = computed(() => Object.values(learningLatest.value.lane_metrics || {}))
+const learningDailyRows = computed(() => (learningReview.value.daily || []).filter(row => row && typeof row === 'object'))
+const learningLaneRows = computed(() => Object.values(learningLatest.value.lane_metrics || {}).filter(row => row && typeof row === 'object'))
 const learningLaunchCohortRows = computed(() => Object.entries(
   learningReview.value?.aggregate?.launch_precursor_metrics || {},
 ).map(([cohort, item]) => ({
   cohort,
   ...(item || {}),
-})).filter(item => Number(item.sample_count || 0) > 0))
+})))
 const learningMissedExamples = computed(() => (learningLatest.value.missed_examples || []).slice(0, 8))
 const firstBoardDiagnostics = computed(() => promotionCandidates.value.first_board_diagnostics || {})
 const firstBoardDiagnosticsOverview = computed(() => firstBoardDiagnostics.value.overview || {})
@@ -1762,7 +2021,7 @@ const ladderChartOption = computed(() => {
       type: 'bar',
       data: items.map(i => ({
         value: i.count,
-        itemStyle: { color: i.seal_rate >= 80 ? '#ef4444' : i.seal_rate >= 50 ? '#f59e0b' : '#22c55e' },
+        itemStyle: { color: formatPercentPoints(i.seal_rate) === '--' ? '#94a3b8' : i.seal_rate >= 80 ? '#ef4444' : i.seal_rate >= 50 ? '#f59e0b' : '#22c55e' },
       })),
       barWidth: 30,
       label: { show: true, position: 'top', color: '#667085' },
@@ -1782,9 +2041,97 @@ function formatProbability(value) {
   return formatPercent(value)
 }
 
+function marketScopeLabel(scope) {
+  if (scope === 'non_st_market_with_risk_annotations') return '非 ST 行情统计（排除退市名称），保留风险标签；展示不代表允许交易（非全市场）'
+  if (scope === 'filtered_market_including_observation_boards') return '过滤统计池，含观察板块（非全市场）'
+  return '统计池口径（过滤 ST / 停牌 / 退市，非全市场）'
+}
+function sourceStatusLabel(status) {
+  return ({ ok: '可用', source_incomplete: '源数据不完整', missing: '记录缺失', blocked: '源数据阻断' })[status] || '数据状态未知'
+}
+function ladderStockLabel(stock) {
+  const tag = ({ tradeable: '主板', observe_only: '仅观察', blocked: '禁止交易', suspended: '停牌' })[stock.tag]
+    || (typeof stock.tag === 'string' && /[\u4e00-\u9fff]/.test(stock.tag) ? stock.tag : '')
+  if (stock.is_tradeable === false && !['blocked', 'suspended'].includes(stock.tag)) return tag.includes('观察') ? tag : `仅观察${tag ? ' · ' + tag : ''}`
+  return tag
+}
+
+function numericValue(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  if (typeof value === 'string' && !value.trim()) return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+function formatCount(value) {
+  const number = numericValue(value)
+  return number !== null && Number.isInteger(number) && number >= 0 ? number : '--'
+}
+function formalPredictionsMissing(metrics = {}) {
+  // Window reasons are a union of daily gaps, not proof that the entire
+  // aggregate/cohort denominator is absent. Preserve known partial samples.
+  if ([metrics.predicted_count, metrics.sample_count].some(value => {
+    const count = numericValue(value)
+    return count !== null && Number.isInteger(count) && count > 0
+  })) return false
+  const reasons = metrics.evaluation_reasons
+  return (Array.isArray(reasons) && reasons.includes('formal_ranked_predictions_unavailable'))
+    || (numericValue(metrics.predicted_count) === 0 && metrics.snapshot_complete === false)
+}
+function formatPredictedCount(metrics = {}) {
+  return formalPredictionsMissing(metrics) ? '暂无记录' : formatCount(metrics.predicted_count)
+}
+function formalMetric(metrics, field, percent = false) {
+  if (formalPredictionsMissing(metrics)) return '--'
+  return percent ? formatPercent(metrics[field]) : formatCount(metrics[field])
+}
+function formatFormalCell(row, column, value) {
+  return formalPredictionsMissing(row) ? '--' : formatCount(value)
+}
+function formatCell(_row, _column, value) {
+  return formatCount(value)
+}
+function formatBrier(value) {
+  const number = numericValue(value)
+  return number !== null && number >= 0 && number <= 1 ? number.toFixed(3) : '--'
+}
+function evidenceReasonLabel(reason) {
+  if (typeof reason !== 'string' || !reason.trim()) return '原因未知'
+  const labels = {
+    eligible_candidates_not_recordable: '排名资格全集与记录全集不一致，部分合资格候选无法完整记录；本批研究榜保持阻断',
+    research_batch_incomplete: '所选正式批次未完成、数量不一致或质量证据未通过，不能展示完整研究榜',
+    direction_candidates_not_recordable: '候选记录不完整，研究榜保持阻断',
+    eligible_direction_probability_missing: '合资格候选缺少有效方向概率',
+    direction_research_contract_missing: '缺少冻结研究合同，等待新批次',
+    direction_research_contract_incomplete: '研究排名证据不完整',
+    direction_research_contract_unsupported: '研究合同版本、标签或范围不受支持，等待新合规批次',
+    direction_research_contract_mismatch: '研究排名、概率或名单分母与原证据不一致，研究榜保持阻断',
+    duplicate_or_missing_code: '股票代码缺失或重复',
+    formal_ranked_predictions_unavailable: '正式预测名单不可用',
+    snapshot_incomplete: '预测快照不完整',
+    prediction_limit_up_pool_missing: '预测日涨停池缺失',
+    outcome_limit_up_pool_missing: '结果日涨停池缺失',
+    candidate_outcome_bar_missing_or_invalid: '个股结局行情缺失或无效',
+    candidate_outcome_bar_missing: '个股真实下一交易日行情缺失，结局保留未知',
+    candidate_outcome_price_chain_discontinuity: '个股前后价格链不连续，结局不可可靠评价',
+    outcome_calendar_gap: '真实下一交易日日历证据缺失，不跨日替代',
+    candidate_outcome_source_unverified: '个股结局行情来源未验证',
+    candidate_outcome_suspended_or_invalid: '个股停牌或结局行情无效',
+    candidate_outcome_change_invalid: '个股结局涨跌幅无效',
+    prediction_limit_up_pool_incomplete: '预测日涨停池证据不完整',
+    outcome_limit_up_pool_incomplete: '结果日涨停池证据不完整',
+  }
+  return labels[reason] ? `${labels[reason]}（${reason}）` : `未识别原因（${reason}）`
+}
+
+function formatPercentPoints(value) {
+  const numeric = numericValue(value)
+  if (numeric === null) return '--'
+  return Number.isFinite(numeric) && numeric >= 0 && numeric <= 100 ? `${numeric.toFixed(1)}%` : '--'
+}
+
 function formatPercent(value) {
-  if (value == null || typeof value === 'boolean' || String(value).trim() === '') return '--'
-  const numeric = Number(value)
+  const numeric = numericValue(value)
+  if (numeric === null) return '--'
   if (!Number.isFinite(numeric) || numeric < 0 || numeric > 1) return '--'
   return `${(numeric * 100).toFixed(1)}%`
 }
@@ -1792,24 +2139,28 @@ function formatPercent(value) {
 function formatDirectionalPrecision(metrics = {}) {
   // Overall quality may be partial for limit-up labels while direction is complete.
   // Legacy rates remain visible without inventing missing coverage or target flags.
-  if (Number(metrics.directional_unknown_count) > 0
-    || (metrics.directional_coverage != null && Number(metrics.directional_coverage) < 1)) return '--'
+  const coverage = numericValue(metrics.directional_coverage)
+  if (formalPredictionsMissing(metrics) || numericValue(metrics.directional_unknown_count) > 0
+    || (coverage !== null && coverage >= 0 && coverage < 1)) return '--'
   return formatPercent(metrics.directional_precision)
 }
 
 function formatDirectionalBounds(metrics = {}) {
+  if (formalPredictionsMissing(metrics)) return '--'
   const lower = formatPercent(metrics.directional_precision_lower_bound)
   const upper = formatPercent(metrics.directional_precision_upper_bound)
   return lower === '--' || upper === '--' ? '--' : `${lower} ～ ${upper}`
 }
 
 function directionalTargetLabel(metrics = {}) {
+  if (formalPredictionsMissing(metrics)) return '数据不足 · 达标未知'
   if (metrics.directional_target_met === true) return '本样本达到目标（非认证）'
   if (metrics.directional_target_met === false) return '本样本未达目标'
   return '数据不足 · 达标未知'
 }
 
 function directionalTargetType(metrics = {}) {
+  if (formalPredictionsMissing(metrics)) return 'info'
   if (metrics.directional_target_met === true) return 'success'
   if (metrics.directional_target_met === false) return 'warning'
   return 'info'
@@ -1818,18 +2169,19 @@ function directionalTargetType(metrics = {}) {
 function reviewEvaluationLabel(metrics = {}) {
   if (metrics.evaluation_status === 'partial') return '部分可评价'
   if (metrics.evaluation_status === 'unavailable') return '数据不足 / 不可评价'
-  return metrics.evaluation_status || '评价状态 --'
+  if (metrics.evaluation_status === 'complete') return '评价完整'
+  return '评价状态未知'
 }
 
 function reviewEvaluationReasons(metrics = {}) {
   const reasons = metrics.evaluation_reasons
-  if (Array.isArray(reasons)) return reasons.filter(item => typeof item === 'string').join('；')
-  return typeof reasons === 'string' ? reasons : ''
+  if (Array.isArray(reasons)) return reasons.filter(item => typeof item === 'string').map(evidenceReasonLabel).join('；')
+  return typeof reasons === 'string' ? evidenceReasonLabel(reasons) : ''
 }
 
 function formatLift(value) {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric) || numeric <= 0) return '--'
+  const numeric = numericValue(value)
+  if (numeric === null || numeric < 0) return '--'
   return `${numeric.toFixed(2)}×`
 }
 
@@ -2222,24 +2574,108 @@ async function queryProbability() {
   querying.value = false
 }
 
-onMounted(async () => {
-  try {
-    const [l, h, c, review] = await Promise.allSettled([
-      getPromotionLadder(),
-      getBoardHeight(),
-      getPromotionCandidates({ limit: 12, ranked_limit: 30, compact: true }),
-      getPromotionLearningReview({ lookback_days: 10 }),
-    ])
-    if (l.status === 'fulfilled') ladderData.value = l.value.ladder || []
-    if (h.status === 'fulfilled') boardHeight.value = h.value
-    if (c.status === 'fulfilled') promotionCandidates.value = c.value || {}
-    if (review.status === 'fulfilled') learningReview.value = review.value || {}
-  } catch { /* ignore */ }
+const requestStates = reactive({
+  height: { label: '市场概况', loading: false, loaded: false, error: '' },
+  ladder: { label: '连板梯队', loading: false, loaded: false, error: '' },
+  candidates: { label: '晋级候选', loading: false, loaded: false, error: '' },
+  review: { label: '学习复盘', loading: false, loaded: false, error: '' },
 })
+const sectionRequests = {
+  height: { request: getBoardHeight, target: boardHeight },
+  ladder: { request: getPromotionLadder, target: ladderData },
+  candidates: { request: () => getPromotionCandidates({ limit: 12, ranked_limit: 30, compact: true }), target: promotionCandidates },
+  review: { request: () => getPromotionLearningReview({ lookback_days: 10 }), target: learningReview },
+}
+let disposed = false
+async function loadSection(key) {
+  const state = requestStates[key]
+  // One in-flight request per region; a slow review must not hold back market data.
+  if (disposed || state.loading) return
+  state.loading = true
+  state.error = ''
+  try {
+    const data = await sectionRequests[key].request()
+    if (disposed) return
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid response')
+    if (key === 'ladder' && data.ladder != null && !Array.isArray(data.ladder)) throw new Error('invalid ladder')
+    if (key === 'review' && data.daily != null && !Array.isArray(data.daily)) throw new Error('invalid review')
+    if (key === 'ladder') ladderMeta.value = data
+    sectionRequests[key].target.value = key === 'ladder' ? (ladderBlocked.value ? [] : (data.ladder || []).filter(row => row && typeof row === 'object')) : data
+    state.loaded = true
+  } catch {
+    if (!disposed) state.error = '加载失败，请重试'
+  } finally {
+    if (!disposed) state.loading = false
+  }
+}
+const tabs = [
+  { key: 'market', label: '市场梯队' },
+  { key: 'candidates', label: '晋级候选' },
+  { key: 'review', label: '预测复盘' },
+  { key: 'research', label: '研究观察' },
+]
+// AppLayout keys pages by fullPath: query navigation would remount this page and refetch.
+// Keep view selection local so cached responses, filters and in-flight requests survive.
+const activeTab = ref('market')
+const tabRequests = { market: ['height', 'ladder'], candidates: ['candidates'], review: ['review'], research: ['candidates'] }
+function selectTab(key) {
+  activeTab.value = key
+}
+function onTabKeydown(event, key) {
+  const index = tabs.findIndex(tab => tab.key === key)
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+    : event.key === 'ArrowRight' ? (index + 1) % tabs.length
+      : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : -1
+  if (next < 0) return
+  event.preventDefault()
+  event.currentTarget.parentElement.children[next].focus()
+  selectTab(tabs[next].key)
+}
+function ensureTabData() {
+  if (activeTab.value === 'research' && requestStates.candidates.loaded) void verifyCurrentResearchEvidence()
+  tabRequests[activeTab.value].forEach(key => {
+    if (!requestStates[key].loaded && !requestStates[key].error) void loadSection(key)
+  })
+}
+function refreshCurrentTab() {
+  if (activeTab.value === 'research' && selectedResearchRun.value) void loadHistoricalResearch()
+  new Set(['height', ...tabRequests[activeTab.value]]).forEach(key => { void loadSection(key) })
+}
+watch(promotionCandidates, () => {
+  currentResearchEvidenceVersion++
+  currentResearchEvidenceSource = null
+  currentResearchCount.value = null
+  currentResearchEvidenceNote.value = ''
+  if (activeTab.value === 'research') void verifyCurrentResearchEvidence()
+})
+watch(activeTab, ensureTabData)
+onMounted(() => {
+  void loadSection('height')
+  ensureTabData()
+})
+onBeforeUnmount(() => { disposed = true; researchRequestVersion++; currentResearchEvidenceVersion++ })
 </script>
 
 <style scoped lang="scss">
-.promotion-page { display: flex; flex-direction: column; gap: 18px; }
+.promotion-page { display: flex; flex-direction: column; gap: 18px; min-width: 0; max-width: 100%; }
+.promotion-page > *, .panel-card, .section-block, .diagnostic-group { min-width: 0; }
+.promotion-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--claw-border-light); }
+.promotion-tabs button { flex: 1; min-width: 0; padding: 12px 4px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--claw-text-secondary); cursor: pointer; font: inherit; font-size: 14px; white-space: nowrap; }
+.promotion-tabs button[aria-selected="true"] { color: var(--el-color-primary); border-bottom-color: var(--el-color-primary); font-weight: 700; }
+.promotion-tabs button:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
+.promotion-tab-panel { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.research-summary { cursor: pointer; padding: 12px 0; }
+.promotion-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+.request-status-strip { display: flex; flex-wrap: wrap; gap: 8px 20px; color: var(--claw-text-secondary); font-size: 12px; }
+.request-status-strip > div { display: flex; align-items: center; gap: 8px; }
+.mobile-table-wrap { min-width: 0; max-width: 100%; overflow-x: auto; }
+:deep(.el-table .el-table__cell) { padding-left: 0; padding-right: 0; }
+:deep(.el-table .cell) { padding-left: 8px; padding-right: 8px; word-break: normal; }
+:deep(.el-table__empty-text) { width: 100%; padding: 16px 12px; box-sizing: border-box; line-height: 1.6; white-space: normal; }
+:deep(.el-table th .cell), :deep(.el-table .is-center .cell) { white-space: nowrap; }
+.stat-value, .learning-metric-card strong { white-space: nowrap; }
+.learning-review-meta { flex-wrap: wrap; }
 .promotion-metrics-panel { padding: 4px; }
 .market-scope-note,
 .learning-scope-note {
@@ -2252,6 +2688,23 @@ onMounted(async () => {
   line-height: 1.7;
 }
 .learning-scope-note { margin: -4px 0 0; }
+.research-history-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  select {
+    max-width: 100%;
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid var(--el-border-color);
+    border-radius: 4px;
+    color: var(--el-text-color-primary);
+    background: var(--el-bg-color);
+    font: inherit;
+  }
+}
 .snapshot-alert { border: 1px solid rgba(245, 158, 11, 0.28); background: rgba(245, 158, 11, 0.08); }
 .prediction-health-strip {
   display: flex;
@@ -2387,6 +2840,9 @@ onMounted(async () => {
 .factor-item { display: flex; justify-content: space-between; font-size: 12px; padding: 6px 10px; background: #f5f6fa; border: 1px solid #e8ebf0; border-radius: 8px; }
 .factor-name { color: var(--claw-text-secondary); }
 .stock-tag { cursor: pointer; margin: 2px; }
+.ladder-stock-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.ladder-stock-tags .stock-tag { flex: 0 0 auto; white-space: nowrap; height: auto; min-height: 24px; }
+.ladder-stock-tags :deep(.el-tag__content) { white-space: nowrap; word-break: normal; }
 :deep(.high-ladder) { background: rgba(239, 68, 68, 0.08) !important; }
 :deep(.el-table) { border: 1px solid var(--claw-border); border-radius: 14px; overflow: hidden; box-shadow: var(--claw-shadow-sm); }
 :deep(.el-table th.el-table__cell) { background: #f7faff; }

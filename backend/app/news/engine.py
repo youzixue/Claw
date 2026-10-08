@@ -9,7 +9,7 @@
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from copy import copy
 import hashlib
@@ -66,6 +66,20 @@ def _analysis_status(result):
     return "analyzed" if any(result.get(key) == "ai" for key in
                              ("sentiment_method", "events_method")) else "fallback"
 
+
+
+def news_item_from_row(row: FinanceNews) -> NewsItem:
+    """Reconstruct stored text, never invent a historical receipt clock."""
+    def sequence(raw):
+        try:
+            values = json.loads(raw or "[]")
+            return values if isinstance(values, list) else []
+        except (ValueError, TypeError):
+            return []
+    return NewsItem(source=row.source, title=row.title, content=row.content or "",
+                    url=row.url or "", publish_time=row.publish_time,
+                    source_id=row.source_id or "", category=row.category or "",
+                    related_codes=sequence(row.related_codes), related_sectors=sequence(row.related_sectors))
 
 
 class NewsEngine:
@@ -136,6 +150,8 @@ class NewsEngine:
                     "observed_at": datetime.now(),
                     "item_count": len(items),
                 }
+                if code == "global" and isinstance(getattr(source, "last_observation", None), dict):
+                    self._fetch_health[code]["index_target_observation"] = dict(source.last_observation)
                 logger.info(f"新闻源 [{source.source_name}]: 获取{len(items)}条")
                 return items
             except asyncio.TimeoutError:
@@ -168,6 +184,57 @@ class NewsEngine:
                 logger.error(f"个股新闻 [{source.source_name}] 异常: {e}")
         return all_items
 
+
+    async def analyze_pending(self, db, *, limit=80, since=None, concurrency=5):
+        """Enrich persisted raw text; scheduler does not refetch to start NLP."""
+        from sqlalchemy import and_, func, or_
+        from app.ai.provider import ai_provider
+        if type(limit) is not int or not 1 <= limit <= 300:
+            raise ValueError("news analysis batch must be within 1..300")
+        now = _news_now()
+        cooled = or_(FinanceNews.nlp_analyzed_at.is_(None),
+                     FinanceNews.nlp_analyzed_at <= now - timedelta(seconds=settings.NEWS_AI_RETRY_COOLDOWN_SEC))
+        pending = [and_(or_(FinanceNews.nlp_status.in_(["raw", "failed"]),
+                            FinanceNews.nlp_status.is_(None)), cooled)]
+        # Payment recovery can enrich old keyword results forward in time, but
+        # never retry the same fallback on every recovery tick while blocked.
+        if ai_provider.enabled and not ai_provider.runtime_status()["circuit_open"]:
+            mixed = and_(FinanceNews.nlp_status == "analyzed", or_(
+                FinanceNews.sentiment_method.is_(None), FinanceNews.sentiment_method != "ai",
+                FinanceNews.events_method.is_(None), FinanceNews.events_method != "ai"))
+            pending.append(and_(or_(FinanceNews.nlp_status == "fallback", mixed),
+                or_(FinanceNews.nlp_analyzed_at.is_(None),
+                    FinanceNews.nlp_analyzed_at <= now - timedelta(seconds=settings.NEWS_AI_FALLBACK_RETRY_SEC))))
+        criteria = [or_(*pending), FinanceNews.source != "global"]
+        if since is not None:
+            criteria.append(FinanceNews.publish_time >= since)
+        total = await db.scalar(select(func.count()).select_from(FinanceNews).where(*criteria))
+        rows = list((await db.scalars(select(FinanceNews).where(*criteria)
+                   .order_by(FinanceNews.publish_time.desc(), FinanceNews.id.desc()).limit(limit))).all())
+        # Commit small waves through the existing owner. A healthy slow model
+        # must not lose every completed result when the overall job times out.
+        results = []
+        wave = settings.NEWS_AI_WAVE_SIZE
+        for start in range(0, len(rows), wave):
+            # Durable attempt watermarks prevent a persistently failing newest
+            # prefix from monopolizing the next bounded job. This projection
+            # clock is NOT an immutable successful-analysis availability clock.
+            for row in rows[start:start + wave]:
+                row.nlp_analyzed_at = _news_now()
+            await db.commit()
+            results.extend(await self.process_and_store(
+                [news_item_from_row(row) for row in rows[start:start + wave]],
+                db_session=db, reset_dedup=True, concurrency=concurrency))
+        counts = {"ai_full": 0, "ai_partial": 0, "keyword": 0}
+        for result in results:
+            methods = [result.get(key) == "ai" for key in ("sentiment_method", "events_method")]
+            counts["ai_full" if all(methods) else "ai_partial" if any(methods) else "keyword"] += 1
+        return {"status": "no_pending" if not rows else (
+                    "analyzed" if counts["ai_full"] == len(rows) and total == len(rows) else "partial"),
+                "pending_at_start": total, "pending_scope": "eligible_after_retry_cooldown",
+                "selected": len(rows), "processed": len(results),
+                "failed": len(rows) - len(results), **counts, "selection_truncated": total > len(rows)}
+
     async def process_and_store(
         self,
         items: list[NewsItem],
@@ -193,7 +260,10 @@ class NewsEngine:
                 version = await self._save_raw_to_db(db_session, item, observed=False)
                 item._news_content_version_id = version.id
                 item._news_entity_evidence = json.loads(version.entity_evidence_json)
-            await db_session.commit()
+                # This batch owns its commits. Release the writer after each
+                # complete article, not after all entity queries in the batch.
+                # All inputs are still durable before the first NLP await.
+                await db_session.commit()
 
         # 2. NLP处理
         semaphore = asyncio.Semaphore(max(1, min(concurrency, 10)))
@@ -268,13 +338,20 @@ class NewsEngine:
         saved = 0
         for item in unique:
             try:
-                async with session.begin_nested():
-                    await self._save_raw_to_db(session, item)
+                # A standalone SQLite SAVEPOINT may commit on RELEASE before
+                # session.commit(). Use the actual per-article owner transaction.
+                await self._save_raw_to_db(session, item)
+                # Do not retain an outer snapshot across independent articles.
+                # This owner already committed the batch; now commit per item.
+                await session.commit()
                 saved += 1
             except Exception as e:
+                # ROLLBACK TO SAVEPOINT does not release a stale WAL snapshot.
+                # The owning batch must end it before processing the next item.
+                # Earlier successful articles have already been committed.
+                await session.rollback()
                 logger.error(f"原始新闻缓存异常: {e}")
 
-        await session.commit()
         logger.info(f"原始新闻缓存完成: {saved}/{len(unique)}条")
         return saved
 

@@ -178,20 +178,37 @@ def test_candidate_confirmation_and_execution_share_liquidity_contract(field, va
     )
     assert live_ok == passed
     if not passed:
-        assert engine.states["600001"].stage == "pullback"
-        blocked = [event for event in events if event["event_type"] == "confirmation_screened"]
+        import math
+        try:
+            missing_path_amount = field == "amount" and not math.isfinite(float(value))
+        except (TypeError, ValueError):
+            missing_path_amount = field == "amount"
+        # amount also anchors the rolling path, unlike confirmation-only liquidity.
+        # Unknown cumulative amount cannot be written as 0 and recovered by one tick.
+        stage = "coverage_blocked" if missing_path_amount else "pullback"
+        event_type = "coverage_blocked" if missing_path_amount else "confirmation_screened"
+        assert engine.states["600001"].stage == stage
+        blocked = [event for event in events if event["event_type"] == event_type]
         assert len(blocked) == 1
         # 浏览器必须能严格JSON解析，未知数值保留null，不输出NaN/Infinity。
         def reject_constant(raw):
             raise AssertionError(raw)
         evidence = json.loads(blocked[0]["snapshot_json"], parse_constant=reject_constant)
-        assert evidence["extra"]["liquidity_issues"]
+        if missing_path_amount:
+            assert evidence["extra"]["point_in_time_coverage"] == "invalid_quote_path"
+            assert engine.states["600001"].quote_history == []
+            assert engine.states["600001"].last_at == datetime(2026, 8, 31, 9, 36, 30)
+        else:
+            assert evidence["extra"]["liquidity_issues"]
         assert reason
-        # 尚未确认的首次回踩可在原窗口内继续观察，不消耗confirmed事件身份。
+        # Confirmation-only screening may retry; unknown path data needs a new
+        # low -> candidate -> pullback, covered in test_momentum_data_recovery.
         engine.observe_batch(
             [_quote(10.47, 4.7, 36_000_000)], datetime(2026, 8, 31, 9, 37, 30), {"600001"},
         )
-        assert engine.states["600001"].stage == "confirmed"
+        assert engine.states["600001"].stage == (
+            "coverage_blocked" if missing_path_amount else "confirmed"
+        )
 
 
 def test_liquidity_contract_honors_zero_limits_and_rejects_invalid_rules():

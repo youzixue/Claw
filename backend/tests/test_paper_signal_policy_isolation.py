@@ -114,7 +114,8 @@ async def test_confirmation_does_not_reuse_peer_old_version_or_future_rows(paper
                 trade_date=at.date(), created_at=created, run_id=f"case-{i}", code="600001",
                 source="promotion", action="confirm_buy", decision="wait",
                 candidate_json=json.dumps({"confirmation_version":"champion_persistent_v1",
-                                           "confirmation_sample_at":sample.isoformat()})))
+                                           "confirmation_sample_at":sample.isoformat(),
+                                           "confirmation_source_quote_at":sample.isoformat()})))
         await db.flush()
         kwargs = dict(account_id=account.id, account_name="promotion", trade_date=at.date(),
                       code="600001", source="promotion", current_at=at)
@@ -123,6 +124,7 @@ async def test_confirmation_does_not_reuse_peer_old_version_or_future_rows(paper
             trade_date=at.date(), created_at=at-timedelta(seconds=60), run_id="valid", code="600001",
             source="promotion", action="confirm_buy", decision="wait",
             candidate_json=json.dumps({"confirmation_version":"champion_persistent_v1",
-                                       "confirmation_sample_at":(at-timedelta(seconds=60)).isoformat()})))
+                                       "confirmation_sample_at":(at-timedelta(seconds=60)).isoformat(),
+                                       "confirmation_source_quote_at":(at-timedelta(seconds=60)).isoformat()})))
         await db.flush()
         assert (await paper._champion_intraday_confirmation_status(db, **kwargs))[0] is True

@@ -446,3 +446,138 @@ def run_capacity_study(scope, signals, observations, *, as_of, policy=None):
     result = json.loads(json.dumps(result, default=_json, allow_nan=False))
     result["report_sha256"] = _digest(result)
     return result
+
+
+@dataclass(frozen=True)
+class SharedCapacityBudget:
+    """Frozen free capital for an offline overlay, not twelve account balances."""
+    trade_date: date
+    observed_at: datetime
+    window_end: datetime
+    available_cash: float
+    max_positions: int
+    max_daily_buys: int
+    used_daily_buys: int
+    encumbered_codes: tuple[str, ...]
+    evidence_sha256: str
+
+    def __post_init__(self):
+        if type(self.trade_date) is not date:
+            raise ValueError("one shared trade date required")
+        _clock(self.observed_at, self.trade_date)
+        _clock(self.window_end, self.trade_date)
+        if self.observed_at >= self.window_end:
+            raise ValueError("ordered shared budget window required")
+        _number(self.available_cash)
+        for key in ("max_positions", "max_daily_buys", "used_daily_buys"):
+            _integer(getattr(self, key))
+        if type(self.encumbered_codes) is not tuple or len(set(self.encumbered_codes)) != len(self.encumbered_codes):
+            raise ValueError("distinct frozen shared held/pending codes required")
+        for code in self.encumbered_codes:
+            _code(code)
+        _sha(self.evidence_sha256)
+
+
+def run_shared_capacity_study(budget, scopes, signals, observations, *, as_of, policy=None):
+    """Overlay one capital cap on the existing per-account reservation arms.
+
+    Preserve each arm's independent requests, including excluded/failed signals.
+    Do not retroactively refill a route slot freed by a shared rejection; that
+    requires a full counterfactual risk/account replay and is NOT simulated here.
+    Cross-route priority scores are not calibrated and must not be compared.
+    """
+    if type(budget) is not SharedCapacityBudget:
+        raise ValueError("frozen shared budget required")
+    scopes, signals, observations = tuple(scopes), tuple(signals), tuple(observations)
+    if not scopes or len(scopes) > len(ACCOUNT_NAMES):
+        raise ValueError("one to twelve explicit account scopes required")
+    _clock(as_of)
+    if as_of < budget.observed_at:
+        raise ValueError("as_of precedes shared budget")
+    key = lambda item: (item.account_id, item.account_name, item.strategy_version)
+    scope_map = {}
+    for scope in scopes:
+        if type(scope) is not CapacityScope:
+            raise ValueError("existing capacity scope required")
+        if (scope.trade_date, scope.observed_at, scope.window_end) != (
+                budget.trade_date, budget.observed_at, budget.window_end):
+            raise ValueError("all arms require the same frozen day/window")
+        if key(scope) in scope_map or any(
+                prior.account_id == scope.account_id or prior.account_name == scope.account_name
+                for prior in scope_map.values()):
+            raise ValueError("duplicate account/version scope")
+        scope_map[key(scope)] = scope
+    if any(type(s) is not CapacitySignal for s in signals) or any(type(o) is not CapacityObservation for o in observations):
+        raise ValueError("existing owned signal/observation records required")
+    cutoff = min(as_of, budget.window_end)
+    visible_signals = tuple(s for s in signals if s.confirmed_at <= cutoff)
+    visible_observations = tuple(o for o in observations if o.observed_at <= cutoff)
+    if any(key(item) not in scope_map for item in (*visible_signals, *visible_observations)):
+        raise ValueError("unmapped account must not disappear from denominator")
+    reports = []
+    for identity, scope in sorted(scope_map.items()):
+        report = run_capacity_study(scope,
+            [s for s in visible_signals if key(s) == identity],
+            [o for o in visible_observations if key(o) == identity], as_of=as_of, policy=policy)
+        reports.append(report)
+    arms = {}
+    initial = Decimal(str(budget.available_cash))
+    slots = max(0, min(budget.max_positions-len(budget.encumbered_codes),
+                       budget.max_daily_buys-budget.used_daily_buys))
+    for arm in ARMS:
+        requests, excluded, all_states = [], [], []
+        for report in reports:
+            scope = report["scope"]
+            identity = {k: scope[k] for k in ("account_id", "account_name", "strategy_version")}
+            selected_ids = {r["signal_id"] for r in report["arms"][arm]["selected"]}
+            for selected in report["arms"][arm]["selected"]:
+                requests.append({**identity, **selected})
+            for signal_id, state in report["arms"][arm]["terminal_states"].items():
+                all_states.append({**identity, "signal_id": signal_id, "independent_state": state})
+                if signal_id not in selected_ids:
+                    excluded.append({**identity, "signal_id": signal_id, "status": state,
+                                     "stage": "independent_noncapacity_or_capacity"})
+        # Deterministic technical tie-break only, not a claim of superior alpha.
+        requests.sort(key=lambda r: (r["selected_at"], r["account_name"], r["code"], r["signal_id"]))
+        cash, held, selected, rejected = initial, set(budget.encumbered_codes), [], []
+        for request in requests:
+            cost = Decimal(str(request["reserved_cash"]))
+            reason = ("shared_held_or_reserved_code" if request["code"] in held else
+                      "shared_position_or_daily_capacity_full" if len(selected) >= slots else
+                      "shared_available_cash_insufficient" if cost > cash else None)
+            if reason:
+                rejected.append({**request, "status": reason, "stage": "shared_budget_overlay"})
+            else:
+                cash -= cost
+                held.add(request["code"])
+                selected.append({**request, "status": "selected_reservation_only"})
+        arms[arm] = {
+            "selected": selected, "displaced": rejected, "independent_excluded": excluded,
+            "all_signal_states": all_states, "signal_count": len(all_states),
+            "selected_count": len(selected), "displaced_count": len(rejected),
+            "reserved_cash": float(initial-cash), "unreserved_cash": float(cash),
+            "by_account_selected": dict(Counter(r["account_name"] for r in selected)),
+            "remaining_new_slots": max(0, slots-len(selected)), "executable_net_pnl": None,
+        }
+        assert len(selected)+len(rejected)+len(excluded) == len(all_states)
+    result = {
+        "schema": "shared_capacity_overlay_v1", "as_of": as_of.isoformat(),
+        "budget": asdict(budget), "policy": reports[0]["policy"], "arms": arms,
+        "signal_count": sum(report["signal_count"] for report in reports),
+        "independent_reports": reports, "winner": None, "performance_difference": None,
+        "contract": {
+            "mode": "offline_shared_reservations_not_executable_portfolio",
+            "same_shared_cash_across_arms": True, "production_policy_changed": False,
+            "cross_strategy_priority_comparison": False,
+            "tie_break": "selection_clock_account_name_code_signal_id_not_alpha",
+            "displaced_and_failed_signals_retained": True,
+            "backfill_or_resize_or_cash_recycling": False,
+            "counterfactual_portfolio_risk_or_fill_recomputed": False,
+            "initial_cash_basis": "explicit_free_cash_after_frozen_holds_and_pending_reservations",
+            "input_evidence": "declared_frozen_evidence_requires_caller_authentication",
+            "promotable_to_production": False,
+        },
+    }
+    result = json.loads(json.dumps(result, default=_json, allow_nan=False))
+    result["report_sha256"] = _digest(result)
+    return result

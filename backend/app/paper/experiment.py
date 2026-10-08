@@ -90,6 +90,32 @@ def sentiment_quality_at(state, *, at: datetime, strict: bool) -> tuple[str, str
 
 # Execution semantics version, distinct from the backward-readable v1 JSON schema.
 PENDING_BUY_VALIDITY_VERSION = "pending_buy_validity_v2"
+# Shared entry/pending severity semantics, scoped only to route-connected accounts.
+LIVE_ROUTE_CONFIRMATION_CONTRACT_VERSION = "route_confirmation_nonbool_v2"
+# Primary pending quotes evaluate known-invalid predicates before missing inputs.
+# Only A-F and E2 consume this contract; connected shadow routes keep theirs.
+PRIMARY_BUY_CONFIRMATION_CONTRACT_VERSION = "primary_source_quote_v4"
+# B/C/D alone consume the formal snapshot visibility and finite-price contract.
+PROMOTION_CANDIDATE_CONTRACT_VERSION = "promotion_candidate_clock_numeric_v1"
+REVERSAL_PENDING_EVIDENCE_CONTRACT_VERSION = "reversal_pending_evidence_v1"
+A_ZERO_LOT_RISK_CAP_CONTRACT_VERSION = "a_zero_lot_risk_cap_v1"
+# A consumes staged layers; the five event accounts consume daily-name counting.
+BUY_ORDER_COUNT_CONTRACT_VERSION = "paper_buy_order_count_v1"
+# Primary daily/sector quotas only; do not rotate the five connected accounts.
+PRIMARY_NEW_BUY_QUOTA_CONTRACT_VERSION = "primary_new_buy_order_quota_v1"
+# Pending T reductions may yield only to a newly validated full protective exit.
+EXIT_UPGRADE_CONTRACT_VERSION = "paper_exit_upgrade_v1"
+# All twelve routes evaluate holding age at the decision calendar, not NAV cache.
+EXIT_HOLD_CLOCK_CONTRACT_VERSION = "paper_exit_hold_clock_v1"
+# Only the seven short-exit accounts consume the opening weak-gate scope.
+SHORT_EXIT_WEAK_GATE_CONTRACT_VERSION = "short_exit_weak_gate_scope_v1"
+# Only E/E2 consume the explicit non-degenerate high-board entry modes.
+HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION = "highboard_entry_mode_v1"
+# Only C consumes independent live-sector visibility across all rank scopes.
+MAINLINE_SECTOR_CLOCK_CONTRACT_VERSION = "mainline_sector_clock_v1"
+# Only E/E2 consume mode-terminal precedence and explicit queue quantity evidence.
+HIGHBOARD_PENDING_MODE_CONTRACT_VERSION = "highboard_pending_mode_terminal_v1"
+LIMIT_QUEUE_EVIDENCE_CONTRACT_VERSION = "limit_queue_evidence_v1"
 
 
 def execution_signal_identity(account_name: str) -> dict:
@@ -117,12 +143,40 @@ def execution_signal_identity(account_name: str) -> dict:
             raise KeyError(f"unknown paper account: {account_name}")
         ttl = settings.PAPER_PENDING_BUY_MAX_AGE_SEC
         route_version = None
-    return {
+    identity = {
         "route_id": route_id,
         "route_version": route_version,
         "pending_buy_guard_version": PENDING_BUY_VALIDITY_VERSION,
         "pending_buy_max_age_sec": ttl,
+        "exit_upgrade_contract": EXIT_UPGRADE_CONTRACT_VERSION,
+        "exit_hold_clock_contract": EXIT_HOLD_CLOCK_CONTRACT_VERSION,
     }
+    if account_name in {"default", "promotion", "mainline", "auction",
+                        "challenger_b", "challenger_c", "challenger_d"}:
+        identity["short_exit_weak_gate_contract"] = SHORT_EXIT_WEAK_GATE_CONTRACT_VERSION
+    if route_id is not None:
+        identity["live_route_confirmation_contract"] = LIVE_ROUTE_CONFIRMATION_CONTRACT_VERSION
+    else:
+        identity["primary_buy_confirmation_contract"] = PRIMARY_BUY_CONFIRMATION_CONTRACT_VERSION
+    if account_name in {"promotion", "mainline", "auction"}:
+        identity["promotion_candidate_contract"] = PROMOTION_CANDIDATE_CONTRACT_VERSION
+    if account_name == "reversal":
+        identity["reversal_pending_evidence_contract"] = REVERSAL_PENDING_EVIDENCE_CONTRACT_VERSION
+    if account_name == "mainline":
+        identity["mainline_sector_clock_contract"] = MAINLINE_SECTOR_CLOCK_CONTRACT_VERSION
+    if account_name in {"tenbagger", "challenger_e"}:
+        identity["highboard_entry_mode_contract"] = HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION
+        identity["highboard_pending_mode_contract"] = HIGHBOARD_PENDING_MODE_CONTRACT_VERSION
+        identity["limit_queue_evidence_contract"] = LIMIT_QUEUE_EVIDENCE_CONTRACT_VERSION
+    if account_name == "default":
+        identity["zero_lot_risk_cap_contract"] = A_ZERO_LOT_RISK_CAP_CONTRACT_VERSION
+    if account_name == "default" or route_id is not None:
+        identity["buy_order_count_contract"] = BUY_ORDER_COUNT_CONTRACT_VERSION
+    if account_name in {
+        "default", "promotion", "mainline", "auction", "tenbagger", "reversal", "challenger_e",
+    }:
+        identity["primary_new_buy_quota_contract"] = PRIMARY_NEW_BUY_QUOTA_CONTRACT_VERSION
+    return identity
 
 
 def standard_execution_version(base: str, account_name: str) -> str:

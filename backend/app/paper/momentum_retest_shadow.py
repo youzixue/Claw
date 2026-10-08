@@ -12,6 +12,7 @@ import statistics
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
 from loguru import logger
@@ -265,6 +266,9 @@ class MomentumRetestState:
     band_seen_before_start: bool = False
     observation_count: int = 0
     last_at: datetime | None = None
+    # Ordering cursor includes rejected data; continuity only includes valid frames.
+    last_seen_at: datetime | None = None
+    last_valid_frame_at: datetime | None = None
     last_price: float = 0.0
     last_amount: float = 0.0
     candidate_at: datetime | None = None
@@ -292,6 +296,8 @@ class MomentumRetestState:
             "band_seen_before_start": self.band_seen_before_start,
             "observation_count": self.observation_count,
             "last_at": self.last_at.isoformat() if self.last_at else None,
+            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
+            "last_valid_frame_at": self.last_valid_frame_at.isoformat() if self.last_valid_frame_at else None,
             "last_price": _round(self.last_price),
             "last_amount": _round(self.last_amount, 2),
             "candidate_at": self.candidate_at.isoformat() if self.candidate_at else None,
@@ -328,6 +334,8 @@ class MomentumRetestState:
             band_seen_before_start=bool(payload.get("band_seen_before_start")),
             observation_count=int(payload.get("observation_count") or 0),
             last_at=_parse_datetime(payload.get("last_at")),
+            last_seen_at=_parse_datetime(payload.get("last_seen_at")),
+            last_valid_frame_at=_parse_datetime(payload.get("last_valid_frame_at")),
             last_price=_safe_float(payload.get("last_price")),
             last_amount=_safe_float(payload.get("last_amount")),
             candidate_at=_parse_datetime(payload.get("candidate_at")),
@@ -352,6 +360,41 @@ class MomentumRetestState:
                     (item_at, _safe_float(item[1]), _safe_float(item[2]))
                 )
         return state if state.code else None
+
+
+@lru_cache(maxsize=8)
+def _research_policy_snapshot(policy):
+    # Policy is frozen. Research-only bounded cache; original event snapshots stay unchanged.
+    return policy.snapshot()
+
+
+def _capture_momentum_projection(policy, quote, scan_at, *, stage, reason,
+                                 candidate=False, confirmed=None, gate=None,
+                                 inputs=None, evidence_ref=None):
+    """Optional research leaf projection, isolated from the engine's state/events."""
+    try:
+        from app.paper.candidate_shadow import capture_frame
+
+        q = quote or {}
+        code = str(q.get("code") or "MARKET")
+        scan_id = str(q.get("quote_round_id") or f"momentum:{scan_at.isoformat()}")
+        at = datetime.now()
+        identities = {"original_confirmed_at": at} if stage == "confirmed" and confirmed is True else {}
+        capture_frame({
+            "route": "A2", "account_id": None, "account_name": "challenger_a",
+            "production_version": policy.version, "code": code,
+            "name": str(q.get("name") or code), "observed_at": at,
+            "episode_id": f"A2:{policy.version}:{scan_at.date().isoformat()}:{code}",
+            "producer_reported_at": scan_at,
+            "scan_id": scan_id,
+            "evidence_ref": evidence_ref or f"{scan_id}:A2:{code}:{stage}",
+            "stage": stage, "reason": reason, "original_candidate": candidate,
+            "original_confirmed": confirmed, "original_gate": gate,
+            "quote": q, "gate_inputs": inputs or {},
+            "rule_snapshot": _research_policy_snapshot(policy), "identities": identities,
+        })
+    except Exception:
+        pass
 
 
 class MomentumRetestShadowEngine:
@@ -420,7 +463,7 @@ class MomentumRetestShadowEngine:
             if state.stage in {"candidate", "pullback", "interrupted"}:
                 state.stage = "interrupted"
                 state.terminal_reason = "进程重启导致连续行情路径中断，不能继续证明首次回踩"
-            else:
+            elif state.stage != "coverage_blocked":
                 # 仍存活的股票：其 last_at 来自快照（可能陈旧），本进程尚未吃到
                 # 新帧，故标记为「需用水位修正基线」。
                 self._restored_codes.add(state.code)
@@ -444,20 +487,37 @@ class MomentumRetestShadowEngine:
         if coverage_loss:
             # 已知丢帧不能靠剩余两帧间隔较短恢复“首次”证明；当天后到股票也受约束。
             self._consumer_coverage_loss = dict(coverage_loss)
+        coverage = Counter()
         for quote in quotes:
+            coverage["visited_quote_count"] += 1
             code = str(quote.get("code") or "")
+            state_before = self._states.get(code)
+            known_candidate = bool(state_before is not None and state_before.candidate_at is not None)
             if code not in allowed_codes:
+                coverage["outside_allowed_count"] += 1
+                if known_candidate:
+                    _capture_momentum_projection(self.policy, quote, observed_at,
+                        stage="not_scanned", reason="existing_candidate_outside_allowed_universe",
+                        candidate=True)
                 continue
+            coverage["allowed_quote_count"] += 1
             source_quote_at = _parse_datetime(quote.get("source_quote_at"))
-            if source_quote_at is not None and (
-                source_quote_at.date() != observed_at.date()
-                or source_quote_at
-                > observed_at
-                + timedelta(
-                    seconds=max(1, int(settings.ANOMALY_QUOTE_ROUND_TOLERANCE_SEC))
-                )
+            explicit_source = "source_quote_at" in quote or bool(quote.get("quote_round_id"))
+            if explicit_source and (
+                source_quote_at is None
+                or source_quote_at.tzinfo is not None
+                or source_quote_at.date() != observed_at.date()
+                or source_quote_at > observed_at
             ):
-                # 显式源时点跨日或明显来自未来时不能伪装成当前提交时点。
+                # A round cannot borrow receipt/commit time for an unknown source.
+                coverage["invalid_source_clock_count"] += 1
+                if known_candidate:
+                    _capture_momentum_projection(self.policy, quote, observed_at,
+                        stage="unknown", reason="invalid_source_clock", candidate=True)
+                else:
+                    coverage["noncandidate_aggregated_count"] += 1
+                if code in self._states:
+                    self._block_quote_path(quote, observed_at, "源行情时钟缺失、跨日或超前")
                 continue
             quote_observed_at = (
                 source_quote_at
@@ -465,9 +525,25 @@ class MomentumRetestShadowEngine:
                 or _parse_datetime(quote.get("updated_at"))
                 or observed_at
             )
-            if quote_observed_at.date() != observed_at.date():
+            if (quote_observed_at.tzinfo is not None
+                    or quote_observed_at.date() != observed_at.date()
+                    or quote_observed_at > observed_at):
+                coverage["invalid_observation_clock_count"] += 1
+                if known_candidate:
+                    _capture_momentum_projection(self.policy, quote, observed_at,
+                        stage="unknown", reason="invalid_observation_clock", candidate=True)
+                else:
+                    coverage["noncandidate_aggregated_count"] += 1
+                if code in self._states:
+                    self._block_quote_path(quote, observed_at, "行情观测时钟不可验证")
                 continue
             if self._consumer_coverage_loss:
+                coverage["coverage_loss_quote_count"] += 1
+                if not known_candidate:
+                    coverage["noncandidate_aggregated_count"] += 1
+                else:
+                    _capture_momentum_projection(self.policy, quote, observed_at,
+                        stage="unknown", reason="consumer_coverage_loss", candidate=True)
                 state = self._states.get(code)
                 if state is None:
                     state = MomentumRetestState(
@@ -485,15 +561,70 @@ class MomentumRetestShadowEngine:
                     })
                 continue
             self.observe_quote(quote, quote_observed_at)
+            state = self._states.get(code)
+            candidate = bool(state is not None and state.candidate_at is not None)
+            # The original engine computed this before-start strength flag already.
+            early_watch = bool(state is not None and state.band_seen_before_start
+                               and time(9, 30) <= quote_observed_at.time() < self.policy.start)
+            if candidate or known_candidate or early_watch:
+                coverage["detailed_observation_count"] += 1
+                coverage["early_watch_count"] += int(early_watch)
+                _capture_momentum_projection(self.policy, quote, observed_at,
+                    stage="observation", reason=state.stage if state is not None else "state_unknown",
+                    candidate=candidate,
+                    confirmed=(state.stage == "confirmed") if state is not None else None,
+                    inputs={"state_stage": state.stage if state is not None else None,
+                            "candidate_at": state.candidate_at if state is not None else None})
+            else:
+                coverage["noncandidate_aggregated_count"] += 1
+        _capture_momentum_projection(self.policy, {}, observed_at,
+            stage="scan_complete", reason="producer_scan_completed",
+            inputs={key: coverage[key] for key in (
+                "visited_quote_count", "allowed_quote_count", "outside_allowed_count",
+                "noncandidate_aggregated_count", "detailed_observation_count",
+                "early_watch_count", "invalid_source_clock_count",
+                "invalid_observation_clock_count", "coverage_loss_quote_count",
+            )} | {"allowed_universe_count": len(allowed_codes),
+                   "coverage_loss": bool(self._consumer_coverage_loss),
+                   "detail_scope": "original_candidates_early_watch_and_material_transitions",
+                   "not_full_universe_tick_capture": True})
         # 本轮行情已整批吃完 —— 推进消费者水位（P0 幻影缺口修正）。
         # 放在最后：只有真正处理完这一批才算「吃到了行情」。
-        if observed_at.date() == self._trade_date:
+        if (observed_at.date() == self._trade_date
+                and (self._consumer_watermark is None or observed_at > self._consumer_watermark)):
             self._consumer_watermark = observed_at
         return self.pending_events()
 
     def consumer_watermark(self) -> datetime | None:
         """供上层持久化的消费者水位；None 表示本轮之后尚无有效消费记录。"""
         return self._consumer_watermark
+
+    def _block_quote_path(
+        self, quote: Mapping[str, Any], observed_at: datetime, reason: str,
+    ) -> None:
+        """Unknown data is not a market failure and cannot extend a price path."""
+        code = str(quote.get("code") or "")
+        if not code:
+            return
+        state = self._states.get(code)
+        if state is None:
+            state = MomentumRetestState(code=code, name=str(quote.get("name") or code),
+                                        trade_date=observed_at.date())
+            self._states[code] = state
+        if state.stage in TERMINAL_STAGES - {"coverage_blocked"}:
+            return
+        state.stage = "coverage_blocked"
+        state.terminal_reason = reason
+        # Unknown source time supplies only a conservative ordering floor, never continuity.
+        if state.last_seen_at is None or observed_at > state.last_seen_at:
+            state.last_seen_at = observed_at
+        state.last_valid_frame_at = None
+        state.quote_history.clear()
+        # Never promote the global consumer watermark over a per-stock data loss.
+        self._restored_codes.discard(code)
+        self._emit(state, quote, observed_at, "coverage_blocked", extra={
+            "reason": reason, "point_in_time_coverage": "invalid_quote_path",
+        })
 
     def _maybe_release_coverage_block(
         self,
@@ -539,12 +670,22 @@ class MomentumRetestShadowEngine:
             return False
 
         blocked_reason = state.terminal_reason
+        if state.candidate_at is not None:
+            _capture_momentum_projection(self.policy, quote, observed_at,
+                stage="reset", reason="original_candidate_coverage_rearm",
+                candidate=False, confirmed=False,
+                inputs={"previous_candidate_at": state.candidate_at,
+                        "released_from": blocked_reason, "quote_gap_sec": quote_gap_sec})
         state.stage = "unseen"
         state.terminal_reason = ""
         state.saw_below_rearm = True
         state.band_seen_before_start = False
         state.quote_history.clear()
         state.observation_count = 0
+        state.band_seen = False
+        state.candidate_at = state.peak_at = state.pullback_at = state.trough_at = None
+        state.candidate_price = state.peak_price = state.trough_price = 0.0
+        state.candidate_change_pct = state.peak_change_pct = state.trough_change_pct = 0.0
         # 允许重新武装 —— 但保留已发过的 coverage_blocked（不重复记）。
         state.event_types.discard("armed")
         self._emit(state, quote, observed_at, "coverage_block_rearm", extra={
@@ -563,20 +704,43 @@ class MomentumRetestShadowEngine:
     ) -> None:
         code = str(quote.get("code") or "")
         name = str(quote.get("name") or code)
-        price = _safe_float(quote.get("price"))
-        prev_close = _safe_float(quote.get("prev_close"))
-        amount = _safe_float(quote.get("amount"))
-        change_pct = _safe_float(quote.get("change_pct"))
-        if not code or price <= 0 or prev_close <= 0 or amount < 0:
+        if not code:
             return
-
         state = self._states.get(code)
         if state is None:
             state = MomentumRetestState(code=code, name=name, trade_date=observed_at.date())
             self._states[code] = state
-        if state.last_at is not None and observed_at <= state.last_at:
+        if state.stage in TERMINAL_STAGES - {"coverage_blocked"}:
             return
-        previous_at = state.last_at
+        ordering_at = state.last_seen_at or state.last_at
+        if ordering_at is not None and observed_at <= ordering_at:
+            return
+        previous_at = (state.last_valid_frame_at if state.last_seen_at is not None
+                       else state.last_at)
+        state.last_seen_at = observed_at
+        values = {key: _safe_float(quote.get(key), math.nan) for key in (
+            "price", "prev_close", "amount", "avg_price", "ask1_price", "ask1_volume", "limit_up",
+        )}
+        known_unfillable = (
+            values["ask1_price"] == 0 or values["ask1_volume"] == 0
+            or (math.isfinite(values["price"]) and math.isfinite(values["limit_up"])
+                and values["limit_up"] > 0 and values["price"] >= values["limit_up"])
+        )
+        if state.stage in {"candidate", "pullback"} and known_unfillable:
+            # Preserve real no-offer/limit-up terminal evidence even if another field is unknown.
+            self._invalidate(state, quote, observed_at, "卖一无量或已封板，影子成交不可实现")
+            return
+        missing = [key for key, value in values.items()
+                   if not math.isfinite(value)
+                   or (value <= 0 if key in {"price", "prev_close", "avg_price", "limit_up"}
+                       else value < 0)]
+        if missing:
+            self._block_quote_path(quote, observed_at, "路径字段缺失或无效：" + ",".join(missing))
+            return
+        price, prev_close, amount = values["price"], values["prev_close"], values["amount"]
+        change_pct = round((price / prev_close - 1.0) * 100.0, 10)
+        # Keep derived strength consistent in emitted evidence, including missing/0 upstream values.
+        quote = {**quote, "change_pct": change_pct}
         # P0 幻影缺口修正（2026-09-17）：重启后首批帧里，`last_at` 来自快照，
         # 而它只在**状态迁移**时落库，安静待在 armed 的股票会带着十几分钟前的
         # 时间戳回来 —— 那不是行情中断，只是「没换过状态」。
@@ -604,8 +768,10 @@ class MomentumRetestShadowEngine:
                 0.0,
             )
             if baseline_at is not None and baseline_at.date() == observed_at.date()
-            else 0.0
+            else (math.inf if state.stage == "coverage_blocked" else 0.0)
         )
+        # Valid blocked frames advance continuity, never the pre-gap candidate/history.
+        state.last_valid_frame_at = observed_at
 
         # 终态判定放在 gap 计算之后：`coverage_blocked` 需要知道连续性是否已恢复
         # 才能决定是否解除（见 `_maybe_release_coverage_block`）。其他终态
@@ -712,6 +878,12 @@ class MomentumRetestShadowEngine:
         if in_band:
             state.band_seen = True
             gate_reasons = self._candidate_gate_reasons(quote)
+            _capture_momentum_projection(self.policy, quote, observed_at,
+                stage="candidate_gate", reason="failed" if gate_reasons else "passed",
+                candidate=not gate_reasons, confirmed=False,
+                inputs={"candidate_gate_reasons": gate_reasons},
+                # Initial-pulse quality is not the complete first-retest gate.
+                gate=None)
             if gate_reasons:
                 # 首次进入候选带时保留漏斗原因；后续质量改善仍可形成候选。
                 self._emit(state, quote, observed_at, "screened", extra={
@@ -869,6 +1041,13 @@ class MomentumRetestShadowEngine:
             confirm_reasons.append("60秒成交速率不足")
         liquidity_issues = momentum_liquidity_gate_issues(quote, self.policy.snapshot())
         confirm_reasons.extend(issue["reason"] for issue in liquidity_issues)
+        _capture_momentum_projection(self.policy, quote, observed_at,
+            stage="static_gate", reason="failed" if confirm_reasons else "passed",
+            candidate=True, confirmed=False, gate=not confirm_reasons,
+            inputs={"confirmation_gate_reasons": confirm_reasons,
+                    "rolling_60s": rolling, "recovery_from_trough_pct": recovery_pct,
+                    "peak_gap_pct": peak_gap_pct, "vwap_hold": vwap_hold,
+                    "liquidity_issues": liquidity_issues})
         if confirm_reasons:
             if liquidity_issues:
                 # 记录一次未通过原因但不消耗confirmed身份；仍受原窗口/路径失效约束。
@@ -995,6 +1174,18 @@ class MomentumRetestShadowEngine:
     ) -> None:
         if event_type in state.event_types:
             return
+        # Thousands of ordinary armed/outside-pattern states are represented by the
+        # batch coverage receipt, not thousands of new core evaluations. All actual
+        # candidate transitions and screened strong-pulse failures remain detailed.
+        if (state.candidate_at is not None or state.band_seen or state.band_seen_before_start
+                or event_type not in {"armed", "coverage_blocked", "coverage_block_rearm"}):
+            _capture_momentum_projection(self.policy, quote, observed_at,
+                stage=event_type, reason=str((extra or {}).get("reason") or event_type),
+                candidate=state.candidate_at is not None,
+                confirmed=True if event_type == "confirmed" else None,
+                inputs=extra,
+                evidence_ref=f"{ROUTE_ID}:{self.policy.version}:{state.trade_date.isoformat()}:"
+                             f"{state.code}:{event_type}")
         state.event_types.add(event_type)
         event_key = (
             f"{ROUTE_ID}:{self.policy.version}:{state.trade_date.isoformat()}:"
@@ -1023,6 +1214,8 @@ class MomentumRetestShadowEngine:
             "state": state.snapshot(),
             "extra": dict(extra or {}),
         }
+        quote_price = _safe_float(quote.get("price"), math.nan)
+        quote_change = _safe_float(quote.get("change_pct"), math.nan)
         self._pending[event_key] = {
             "event_key": event_key,
             "route_id": ROUTE_ID,
@@ -1033,9 +1226,9 @@ class MomentumRetestShadowEngine:
             "name": state.name[:20],
             "event_type": event_type,
             "status": state.stage,
-            "price": _safe_float(quote.get("price")),
+            "price": quote_price if math.isfinite(quote_price) else None,
             "assumed_fill_price": assumed_fill_price,
-            "change_pct": _safe_float(quote.get("change_pct")),
+            "change_pct": quote_change if math.isfinite(quote_change) else None,
             "snapshot_json": json.dumps(snapshot, ensure_ascii=False, default=str),
             "created_at": datetime.now(),
         }
@@ -1197,6 +1390,8 @@ async def scan_momentum_retest_shadow(
 ) -> dict[str, int]:
     """处理一轮全市场快照并追加事件；不会生成或执行任何订单。"""
     if not settings.PAPER_MOMENTUM_RETEST_SHADOW_ENABLED:
+        _capture_momentum_projection(shadow_engine.policy, {}, observed_at,
+            stage="not_scanned", reason="producer_disabled")
         return {"events": 0, "confirmed": 0}
     await _hydrate_engine(db, observed_at.date())
     allowed_codes = await _load_allowed_codes(db, observed_at.date())

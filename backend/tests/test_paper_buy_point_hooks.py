@@ -94,6 +94,8 @@ def clock_and_guards(monkeypatch):
     monkeypatch.setattr(paper, "_should_run_intraday_auto_trade", AsyncMock(return_value=(True, "")))
     send = AsyncMock(return_value={"sent":True, "channels":{"feishu":True}, "status":"sent"})
     monkeypatch.setattr(points.push_scheduler, "push_to_channels", send)
+    # 已替换成假投递器；显式开启测试分支，不继承部署/离线运行器的开关。
+    monkeypatch.setattr(settings, "PUSH_ENABLED", True)
     # 所有用例都故意被预算/持仓拦截，不应走到下单。
     import app.trading.service as trading
     submit = AsyncMock(side_effect=AssertionError("测试只验证买点，不允许下单或联网"))
@@ -103,7 +105,7 @@ def clock_and_guards(monkeypatch):
 
 def main_quote(at):
     return dict(code="600888", name="隔离买点", price=10.0, prev_close=9.95,
-        open=9.95, high=10.03, low=9.98, avg_price=9.99, change_pct=.5,
+        open=9.95, high=10.03, low=9.94, avg_price=9.99, change_pct=.5,
         volume_ratio=1.2, ask1_price=10.01, ask1_volume=500,
         bid1_price=9.99, bid1_volume=500, orderbook_imbalance=.1,
         limit_up=10.95, limit_down=8.95, updated_at=at)
@@ -116,6 +118,12 @@ async def run_main(maker, monkeypatch, account_name, source, *, gate="", block="
         trade_gate_passed=True, actionable=True, watch_only=False,
         strategy_label="真实形态测试", entry_condition="已完成策略条件验证",
         buy_point_type="支撑确认", buy_point_reasons=["分时支撑收复"])
+    if account_name in {"tenbagger", "challenger_e"}:
+        from app.paper.experiment import HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION
+        candidate.update(
+            entry_mode_contract=HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION,
+            entry_variant="e2_strong_entry" if account_name == "challenger_e" else "e_low_entry",
+        )
     factory = AsyncMock(side_effect=lambda *args, **kwargs: ([dict(candidate)], []))
     for name in ("_paper_auto_buy_candidates", "_promotion_route_buy_candidates",
                  "_tenbagger_midline_candidates", "_reversal_pullback_candidates"):

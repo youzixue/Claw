@@ -364,50 +364,12 @@ async def test_intraday_limit_and_broken_pools_are_final_state_disjoint(
     SessionLocal = scheduler_db_env
     target_date = date.today()
 
-    async def trading_hours():
-        return True
-
-    async def record_success(*_args, **_kwargs):
-        return None
-
-    class FakeEastMoney:
-        async def get_limit_up_pool(self, _trade_date):
-            return pd.DataFrame(
-                [
-                    {
-                        "代码": "000001",
-                        "名称": "仍封板",
-                        "最新价": 11.0,
-                        "封板资金": 100_000_000,
-                        "炸板次数": 1,
-                        "连板数": 1,
-                    }
-                ]
-            )
-
-        async def get_limit_down_pool(self, _trade_date):
-            return pd.DataFrame()
-
-        async def get_broken_limit_pool(self, _trade_date):
-            return pd.DataFrame(
-                [
-                    {"代码": "000001", "名称": "接口重叠脏行"},
-                    {"代码": "000002", "名称": "真实炸板"},
-                ]
-            )
-
-    monkeypatch.setattr(
-        scheduler_module.trade_calendar,
-        "is_trading_hours",
-        trading_hours,
-    )
-    monkeypatch.setattr(
-        scheduler_module.data_quality_guard,
-        "record_success",
-        record_success,
-    )
-    scheduler = DataScheduler()
-    scheduler._sources["eastmoney"] = FakeEastMoney()
+    from app.data.limit_pool import persist_tencent_limit_state
+    observed = datetime.combine(target_date, datetime.min.time()).replace(hour=10)
+    def quote(code, price, high):
+        return dict(code=code, name="腾讯状态", price=price, high=high, low=10,
+                    prev_close=10, limit_up=11, limit_down=9, volume=100,
+                    source_quote_at=observed, received_at=observed)
 
     async with SessionLocal() as session:
         session.add_all(
@@ -436,7 +398,13 @@ async def test_intraday_limit_and_broken_pools_are_final_state_disjoint(
         )
         await session.commit()
 
-    await scheduler._intraday_fast()
+    async with SessionLocal() as session:
+        await persist_tencent_limit_state(
+            session, [quote("000001", 11, 11), quote("000002", 10.8, 11),
+                      quote("000003", 10.5, 10.8)],
+            observed_at=observed, expected_count=3,
+        )
+        await session.commit()
 
     async with SessionLocal() as session:
         limit_rows = list(

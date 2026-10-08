@@ -30,6 +30,7 @@ from app.models.stock import (
     StockSpot,
 )
 from app.promotion.regime import REGIME_NAMES_ZH, build_market_regime_snapshot
+from app.review.overnight_evidence import _read_news_window
 
 
 REVIEW_SCHEMA_VERSION = "daily_review_workbench_v5"
@@ -867,30 +868,16 @@ async def _market_dimensions(
     if not unversioned_allowed:
         sector_rows, lifecycle_rows = [], []
 
-    news_start = as_of_at - timedelta(hours=20 if phase == "premarket" else 14)
-    news_filter = (
-        FinanceNews.publish_time >= news_start,
-        FinanceNews.publish_time <= as_of_at,
+    # Premarket spans the last actual stored session's close, including holidays.
+    # The existing PIT reader owns revision/availability and role attribution.
+    news_start = (
+        datetime.combine(analysis_trade_date, time(15))
+        if phase == "premarket" else as_of_at - timedelta(hours=14)
     )
-    news_metric_rows = (
-        await db.execute(
-            select(
-                FinanceNews.bull_bear,
-                FinanceNews.sentiment,
-                FinanceNews.nlp_status,
-            ).where(*news_filter)
-        )
-    ).all()
-    news_rows = list(
-        (
-            await db.scalars(
-                select(FinanceNews)
-                .where(*news_filter)
-                .order_by(desc(FinanceNews.importance), desc(FinanceNews.publish_time))
-                .limit(_NEWS_SELECTION_LIMIT)
-            )
-        ).all()
+    news_evidence = await _read_news_window(
+        db, start_time=news_start, as_of=as_of_at, limit=_NEWS_SELECTION_LIMIT,
     )
+    news_rows = news_evidence["items"]
 
     use_spot = phase == "intraday"
     spot_rows = (
@@ -988,15 +975,9 @@ async def _market_dimensions(
         key=lambda row: (int(row.consecutive_days or 1), _number(row.seal_amount)),
         reverse=True,
     )[:20]
-    analyzed_news_rows = [
-        row for row in news_metric_rows if row.nlp_status in {"analyzed", "fallback"}
-    ]
-    news_polarities = [
-        _news_polarity(row.bull_bear, row.sentiment) for row in analyzed_news_rows
-    ]
-    positive_news = news_polarities.count("bull")
-    negative_news = news_polarities.count("bear")
-    neutral_news = news_polarities.count("neutral")
+    positive_news = news_evidence["positive_count"]
+    negative_news = news_evidence["negative_count"]
+    neutral_news = news_evidence["neutral_count"]
     sampled_flow_values = [
         parsed
         for row in fund_rows
@@ -1105,21 +1086,14 @@ async def _market_dimensions(
             ],
         },
         "news": {
+            **news_evidence,
             "window_start": news_start.isoformat(timespec="seconds"),
-            "as_of_at": as_of_at.isoformat(timespec="seconds"),
-            "count": len(news_metric_rows),
-            "count_scope": "as_of_window",
-            "selected_count": len(news_rows),
-            "selection_limit": _NEWS_SELECTION_LIMIT,
-            "selection_basis": "importance_then_publish_time",
+            "as_of_at": news_evidence["as_of_at"],
+            "count_scope": "as_of_window",  # Existing view field; see count_basis/coverage.
+            "count_basis": "bounded_pit_window_not_legacy_projection",
             "positive_count": positive_news,
             "negative_count": negative_news,
             "neutral_count": neutral_news,
-            "unanalyzed_count": sum(
-                row.nlp_status not in {"analyzed", "fallback"}
-                for row in news_metric_rows
-            ),
-            "items": [_news_snapshot_item(row) for row in news_rows],
         },
         "fundamental": {
             "status": fundamental_source,

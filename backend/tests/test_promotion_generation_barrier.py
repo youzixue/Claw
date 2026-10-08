@@ -238,7 +238,7 @@ async def test_same_second_success_supersedes_marker_even_if_later_shadow_times_
         monkeypatch.setattr(shadow, "run_eligible_shadows_for_prediction_run", slow_shadow)
     result = await scheduler._prewarm_promotion_candidates(trigger="promotion_prediction_0935")
     if shadow_timeout:
-        assert result["status"] == "timeout"
+        assert result["status"] == "completed_postprocessing_timeout"
     else:
         assert result["learning"]["recorded_predictions"] == 1
     assert (DAY, "promotion_0935") in scheduler._promotion_snapshot_completed_contexts

@@ -20,7 +20,7 @@ if str(BACKEND) not in sys.path:
 
 from app.paper.capacity_research import (
     CapacityScope, CapacitySignal, CapacityObservation, CapacityPolicy,
-    NonCapacityGuards, run_capacity_study,
+    NonCapacityGuards, run_capacity_study, SharedCapacityBudget, run_shared_capacity_study,
 )
 from app.paper.signal_research import MarkoutPolicy
 
@@ -65,6 +65,28 @@ def decode_input(payload):
     return scope, signals, observations, as_of, CapacityPolicy(**policy_fields)
 
 
+def decode_shared_input(payload):
+    """Reuse the exact single-account decoder; never accept outcome-driven weights."""
+    if (not isinstance(payload, dict)
+            or payload.get("schema") != "paper_shared_capacity_frozen_input_v1"
+            or set(payload) != {"schema", "budget", "accounts"}):
+        raise ValueError("explicit shared budget and frozen account inputs required")
+    raw_accounts = payload["accounts"]
+    if not isinstance(raw_accounts, list) or not 1 <= len(raw_accounts) <= 12:
+        raise ValueError("one to twelve account inputs required")
+    parts = [decode_input(raw) for raw in raw_accounts]
+    if any(part[3:] != parts[0][3:] for part in parts[1:]):
+        raise ValueError("all accounts require the same as_of and capacity policy")
+    fields = dict(payload["budget"])
+    fields["trade_date"] = date.fromisoformat(fields["trade_date"])
+    for key in ("observed_at", "window_end"):
+        fields[key] = datetime.fromisoformat(fields[key])
+    fields["encumbered_codes"] = tuple(fields["encumbered_codes"])
+    return (SharedCapacityBudget(**fields), [part[0] for part in parts],
+            [signal for part in parts for signal in part[1]],
+            [obs for part in parts for obs in part[2]], parts[0][3], parts[0][4])
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -91,8 +113,12 @@ def main(argv=None):
             result[key] = value
         return result
     payload = json.loads(raw, parse_constant=reject_constant, object_pairs_hook=unique_pairs)
-    scope, signals, observations, as_of, policy = decode_input(payload)
-    report = run_capacity_study(scope, signals, observations, as_of=as_of, policy=policy)
+    if isinstance(payload, dict) and payload.get("schema") == "paper_shared_capacity_frozen_input_v1":
+        budget, scopes, signals, observations, as_of, policy = decode_shared_input(payload)
+        report = run_shared_capacity_study(budget, scopes, signals, observations, as_of=as_of, policy=policy)
+    else:
+        scope, signals, observations, as_of, policy = decode_input(payload)
+        report = run_capacity_study(scope, signals, observations, as_of=as_of, policy=policy)
     # Do not change report_sha256's pure-study meaning; wrap export metadata.
     output = {
         "schema": "paper_capacity_export_v1", "input_sha256": hashlib.sha256(raw).hexdigest(),

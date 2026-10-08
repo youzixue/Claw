@@ -10,6 +10,9 @@ from typing import Any
 
 from app.config.settings import settings, PaperConfirmationPolicy, PaperRouteSignalPolicy, PaperChallengerExecutionPolicy
 
+# 数据输入修复也进入版本身份，防止旧输入口径的排队单继续成交。
+EXIT_INPUT_CONTRACT_VERSION = "quote_day_frozen_volume_v1"
+
 # Immutable default mechanics currently shared by short-account exits.  Keeping
 # them in the effective account snapshot prevents later PAPER_AUTO_* changes
 # from silently altering another account.  A future intentional change should
@@ -285,7 +288,14 @@ def route_signal_policy(route_id: str) -> dict[str, Any]:
 def challenger_execution_policy(route_id: str) -> dict[str, Any]:
     name = ROUTE_ACCOUNT_NAMES[route_id]
     profile = settings.PAPER_ACCOUNT_CHALLENGER_EXECUTION_POLICIES.get(name)
-    return (profile if profile is not None else PaperChallengerExecutionPolicy()).model_dump()
+    if name in {"challenger_a", "challenger_b", "challenger_c"}:
+        return (profile if profile is not None else PaperChallengerExecutionPolicy(
+            target_top_up_enabled=True,
+        )).model_dump()
+    # D/F仍保持原执行口径及参数指纹，不因A/B/C新增加仓机制切换版本。
+    return (profile if profile is not None else PaperChallengerExecutionPolicy()).model_dump(exclude={
+        "target_top_up_enabled", "top_up_cooldown_sec", "top_up_max_daily_layers", "top_up_max_cost_return_pct",
+    })
 
 
 def account_parameter_snapshot(account_name: str) -> dict[str, Any]:
@@ -305,6 +315,7 @@ def account_parameter_snapshot(account_name: str) -> dict[str, Any]:
         "account_name": account_name,
         "account": _values(account_keys),
         "sell": account_sell_params(account_name),
+        "exit_input_contract": EXIT_INPUT_CONTRACT_VERSION,
         "confirmation": account_confirmation_policy(account_name) if account_name in _CONFIRMATION_ACCOUNTS else {},
         "route_signal": route_signal,
         "route_execution": challenger_execution_policy(route_id) if route_id else {},

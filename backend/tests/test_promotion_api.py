@@ -35,7 +35,15 @@ def test_first_board_diagnostic_overview_uses_actual_largest_reason_group():
 
 
 @pytest_asyncio.fixture
-async def promotion_api_env(tmp_path: Path):
+async def promotion_api_env(tmp_path: Path, monkeypatch):
+    # All historical route fixtures in this module use 2026. Calendar access
+    # must not inherit another test\'s network-fallback cache; official closures
+    # remain enforced by the unmodified is_trade_day implementation.
+    first_day = date(2026, 1, 1)
+    monkeypatch.setattr(promotion.trade_calendar, "_cache", {
+        first_day + timedelta(days=i): (first_day + timedelta(days=i)).weekday() < 5
+        for i in range(365)
+    })
     db_path = tmp_path / "promotion_api.db"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", future=True)
     SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -9605,7 +9613,8 @@ async def test_promotion_learning_calibrates_probability_by_route_history(promot
                     code=f"0001{i:02d}",
                     name="历史失败",
                     target_board=2,
-                    prediction_trade_date=date(2026, 4, 1 + i),
+                    # Keep all eight samples inside the production rolling window.
+                    prediction_trade_date=date.today() - timedelta(days=60 + i),
                     horizon_days=1,
                     predicted_probability=0.70,
                     calibrated_probability=0.70,

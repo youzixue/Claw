@@ -12,7 +12,8 @@
 
 注意:
 - URL路径参数: 01=日K 11=周K 21=月K (必须用01!)
-- [8][9][10]为盘后定价交易量/额, 仅创业板/科创板有值, 用户不交易故不存
+- [9]/[10]盘后股数/元，2026-10-02四板样本经官方与新浪交叉核验；[8]未知
+- 尾字段保留为研究材料，不认证全市场/ETF覆盖、历史可用钟或成交资格
 - 前复权[5]成交量单位=股(非手)
 - 必须先访问stockpage获取Cookie
 """
@@ -30,6 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.sources.base import DataSourceBase
 from app.data.source_capture import observe_response
+from app.data.after_hours import ths_tail
+from app.data.sources.after_hours_source import local_now
 
 
 class ThsKlineSource(DataSourceBase):
@@ -80,6 +83,14 @@ class ThsKlineSource(DataSourceBase):
 
             return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
+    async def collect_after_hours(self, code: str, *, trade_date: date) -> Optional[dict]:
+        """Explicit-date auxiliary observation; never select metadata.today or ffill."""
+        if type(trade_date) is not date or trade_date > local_now().date():
+            raise ValueError("explicit non-future trade date required")
+        rows = await self._fetch_kline(code, url_suffix="last.js", max_attempts=1)
+        target = trade_date.isoformat()
+        return next((row for row in rows or [] if row["trade_date"] == target), None)
+
     async def _fetch_kline(
         self,
         code: str,
@@ -123,10 +134,11 @@ class ThsKlineSource(DataSourceBase):
                     bust_url = self._bust_cache_url(url)
                     resp = await client.get(bust_url, headers=headers)
                     resp.raise_for_status()
+                    received_at = local_now()
                     if self._response_capture is not None:
                         observe_response(self._response_capture, source="ths_kline",
                             request_key=(code, url_suffix, attempt + 1), response=resp,
-                            received_at=datetime.now())
+                            received_at=received_at)
                     text = resp.text
                 except Exception as e:
                     logger.warning(f"[ths_kline] {code} 请求失败(第{attempt+1}次): {e}")
@@ -169,6 +181,9 @@ class ThsKlineSource(DataSourceBase):
                         "amount": float(fields[6]),
                         "turnover": float(fields[7]) if fields[7] else None,
                         "source": "ths",
+                        "after_hours": ths_tail(fields),
+                        "received_at": received_at,
+                        "source_published_at": None,
                     })
                 except (ValueError, OverflowError, IndexError):
                     continue

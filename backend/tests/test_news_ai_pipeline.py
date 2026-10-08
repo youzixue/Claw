@@ -45,6 +45,139 @@ def test_cleaning_status_requires_actual_ai_participation(sentiment, events, exp
 
 
 @pytest.mark.asyncio
+async def test_pending_batch_uses_stored_originals_and_keeps_truncation_denominator(monkeypatch):
+    from datetime import datetime
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from app.models.news import FinanceNews
+    from app.news.engine import NewsEngine
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    subject = NewsEngine()
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(FinanceNews.__table__.create)
+        async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+            db.add_all([FinanceNews(source="cls", source_id=str(i), title=f"原文{i}", content="冻结文字",
+                                   publish_time=datetime(2026,10,7,19), nlp_status="raw")
+                        for i in range(3)])
+            db.add(FinanceNews(source="global", source_id="SPX", title="指数不是新闻",
+                               publish_time=datetime(2026,10,7,19), nlp_status="raw"))
+            await db.commit()
+            async def analyze(items, **kwargs):
+                assert len(items) == 2 and all(item.content == "冻结文字" for item in items)
+                assert all(not hasattr(item,"_news_received_at") for item in items)
+                return [{"sentiment_method":"ai", "events_method":"ai"} for _ in items]
+            monkeypatch.setattr(subject,"process_and_store",analyze)
+            result=await subject.analyze_pending(db,limit=2)
+            assert result["pending_at_start"] == 3 and result["selected"] == result["processed"] == 2
+            assert result["selection_truncated"] is True and result["status"] == "partial"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_partial_ai_and_null_method_enter_cooldown_recovery_not_permanent_success(monkeypatch):
+    from datetime import datetime, timedelta
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from app.models.news import FinanceNews
+    from app.news.engine import NewsEngine, _news_now
+    monkeypatch.setattr(ai_provider,"enabled",True)
+    monkeypatch.setattr(ai_provider,"runtime_status",lambda:{"circuit_open":False})
+    engine=create_async_engine("sqlite+aiosqlite:///:memory:")
+    subject=NewsEngine()
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(FinanceNews.__table__.create)
+        async with async_sessionmaker(engine,expire_on_commit=False)() as db:
+            for identity,method,stamp in (("mixed","keyword",_news_now()-timedelta(hours=2)),
+                                          ("null",None,_news_now()-timedelta(hours=2)),
+                                          ("recent","keyword",_news_now())):
+                db.add(FinanceNews(source="cls",source_id=identity,title=identity,
+                       publish_time=datetime(2026,10,7,19),nlp_status="analyzed",
+                       sentiment_method="ai",events_method=method,nlp_analyzed_at=stamp))
+            await db.commit()
+            seen=[]
+            async def process(items,**kwargs):
+                seen.extend(item.source_id for item in items)
+                return [{"sentiment_method":"ai","events_method":"ai"} for item in items]
+            monkeypatch.setattr(subject,"process_and_store",process)
+            result=await subject.analyze_pending(db,limit=10)
+            assert set(seen)=={"mixed","null"} and result["selected"]==2
+            assert "recent" not in seen
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_newest_prefix_does_not_starve_older_raw_news(monkeypatch):
+    from datetime import datetime, timedelta
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from app.models.news import FinanceNews
+    from app.news.engine import NewsEngine
+    engine=create_async_engine("sqlite+aiosqlite:///:memory:")
+    subject=NewsEngine()
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(FinanceNews.__table__.create)
+        async with async_sessionmaker(engine,expire_on_commit=False)() as db:
+            db.add_all([FinanceNews(source="cls",source_id=str(i),title=f"原文{i}",
+                        publish_time=datetime(2026,10,7,19)+timedelta(minutes=i),
+                        nlp_status="raw") for i in range(4)])
+            await db.commit()
+            attempts=[]
+            async def fail(items,**kwargs):
+                attempts.append({item.source_id for item in items})
+                return []
+            monkeypatch.setattr(subject,"process_and_store",fail)
+            first=await subject.analyze_pending(db,limit=2)
+            second=await subject.analyze_pending(db,limit=2)
+            assert first["failed"]==second["failed"]==2
+            assert attempts[0].isdisjoint(attempts[1])
+            assert (await subject.analyze_pending(db,limit=2))["selected"]==0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pending_waves_preserve_committed_progress_when_next_wave_cancelled(monkeypatch):
+    import asyncio
+    from datetime import datetime
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from app.models.news import FinanceNews
+    from app.news.engine import NewsEngine
+    from app.config.settings import settings
+    monkeypatch.setattr(settings,"NEWS_AI_WAVE_SIZE",2)
+    engine=create_async_engine("sqlite+aiosqlite:///:memory:")
+    subject=NewsEngine()
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(FinanceNews.__table__.create)
+        async with async_sessionmaker(engine,expire_on_commit=False)() as db:
+            db.add_all([FinanceNews(source="cls",source_id=str(i),title=f"原文{i}",
+                        publish_time=datetime(2026,10,7,19),nlp_status="raw") for i in range(4)])
+            await db.commit()
+            calls=[]
+            async def wave(items,db_session,**kwargs):
+                calls.append([item.source_id for item in items])
+                if len(calls)>1:
+                    raise asyncio.CancelledError()
+                for item in items:
+                    row=await db_session.scalar(select(FinanceNews).where(FinanceNews.source_id==item.source_id))
+                    row.nlp_status="analyzed"
+                await db_session.commit()
+                return [{"sentiment_method":"ai","events_method":"ai"} for item in items]
+            monkeypatch.setattr(subject,"process_and_store",wave)
+            with pytest.raises(asyncio.CancelledError):
+                await subject.analyze_pending(db,limit=4)
+            rows=list((await db.scalars(select(FinanceNews))).all())
+            assert [row.nlp_status for row in rows].count("analyzed")==2
+            assert [row.nlp_status for row in rows].count("raw")==2
+            assert set(calls[0]).isdisjoint(calls[1])
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_news_pipeline_preserves_structured_ai_output(monkeypatch):
     async def reply(prompt, system=""):
         if "情感分析引擎" in system:

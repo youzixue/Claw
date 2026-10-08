@@ -23,8 +23,9 @@ certifi 仍然失败，已验证）。
 修法
 ----
 把 CA 官方仓库发布的缺失中间证书随仓库携带，并在进程启动时把它并入一个
-临时 CA bundle，通过 `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` 交给 OpenSSL
-与 requests。
+持久 CA bundle，通过 `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` 交给 OpenSSL
+与 requests。运行目录不使用系统临时目录，避免长驻进程的证书被临时文件清理移除；
+内容寻址和原子发布避免并行启动时暴露半写入文件。
 
 **这不是关闭校验**：仍然执行完整的链验证（叶子 → 中间 → DigiCert Global Root G2），
 只是把服务端漏发的中间证书补齐。已实测补链后 TLS 握手通过（TLSv1.3）。
@@ -41,7 +42,9 @@ SHA256  = 05:DC:9E:DC:0F:DD:FA:97:5A:14:32:EF:80:6E:C7:80:07:8B:53:62:AD:45:AF:7
 
 from __future__ import annotations
 
+import hashlib
 import os
+import ssl
 import tempfile
 from pathlib import Path
 
@@ -49,6 +52,8 @@ from loguru import logger
 
 # 随仓库携带的额外中间证书（PEM）。新增时在此登记即可，不必改调用方。
 EXTRA_CA_DIR = Path(__file__).resolve().parent.parent / "data" / "certs"
+# Repository runtime storage, independent of cwd and the OS temporary-file TTL.
+BUNDLE_DIR = Path(__file__).resolve().parents[3] / "runtime" / "tls"
 
 _INSTALLED_BUNDLE: str | None = None
 
@@ -74,7 +79,7 @@ def install_extra_ca_bundle() -> str | None:
     返回 bundle 路径；无法构建时返回 None（不影响启动）。
     """
     global _INSTALLED_BUNDLE
-    if _INSTALLED_BUNDLE is not None:
+    if _INSTALLED_BUNDLE is not None and Path(_INSTALLED_BUNDLE).is_file():
         return _INSTALLED_BUNDLE
 
     extra = _read_extra_certs()
@@ -85,16 +90,40 @@ def install_extra_ca_bundle() -> str | None:
         import certifi
 
         base = Path(certifi.where()).read_text(encoding="utf-8")
-    except Exception as exc:  # certifi 缺失时退回额外证书自身
-        logger.warning(f"certifi 证书包不可用，仅使用额外 CA: {exc}")
-        base = ""
-
-    bundle_path = Path(tempfile.gettempdir()) / "claw_ca_bundle.pem"
-    try:
-        bundle_path.write_text(f"{base}\n{extra}\n", encoding="utf-8")
-    except OSError as exc:
-        logger.warning(f"CA bundle 写入失败，跳过额外信任引导: {exc}")
+        if "BEGIN CERTIFICATE" not in base:
+            raise ValueError("base CA bundle is empty or invalid")
+    except Exception as exc:
+        # Never replace the normal trust roots with only an intermediate CA.
+        logger.warning(f"certifi 证书包不可用，保留原信任源: {exc}")
         return None
+
+    content = f"{base}\n{extra}\n".encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    bundle_path = BUNDLE_DIR / f"claw_ca_bundle_{digest}.pem"
+    temporary_path = None
+    try:
+        BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+        if not bundle_path.is_file() or bundle_path.read_bytes() != content:
+            # Same-filesystem replacement is atomic; other processes may still
+            # use a previous digest. Do not delete their bundles on startup.
+            with tempfile.NamedTemporaryFile(dir=BUNDLE_DIR, suffix=".tmp", delete=False) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            ssl.create_default_context(cafile=str(temporary_path))
+            os.replace(temporary_path, bundle_path)
+        else:
+            ssl.create_default_context(cafile=str(bundle_path))
+    except (OSError, ValueError) as exc:
+        logger.warning(f"CA bundle 构建失败，保留原信任源: {exc}")
+        return None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"CA 临时文件清理失败: {exc}")
 
     # 尊重调用方已显式配置的信任源，不覆盖。
     os.environ.setdefault("SSL_CERT_FILE", str(bundle_path))

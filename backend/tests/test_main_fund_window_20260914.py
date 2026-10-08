@@ -104,10 +104,10 @@ async def test_intraday_excludes_today_and_weekend_keeps_friday(db):
 
 @pytest.mark.asyncio
 async def test_long_official_holiday_uses_confirmed_sessions_not_calendar_span(db):
-    sessions = [date(2026, 9, d) for d in (24, 28, 29, 30)] + [date(2026, 10, 12)]
+    sessions = [date(2026, 9, d) for d in (24, 28, 29, 30)] + [date(2026, 10, 8)]
     await seed(db, sessions=sessions)
     result = await load_main_fund_window(db, through_date=sessions[-1],
-                                        decision_at=datetime(2026, 10, 12, 16), codes=["000001"])
+                                        decision_at=datetime(2026, 10, 8, 16), codes=["000001"])
     assert result["session_dates"] == [d.isoformat() for d in sessions]
     assert result["items"]["000001"]["total"] == 50
 

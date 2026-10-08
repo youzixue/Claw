@@ -224,6 +224,13 @@ def signal_record(row, account_name):
                           and context.get("schema") == "signal_market_context_v1"
                           and context.get("quote_round_id") == row.quote_round_id
                           and _number(context.get("price")) == price)
+    recovery = payload.get("ingress_recovery")
+    recovery = recovery if isinstance(recovery, dict) else {}
+    recovery_at = _clock(recovery.get("recovered_at"))
+    recovered = bool(valid and recovery.get("schema") == "paper_buy_point_ingress_recovery_v1"
+        and _clock(recovery.get("original_signal_observed_at")) == observed
+        and recovery.get("decision_run_id") == payload.get("decision_run_id")
+        and recovery_at and observed <= recovery_at <= created)
     raw_labels = payload.get("signal_labels")
     labels = raw_labels if isinstance(raw_labels, dict) else {}
     labels_at = _clock(labels.get("observed_at"))
@@ -239,6 +246,8 @@ def signal_record(row, account_name):
             "trade_date": row.trade_date.isoformat(), "source": row.source,
             "observed_at": observed.isoformat() if observed else None,
             "recorded_at": created.isoformat() if created else None,
+            "ingress_recovered": recovered,
+            "ingress_recovery_clock": recovery_at.isoformat() if recovered else None,
             "quote_round_id": row.quote_round_id, "decision_run_id": payload.get("decision_run_id"),
             "session": ("AM" if reference_at.time() < time(12) else "PM") if reference_at else "unknown",
             "reference_at": reference_at.isoformat() if reference_at else None,
@@ -454,7 +463,12 @@ async def build_signal_research_report(db, *, start_date, end_date, as_of, polic
         reference = _clock(signal["observed_at"]) if signal["evidence_status"] == "valid" else None
         legacy = signal["evidence_status"] == "legacy_record_reference"
         linked = sorted((r for r in decisions[key]
-                         if (reference or legacy) and r.id > signal["signal_id"]
+                         if (reference or legacy) and (
+                             r.id > signal["signal_id"] or (
+                                 reference and signal.get("ingress_recovered") is True
+                                 and r.quote_round_id == signal["quote_round_id"]
+                             )
+                         )
                          and _clock(r.created_at) and r.created_at <= as_of
                          and (reference is None or reference <= r.created_at)),
                         key=(lambda r: (r.created_at, r.id)) if reference else (lambda r: r.id))
@@ -464,6 +478,20 @@ async def build_signal_research_report(db, *, start_date, end_date, as_of, polic
         signal["first_decision_log_clock"] = first.created_at.isoformat() if first else None
         signal["first_decision_state"] = (first.action + ":" + first.decision) if first else "unknown"
         signal["first_decision_id"] = first.id if first else None
+        # New wall-clock evidence is separate from legacy/injected business clocks.
+        timing = _object(first.candidate_json).get("execution_timing") if first else None
+        timing = timing if isinstance(timing, dict) else {}
+        consumer_at, logged_at = (_clock(timing.get(k)) for k in ("consumer_started_at", "log_observed_at"))
+        wall_ok = bool(timing.get("schema") == "paper_entry_wall_clock_v1"
+                       and timing.get("clock_status") == timing.get("log_clock_status") == "ok"
+                       and consumer_at and logged_at and reference
+                       and reference <= consumer_at <= logged_at <= as_of)
+        signal["first_decision_wall_timing"] = {
+            "consumer_started_at": consumer_at.isoformat(),
+            "log_observed_at": logged_at.isoformat(),
+            "consumer_to_log_seconds": round((logged_at-consumer_at).total_seconds(), 6),
+            "commit_known_at": None, "basis": "native_wall_observation_not_commit_receipt",
+        } if wall_ok else None
         signal["first_decision_reason"] = str(first.reason or "") if first else None
         # 唯一同账户/版本/来源/个股/报价轮订单；不能靠后来同股成交贴回旧信号。
         candidates = order_groups[tuple(signal[k] for k in ("account_name", "strategy_version", "code", "source", "quote_round_id"))]

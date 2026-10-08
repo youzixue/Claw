@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 from sqlalchemy import desc, or_, select
@@ -26,6 +26,7 @@ from app.models.stock import FundFlow, StockKline
 from app.promotion.modeling.dataset import DatasetBundle
 from app.promotion.modeling.features import FeatureRow
 from app.promotion.regime import classify_historical_market_context
+from app.promotion.outcome_evidence import formal_outcome_bar_error
 
 
 _MAIN_CODE_PREFIXES = ("000", "001", "002", "003", "600", "601", "603", "605")
@@ -33,7 +34,7 @@ _LIMIT_UP_THRESHOLD = limit_up_change_threshold(
     "600000", adjusted_bar=True
 )  # forward-adjusted main-board detection threshold
 _HISTORICAL_PANEL_VERSION = (
-    "historical_panel_v2_expanding_reference_content_addressed"
+    "historical_panel_v3_outcome_blind_candidates_partial_labels"
 )
 _REFERENCE_BETA_PRIORS = {
     1: (2.0, 48.0),  # 4% conservative first-board candidate prior
@@ -54,6 +55,7 @@ class _Bar:
     turnover: float
     change_pct: float
     prev_close: float
+    source: str = ""
 
 
 def _number(value, default: float = 0.0) -> float:
@@ -278,7 +280,34 @@ def _select_broad_candidates(
     candidates: list[dict],
     *,
     limit: int,
+    policy: str = "legacy_union",
 ) -> list[dict]:
+    if policy not in {"legacy_union", "balanced_round_robin"}:
+        raise ValueError("unsupported historical candidate policy")
+    if limit <= 0:
+        return []
+    if policy == "balanced_round_robin":
+        # Fixed total budget; lane overlaps are filled from that lane's next
+        # unique name, rather than summing incomparable raw score units.
+        lanes = [sorted(candidates, key=lambda x: (x["scores"][lane], x["code"]), reverse=True)
+                 for lane in range(4)]
+        cursors = [0] * 4
+        selected = {}
+        while len(selected) < min(limit, len(candidates)):
+            progressed = False
+            for lane, ranked in enumerate(lanes):
+                while cursors[lane] < len(ranked) and ranked[cursors[lane]]["code"] in selected:
+                    cursors[lane] += 1
+                if cursors[lane] < len(ranked):
+                    item = ranked[cursors[lane]]
+                    selected[item["code"]] = item
+                    cursors[lane] += 1
+                    progressed = True
+                if len(selected) >= limit:
+                    break
+            if not progressed:
+                break
+        return list(selected.values())
     if len(candidates) <= limit:
         return sorted(candidates, key=lambda item: (item["scores"][0], item["code"]), reverse=True)
     lane_limit = max(limit // 4, 1)
@@ -308,6 +337,27 @@ def _select_broad_candidates(
     )[:limit]
 
 
+def _research_outcome_label(current, outcome, *, outcome_day, target_board, label_target):
+    """Read-time historical labels only; outcome checks NEVER select candidates."""
+    if outcome_day is None:
+        return None, "outcome_session_missing"
+    cursor = current.trade_date + timedelta(days=1)
+    while cursor < outcome_day:
+        if cursor.weekday() < 5 and not is_official_closed_day(cursor):
+            return None, "outcome_calendar_gap"
+        cursor += timedelta(days=1)
+    error = formal_outcome_bar_error(current, outcome)
+    if error:
+        return None, error
+    if _is_ambiguous_pre_reform_st_move(outcome):
+        return None, "outcome_identity_ambiguous"
+    if label_target == "next_day_close_up":
+        return int(outcome.close > outcome.prev_close), ""
+    current_limit = _is_limit_up(current.change_pct)
+    outcome_limit = _is_limit_up(outcome.change_pct)
+    return int(outcome_limit and (not current_limit if target_board == 1 else current_limit)), ""
+
+
 async def build_historical_panel_dataset(
     db: AsyncSession,
     *,
@@ -317,10 +367,16 @@ async def build_historical_panel_dataset(
     candidate_limit_per_day: int = 450,
     minimum_universe_count: int = 500,
     end_date: date | None = None,
+    candidate_policy: str = "legacy_union",
+    label_target: str = "promotion",
 ) -> DatasetBundle:
     """Build a broad, multi-year close→next-session panel from local K-lines."""
 
     target_board = int(target_board)
+    if candidate_policy not in {"legacy_union", "balanced_round_robin"}:
+        raise ValueError("unsupported historical candidate policy")
+    if label_target not in {"promotion", "next_day_close_up"} or (label_target != "promotion" and target_board != 1):
+        raise ValueError("unsupported historical research label target")
     if target_board not in {1, 2}:
         raise ValueError("target_board must be 1 or 2")
     lookback_trade_days = max(int(lookback_trade_days), 80)
@@ -368,6 +424,7 @@ async def build_historical_panel_dataset(
                 StockKline.turnover,
                 StockKline.change_pct,
                 StockKline.prev_close,
+                StockKline.source,
             ).where(
                 StockKline.trade_date >= first_query_date,
                 StockKline.trade_date <= last_query_date,
@@ -399,6 +456,7 @@ async def build_historical_panel_dataset(
             turnover=_number(row[8]),
             change_pct=change,
             prev_close=prev_close,
+            source=str(row[11] or ""),
         )
         by_code[code].append(bar)
         market_changes[bar.trade_date].append(change)
@@ -480,46 +538,35 @@ async def build_historical_panel_dataset(
             index = index_by_date.get(feature_day)
             if index is None or index < history_days - 1:
                 continue
-            outcome_day = next_market_date.get(feature_day)
-            if outcome_day is None:
-                continue
-            outcome_index = index_by_date.get(outcome_day)
-            if outcome_index is None:
-                continue
             current = bars[index]
-            outcome = bars[outcome_index]
-            if current.close <= 0 or current.volume <= 0 or outcome.close <= 0:
+            if current.close <= 0 or current.volume <= 0:
                 continue
             clock_aligned_sample_count += 1
-            # Before the date-effective ST reform, a 4.5%-6.2% adjusted move may
-            # be either an ST limit or an ordinary main-board rise.  Without a
-            # versioned historical ST-membership table, both the lane identity
-            # on T and the outcome on T+1 are unknowable, so fail closed.  After
-            # the reform the main-board threshold applies and a 5% move is an
-            # ordinary non-limit observation rather than an ambiguous event.
+            # Only information at T can decide membership. Missing/bad T+1
+            # evidence becomes an unknown label, never a freed candidate slot.
             if _is_ambiguous_pre_reform_st_move(current):
                 excluded_ambiguous_st_current_moves += 1
                 continue
-            if _is_ambiguous_pre_reform_st_move(outcome):
-                excluded_ambiguous_st_outcome_moves += 1
-                continue
             current_limit = _is_limit_up(current.change_pct)
-            outcome_limit = _is_limit_up(outcome.change_pct)
-            label = int(
-                outcome_limit and not current_limit
-                if target_board == 1
-                else outcome_limit and current_limit
-            )
-            if label:
-                universe_positives_by_date[feature_day] += 1
             if target_board == 2 and not current_limit:
                 continue
             if target_board == 1 and current_limit:
                 continue
+            outcome_day = next_market_date.get(feature_day)
+            outcome_index = index_by_date.get(outcome_day)
+            outcome = bars[outcome_index] if outcome_index is not None else None
+            label, label_error = _research_outcome_label(
+                current, outcome, outcome_day=outcome_day,
+                target_board=target_board, label_target=label_target)
+            if label_error == "outcome_identity_ambiguous":
+                excluded_ambiguous_st_outcome_moves += 1
+            if label == 1:
+                universe_positives_by_date[feature_day] += 1
             candidates_by_date[feature_day].append(
                 {
                     "code": code,
                     "label": label,
+                    "label_error": label_error,
                     "bars": bars,
                     "index": index,
                     "scores": _quick_prefilter_scores(bars, index),
@@ -542,10 +589,11 @@ async def build_historical_panel_dataset(
             candidates
             if target_board == 2
             else _select_broad_candidates(
-                candidates, limit=candidate_limit_per_day
+                candidates, limit=candidate_limit_per_day, policy=candidate_policy
             )
         )
-        selected_positives = sum(item["label"] for item in selected)
+        selected_positives = sum(item["label"] == 1 for item in selected)
+        selected_known = sum(item["label"] is not None for item in selected)
         pool_positive_count += selected_positives
         # The comparison curve is deliberately prequential: today's labels are
         # not allowed to set today's probability.  The old same-day base rate was
@@ -556,11 +604,14 @@ async def build_historical_panel_dataset(
             prior_positive_count=reference_positive_count,
             prior_sample_count=reference_sample_count,
         )
+        if label_target == "next_day_close_up":
+            reference_base_rate = (reference_positive_count + 10.0) / (reference_sample_count + 20.0)
         day_regime = classify_historical_market_context(
             market_context.get(feature_day, {})
         )
         for rank, item in enumerate(selected, start=1):
-            rank_multiplier = 1.4 - 0.8 * ((rank - 1) / max(len(selected) - 1, 1))
+            rank_multiplier = (1.4 - 0.8 * ((rank - 1) / max(len(selected) - 1, 1))
+                               if label_target == "promotion" else 1.0)
             values, _scores = _historical_values(
                 item["bars"],
                 item["index"],
@@ -588,17 +639,22 @@ async def build_historical_panel_dataset(
                 "candidate_count": len(selected),
                 "universe_positive_count": universe_positives,
                 "candidate_positive_count": selected_positives,
+                "universe_unknown_count": sum(item["label"] is None for item in candidates),
+                "candidate_unknown_count": len(selected) - selected_known,
+                "candidate_unknown_reasons": dict(Counter(item["label_error"] for item in selected if item["label"] is None)),
+                "unknown_candidates": [{"code": item["code"], "reason": item["label_error"]}
+                                       for item in selected if item["label"] is None],
                 "reference_base_rate": reference_base_rate,
                 "reference_prior_sample_count": reference_sample_count,
             }
         )
         reference_positive_count += selected_positives
-        reference_sample_count += len(selected)
+        reference_sample_count += selected_known
 
     digest_header = (
         f"{_HISTORICAL_PANEL_VERSION}|{target_board}|{feature_dates[0]}|"
         f"{feature_dates[-1]}|{len(rows)}|"
-        f"{universe_positive_count}|{candidate_limit_per_day}"
+        f"{universe_positive_count}|{candidate_limit_per_day}|{candidate_policy}|{label_target}"
     )
     digest_builder = hashlib.sha256(digest_header.encode("utf-8"))
     for row in rows:
@@ -619,26 +675,32 @@ async def build_historical_panel_dataset(
                 allow_nan=False,
             ).encode("utf-8")
         )
+    digest_builder.update(json.dumps(day_diagnostics, sort_keys=True, allow_nan=False).encode())
     digest = digest_builder.hexdigest()[:16]
+    universe_unknown_count = sum(day["universe_unknown_count"] for day in day_diagnostics)
     diagnostics = {
         "dataset_source": "historical_kline_panel",
-        "label_source": (
-            "next_session_date_effective_adjusted_mainboard_limit_threshold_"
-            "with_pre_reform_st_ambiguity_excluded"
-        ),
+        "label_source": "read_time_formal_close_partial_labels_not_first_knowledge",
+        "label_target": label_target,
+        "candidate_policy": candidate_policy,
+        "candidate_selection_contract": "T_only_selection_then_label_v3",
+        "unknown_count": sum(row.label is None for row in rows),
+        "universe_unknown_count": universe_unknown_count,
+        "historical_first_knowledge_verified": False,
+        "manual_review_eligible": False,
+        "research_only": True,
         "target_board": target_board,
         "eligible_records": len(rows),
-        "positive_count": sum(row.label for row in rows),
-        "negative_count": sum(1 - row.label for row in rows),
+        "positive_count": sum(row.label == 1 for row in rows),
+        "negative_count": sum(row.label == 0 for row in rows),
         "trade_day_count": len({row.trade_date for row in rows}),
         "universe_candidate_count": universe_candidate_count,
         "universe_positive_count": universe_positive_count,
         "candidate_positive_count": pool_positive_count,
-        "prefilter_recall": (
-            pool_positive_count / universe_positive_count
-            if universe_positive_count
-            else 0.0
-        ),
+        "prefilter_recall": (pool_positive_count / universe_positive_count
+                             if universe_positive_count else 0.0) if not universe_unknown_count else None,
+        "observed_prefilter_recall": (pool_positive_count / universe_positive_count
+                                      if universe_positive_count else None),
         "candidate_limit_per_day": candidate_limit_per_day,
         "regime_sample_counts": dict(Counter(row.market_regime for row in rows)),
         "regime_trade_day_counts": {
@@ -647,17 +709,13 @@ async def build_historical_panel_dataset(
         },
         "minimum_universe_count": minimum_universe_count,
         "excluded_incomplete_trade_days": len(incomplete_feature_dates),
-        "excluded_ambiguous_st_moves": (
-            excluded_ambiguous_st_current_moves
-            + excluded_ambiguous_st_outcome_moves
-        ),
+        "excluded_ambiguous_st_moves": excluded_ambiguous_st_current_moves,
         "excluded_ambiguous_st_current_moves": excluded_ambiguous_st_current_moves,
-        "excluded_ambiguous_st_outcome_moves": excluded_ambiguous_st_outcome_moves,
+        "unknown_ambiguous_st_outcome_moves": excluded_ambiguous_st_outcome_moves,
         "clock_aligned_sample_count": clock_aligned_sample_count,
         "ambiguous_st_exclusion_rate": (
             (
                 excluded_ambiguous_st_current_moves
-                + excluded_ambiguous_st_outcome_moves
             )
             / clock_aligned_sample_count
             if clock_aligned_sample_count
@@ -666,6 +724,7 @@ async def build_historical_panel_dataset(
         "point_in_time_contract": "features use bars/fund flow at or before feature date only",
         "reference_probability": (
             "expanding_prior_broad_prefilter_rank_heuristic_not_production_champion"
+            if label_target == "promotion" else "expanding_close_up_beta_prior_not_production_champion"
         ),
         "reference_probability_contract": (
             "each day uses only earlier selected outcomes plus a fixed beta prior"
@@ -675,7 +734,7 @@ async def build_historical_panel_dataset(
     return DatasetBundle(
         rows=rows,
         diagnostics=diagnostics,
-        data_version=f"historical_panel_v2_{len(rows)}_{digest}",
+        data_version=f"historical_panel_v3_{label_target}_{len(rows)}_{digest}",
         start_date=(date.fromisoformat(rows[0].trade_date) if rows else None),
         end_date=(date.fromisoformat(rows[-1].trade_date) if rows else None),
     )

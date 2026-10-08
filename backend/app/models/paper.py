@@ -322,3 +322,81 @@ class PaperDailyOutcome(Base):
     details_json = Column(Text, nullable=False, default="{}")
     updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
     finalized_at = Column(DateTime)
+
+
+class PaperPortfolioSignal(Base):
+    """Immutable pre-capacity confirmation outbox; no historical backfill."""
+    __tablename__ = "paper_portfolio_signal"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_key = Column(String(96), nullable=False, unique=True)
+    portfolio_version = Column(String(64), nullable=False)
+    origin_account = Column(String(30), nullable=False)
+    origin_account_id = Column(Integer, nullable=False)
+    origin_version = Column(String(64), nullable=False)
+    source = Column(String(40), nullable=False)
+    code = Column(String(10), nullable=False)
+    name = Column(String(40))
+    source_signal_id = Column(String(128), nullable=False)
+    shadow_event_key = Column(String(128))
+    confirmed_at = Column(DateTime, nullable=False)
+    decision_round_id = Column(String(64), nullable=False)
+    as_of_at = Column(DateTime, nullable=False)
+    # Actual append wall clock supplied explicitly, never quote-clock default.
+    observed_at = Column(DateTime, nullable=False)
+    candidate_json = Column(Text, nullable=False)
+    entry_policy_json = Column(Text, nullable=False)
+    exit_policy_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    __table_args__ = (
+        Index("ix_portfolio_signal_observed", "portfolio_version", "observed_at"),
+        Index("ix_portfolio_signal_origin_code", "origin_account", "code", "confirmed_at"),
+    )
+
+
+class PaperPortfolioDecision(Base):
+    """One immutable allocation/terminal attempt; source evidence is never updated."""
+    __tablename__ = "paper_portfolio_decision"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    decision_key = Column(String(128), nullable=False, unique=True)
+    signal_id = Column(Integer, ForeignKey("paper_portfolio_signal.id"), nullable=False)
+    portfolio_version = Column(String(64), nullable=False)
+    account_id = Column(Integer, nullable=False)
+    decision_round_id = Column(String(64), nullable=False)
+    as_of_at = Column(DateTime, nullable=False)
+    observed_at = Column(DateTime, nullable=False)
+    decision = Column(String(32), nullable=False)
+    reason_code = Column(String(64), nullable=False)
+    reason = Column(Text)
+    # TradeOrder.order_id business identity; nullable for failed/unallocated attempts.
+    order_id = Column(String(40))
+    budget_json = Column(Text, nullable=False)
+    __table_args__ = (
+        Index("ix_portfolio_decision_signal", "signal_id", "observed_at"),
+        Index("ix_portfolio_decision_order", "order_id"),
+    )
+
+
+def _reject_portfolio_mutation(mapper, connection, target):
+    raise ValueError("portfolio evidence is append-only")
+
+
+for _portfolio_model, _portfolio_key in (
+    (PaperPortfolioSignal, "signal_key"),
+    (PaperPortfolioDecision, "decision_key"),
+):
+    event.listen(_portfolio_model, "before_update", _reject_portfolio_mutation)
+    event.listen(_portfolio_model, "before_delete", _reject_portfolio_mutation)
+    for _portfolio_action in ("UPDATE", "DELETE"):
+        event.listen(_portfolio_model.__table__, "after_create", DDL(
+            f"CREATE TRIGGER {_portfolio_model.__tablename__}_no_{_portfolio_action.lower()} "
+            f"BEFORE {_portfolio_action} ON {_portfolio_model.__tablename__} "
+            "BEGIN SELECT RAISE(ABORT, 'portfolio evidence is append-only'); END"
+        ).execute_if(dialect="sqlite"))
+    # SQLite REPLACE can otherwise delete old rows without DELETE triggers enabled.
+    event.listen(_portfolio_model.__table__, "after_create", DDL(
+        f"CREATE TRIGGER {_portfolio_model.__tablename__}_no_replace "
+        f"BEFORE INSERT ON {_portfolio_model.__tablename__} WHEN EXISTS "
+        f"(SELECT 1 FROM {_portfolio_model.__tablename__} "
+        f"WHERE id=NEW.id OR {_portfolio_key}=NEW.{_portfolio_key}) "
+        "BEGIN SELECT RAISE(ABORT, 'portfolio evidence is append-only'); END"
+    ).execute_if(dialect="sqlite"))

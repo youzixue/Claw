@@ -11,7 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from app.config.settings import settings
-from app.models.paper import PaperAutoTradeLog, PaperAccount
+from app.models.paper import PaperAutoTradeLog, PaperAccount, PaperTradeLog
+from app.models.trading import TradeOrder, TradeFill
 from app.models.stock import StockTag
 from app.push import paper_buy_points as points
 from app.paper.account_policy import ACCOUNT_NAMES
@@ -21,7 +22,8 @@ from app.paper.account_policy import ACCOUNT_NAMES
 async def setup(tmp_path, monkeypatch):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'push.db'}")
     async with engine.begin() as conn:
-        for table in (PaperAutoTradeLog.__table__, PaperAccount.__table__, StockTag.__table__):
+        for table in (PaperAutoTradeLog.__table__, PaperAccount.__table__, StockTag.__table__,
+                      PaperTradeLog.__table__, TradeOrder.__table__, TradeFill.__table__):
             await conn.run_sync(table.create)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now().replace(microsecond=0)
@@ -265,12 +267,14 @@ def test_candidate_reason_keeps_strategy_evidence_not_generic_score():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action,decision,trade_id,expected", [
-    ("buy", "executed", 123, "✅ 已有模拟成交记录"),
-    ("buy", "executed", None, "🔎 买点已确认 · 非下单或成交"),
-    ("buy", "dry_run", 123, "🔎 买点已确认 · 非下单或成交"),
+    # A bare ID is not a verified ledger receipt. Real filled/partial positives
+    # live in test_execution_loop_boundary_20260923 with all three entity types.
+    ("buy", "executed", 123, "🔎 原条件曾确认 · 执行未核实 · 非下单或成交"),
+    ("buy", "executed", None, "🔎 原条件曾确认 · 执行未核实 · 非下单或成交"),
+    ("buy", "dry_run", 123, "🔎 原条件曾确认 · 执行未核实 · 非下单或成交"),
     ("deferred_buy", "wait", None, "⏳ 已提交模拟委托 · 未确认成交"),
     ("wait_buy", "wait", None, "⏸ 本轮未下单 · 等待条件"),
-    ("skip_buy", "blocked", None, "⛔ 本轮未下单 · 已拦截"),
+    ("skip_buy", "blocked", None, "⛔ 本轮执行已拦截"),
     ("skip_terminal", "skipped", None, "⌛ 原买点已失效 · 本轮未下单"),
 ])
 async def test_card_execution_badge_uses_scoped_audit_not_reason_text(

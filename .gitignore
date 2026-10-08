@@ -79,3 +79,21 @@ sectors_*.png
 
 # 生成的缓存（非源码；.workbuddy/memory/ 等仍应入库）
 .workbuddy/stock_list_cache.json
+
+# 本地测试 / 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage.*
+playwright-report/
+
+# 私钥与账户凭据（数据源公共 CA 证书 *.pem 仍保留）
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# DSH 插件运行状态 / 本机验收结果，不是可复用源码
+.dsh/plugins/claw-trading-schedule/state.json
+.dsh/plugins/claw-task-router/verification/live-result*.json

@@ -66,6 +66,13 @@ async def paper_client(tmp_path, monkeypatch):
     monkeypatch.setattr(paper.settings, "PAPER_DEFER_AUTO_FILL_TO_NEXT_ROUND", False)
     # 旧策略筛选用例固定旧协议；持续实验由独立用例验证，不依赖系统日期。
     monkeypatch.setattr(paper.settings, "PAPER_CONTINUOUS_EXPERIMENT_ENABLED", False)
+    # Strategy fixtures using today/previous_trade_day own a bounded calendar
+    # window; they must not depend on a prior test having fetched/fallen back.
+    today = date.today()
+    monkeypatch.setattr(paper.trade_calendar, "_cache", {
+        today - timedelta(days=i): (today - timedelta(days=i)).weekday() < 5
+        for i in range(40)
+    })
     db_path = tmp_path / "paper.db"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", future=True)
     SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -132,6 +139,13 @@ async def qualified_manual_execution(paper_client, qualified_execution_risk, mon
         at.date() - timedelta(days=i): (at.date() - timedelta(days=i)).weekday() < 5
         for i in range(32)
     })
+    # trade_days_between always invokes the loader, even with a populated cache.
+    # These tests own their explicit dates; calendar-source integration is separate.
+    async def use_fixture_calendar(self, year):
+        assert self is paper.trade_calendar and year == 2026
+    # Patch the descriptor, not the instance: undo must not leave a bound method
+    # shadowing other suites\' class-level calendar isolation.
+    monkeypatch.setattr(type(paper.trade_calendar), "_ensure_loaded", use_fixture_calendar)
     async with factory() as db:
         sentiment = await db.scalar(select(MarketSentiment))
         sentiment.trade_date = at.date()
@@ -655,7 +669,17 @@ async def test_paper_buy_keeps_original_entry_sector_on_scale_in(paper_client, q
     assert payload["entry_sector_name"] == "入场主线"
 
 
-def test_short_sell_reason_uses_tighter_intraday_rules():
+@pytest.fixture
+def regular_session_sell_clock(monkeypatch):
+    # These price-threshold tests are outside the opening noise window. Their
+    # result must not depend on whether pytest happens to run at 09:30-09:45.
+    original = paper._is_open_noise_window
+    at = datetime.combine(date.today(), datetime.min.time()).replace(hour=10)
+    monkeypatch.setattr(paper, "_is_open_noise_window",
+                        lambda now=None, **kw: original(now or at, **kw))
+
+
+def test_short_sell_reason_uses_tighter_intraday_rules(regular_session_sell_clock):
     position = PaperPosition(
         account_id=1,
         code="000001",
@@ -813,7 +837,7 @@ def test_limit_up_next_day_limit_down_full_exit_before_open_noise():
     assert paper._auto_sell_amount(position, 2300, reason) == 2300
 
 
-def test_short_sell_reason_prioritizes_position_stop_loss_price():
+def test_short_sell_reason_prioritizes_position_stop_loss_price(regular_session_sell_clock):
     position = PaperPosition(
         account_id=1,
         code="000001",
@@ -2867,7 +2891,8 @@ def test_execution_value_gate_allows_confirmed_support_reclaim_with_reward_risk(
     ) == ""
 
 
-def test_execution_value_gate_rejects_rebound_far_from_intraday_low():
+def test_legacy_execution_value_gate_rejects_rebound_far_from_intraday_low(monkeypatch):
+    monkeypatch.setattr(paper.settings, "PAPER_AUTO_ENTRY_ANCHOR", "legacy_high")
     candidate = {
         "_source": "underwater_reversal",
         "execution_confirmation": True,
@@ -3292,8 +3317,14 @@ async def test_t_buyback_does_not_rebuy_above_cost_after_profit_sell(paper_clien
 
 
 @pytest.mark.asyncio
-async def test_paper_auto_evaluation_groups_executed_logs(paper_client):
+async def test_paper_auto_evaluation_groups_executed_logs(paper_client, monkeypatch):
     client, SessionLocal = paper_client
+    at = datetime.now()
+    days = (at.date() - timedelta(days=1), at.date())
+    monkeypatch.setattr(paper.trade_calendar, "_cache", {day: day.weekday() < 5 for day in days})
+    async def use_fixture_calendar(self, year):
+        assert self is paper.trade_calendar and year in {day.year for day in days}
+    monkeypatch.setattr(type(paper.trade_calendar), "_ensure_loaded", use_fixture_calendar)
     await client.get("/paper/account")
 
     async with SessionLocal() as session:
@@ -3632,7 +3663,7 @@ def test_strategy_buy_limits_distinguish_accounts():
     )
 
 
-def test_short_sell_reason_uses_strategy_b_params():
+def test_short_sell_reason_uses_strategy_b_params(regular_session_sell_clock):
     """策略B持仓按 8% 止盈 / 6% 止损 / 3天时间止损 独立判定."""
     position = PaperPosition(
         account_id=1,
@@ -3657,7 +3688,7 @@ def test_short_sell_reason_uses_strategy_b_params():
     assert reason_b == ""        # 策略B: -6% 止损未触发, 不因噪音离场
 
 
-def test_strategy_b_sell_take_profit_at_8_percent():
+def test_strategy_b_sell_take_profit_at_8_percent(regular_session_sell_clock):
     """策略B: 止盈阈值以下不触发, 达到阈值触发 (2026-08-31 寻优后止盈=12%)."""
     position = PaperPosition(
         account_id=1, code="000001", buy_price=10.0, buy_amount=100,
@@ -3740,6 +3771,7 @@ def _governed_promotion_snapshot(
     trade_gate_passed: bool = True,
     actionable: bool = True,
     watch_only: bool = False,
+    created_at: datetime | None = None,
 ) -> PromotionPredictionSnapshot:
     return PromotionPredictionSnapshot(
         run_id=run_id,
@@ -3748,6 +3780,9 @@ def _governed_promotion_snapshot(
         name=record_key,
         target_board=target_board,
         prediction_trade_date=prediction_trade_date,
+        # Existing fixtures represent already-visible snapshots, not records
+        # materialized at the wall clock of this test. Clock tests override this.
+        created_at=created_at or datetime.combine(prediction_trade_date, datetime.min.time()),
         horizon_days=1,
         candidate_route=route,
         rank_scope="trade_pool",
@@ -3900,7 +3935,7 @@ async def test_promotion_second_board_accepts_same_day_immutable_intraday_snapsh
 
 
 @pytest.mark.asyncio
-async def test_late_mainline_refresh_does_not_replace_b_or_d_opening_batch(paper_client, monkeypatch):
+async def test_intraday_refresh_replaces_b_without_fallback_but_preserves_d_opening_batch(paper_client, monkeypatch):
     _client, SessionLocal = paper_client
     today = date.today()
     monkeypatch.setattr(paper, "_paper_now", lambda: datetime.combine(today, time(14)))
@@ -3950,9 +3985,8 @@ async def test_late_mainline_refresh_does_not_replace_b_or_d_opening_batch(paper
             session, limit=5, trade_date=today, account_name=paper.PAPER_ACCOUNT_AUCTION,
         )
 
-    assert [item["code"] for item in b_candidates] == ["600019"]
+    assert b_candidates == []  # 新批次没有B候选时，不能回捞开盘票。
     assert [item["code"] for item in d_candidates] == ["600029"]
-    assert b_candidates[0]["snapshot_context"] == "promotion_0935"
     assert d_candidates[0]["snapshot_context"] == "promotion_0935"
 
 
@@ -4340,6 +4374,7 @@ async def test_mainline_non_actionable_snapshot_requires_same_day_live_sector_sp
                 sector_code="BK_MAIN",
                 sector_name="主线扩散板块",
                 trade_date=today,
+                observed_at=datetime.combine(today, time(13, 59)),
                 strength_score=72,
                 change_pct=2.1,
                 fund_flow=18.0,
@@ -4571,19 +4606,20 @@ async def test_tenbagger_midline_candidates_score_filter(monkeypatch, paper_clie
         ])
         # 600100 在3%低吸区；其余覆盖板数、质量、一字和追涨上限过滤。
         session.add_all([
-            StockSpot(code="600100", name="五板龙头", price=12.0, prev_close=11.0, change_pct=3.0,
-                      high=12.1, avg_price=11.9, volume_ratio=1.5, limit_up=12.1),
+            StockSpot(code="600100", name="五板龙头", price=11.33, prev_close=11.0, change_pct=3.0,
+                      open=11.2, low=11.1, high=11.4, avg_price=11.2,
+                      volume_ratio=1.5, limit_up=12.1, limit_down=9.9),
             StockSpot(code="600400", name="一字未开板", price=13.2, prev_close=12.0, change_pct=10.0,
-                      open=13.2, low=13.2, volume_ratio=0.3, limit_up=13.2,
+                      open=13.2, low=13.2, high=13.2, avg_price=13.2, volume_ratio=0.3, limit_up=13.2, limit_down=10.8,
                       bid1_price=13.2, bid1_volume=50000, ask1_price=0),
             StockSpot(code="600500", name="开板后回封", price=14.3, prev_close=13.0, change_pct=10.0,
-                      open=13.7, low=13.6, volume=80000, volume_ratio=4.0, limit_up=14.3,
+                      open=13.7, low=13.6, high=14.3, avg_price=14.0, volume=80000, volume_ratio=4.0, limit_up=14.3, limit_down=11.7,
                       bid1_price=14.3, bid1_volume=12000, ask1_price=0),
             StockSpot(code="600600", name="涨停有卖盘", price=11.0, prev_close=10.0, change_pct=10.0,
-                      open=10.6, low=10.5, volume=50000, volume_ratio=3.0, limit_up=11.0,
+                      open=10.6, low=10.5, high=11., avg_price=10.8, volume=50000, volume_ratio=3.0, limit_up=11.0, limit_down=9.,
                       bid1_price=11.0, bid1_volume=3000, ask1_price=11.0, ask1_volume=100),
             StockSpot(code="600700", name="涨幅超限高标", price=10.43, prev_close=10.0, change_pct=4.27,
-                      high=10.5, avg_price=10.3, volume_ratio=1.5, limit_up=11.0),
+                      open=10.2, low=10.1, high=10.5, avg_price=10.3, volume_ratio=1.5, limit_up=11.0, limit_down=9.),
         ])
         await session.commit()
 
@@ -4598,7 +4634,7 @@ async def test_tenbagger_midline_candidates_score_filter(monkeypatch, paper_clie
         assert "600500" not in codes   # 即使曾开板回封，执行日涨幅10%也不追
         assert "600600" not in codes   # 涨停有卖盘也不能绕过3%执行上限
         assert "600700" not in codes   # +4.27%超过E策略3%硬上限
-        assert candidates[0]["avg_price"] == pytest.approx(11.9)
+        assert candidates[0]["avg_price"] == pytest.approx(11.2)
         assert candidates[0]["pullback_from_high_pct"] <= 2.0
         assert candidates[0]["_source"] == "tenbagger_midline"
         assert candidates[0]["consecutive_days"] == 5

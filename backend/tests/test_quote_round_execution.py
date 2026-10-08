@@ -74,6 +74,7 @@ def _round_payload(round_id: str, observed_at: datetime, records: list[dict]) ->
 async def test_deferred_order_uses_next_round_depth_partial_fill_and_is_idempotent(
     quote_execution_env,
     monkeypatch,
+    request,
 ):
     SessionLocal = quote_execution_env
 
@@ -84,6 +85,11 @@ async def test_deferred_order_uses_next_round_depth_partial_fill_and_is_idempote
     # Isolate depth/accounting here; real TTL/route checks have dedicated integration tests.
     monkeypatch.setattr(trading_service, "_requires_pending_buy_validity", lambda _order: False)
     decision_at = datetime(2026, 9, 3, 10, 0, 0)
+    from sqlalchemy import event as orm_event
+    def order_clock(_mapper, _connection, target):
+        target.created_at = target.decision_at
+    orm_event.listen(TradeOrder, "before_insert", order_clock)
+    request.addfinalizer(lambda: orm_event.remove(TradeOrder, "before_insert", order_clock))
     decision_payload = _round_payload(
         "qr-decision",
         decision_at,
@@ -103,6 +109,7 @@ async def test_deferred_order_uses_next_round_depth_partial_fill_and_is_idempote
                 strategy_id="paper-auto-short",
                 source="next_day_plan",
                 reason="验证下一轮五档撮合",
+                strategy_version=paper._strategy_version(paper.PAPER_ACCOUNT_DEFAULT),
                 idempotency_key="qr-decision:default:buy:600001",
                 defer_until_next_round=True,
                 deferred_metadata={"block_warn": True},
@@ -211,6 +218,11 @@ async def test_deferred_order_uses_next_round_depth_partial_fill_and_is_idempote
             ).all()
         )
         assert fill_rounds == ["qr-fill-1", "qr-fill-2"]
+        # Real service/broker created two pf request IDs, but one original decision.
+        layers, last_fill = await paper._same_day_buy_layers(
+            session, account_id=position.account_id, code=position.code, now=final_at)
+        assert layers == 1 and last_fill == final_at
+        assert len(set(await session.scalars(select(PaperTradeLog.signal_id)))) == 2
 
 
 @pytest.mark.asyncio

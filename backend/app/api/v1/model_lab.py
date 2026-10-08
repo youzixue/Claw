@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -168,8 +168,10 @@ async def prediction_runs(
     model_version: str = "",
     limit: int = 50,
     db: AsyncSession = Depends(get_db),
+    compact: bool = False,
 ):
-    await ensure_prediction_ledger_storage(db)
+    if not compact:
+        await ensure_prediction_ledger_storage(db)
     statement = select(PromotionPredictionRun)
     if trade_date is not None:
         statement = statement.where(PromotionPredictionRun.reference_trade_date == trade_date)
@@ -179,6 +181,15 @@ async def prediction_runs(
         )
     if model_version.strip():
         statement = statement.where(PromotionPredictionRun.model_version == model_version.strip())
+    if compact:
+        fields = ("id", "reference_trade_date", "as_of_at", "snapshot_context",
+                  "status", "gate_passed", "candidate_count", "ranked_count")
+        statement = statement.with_only_columns(*(getattr(PromotionPredictionRun, key) for key in fields))
+        with db.no_autoflush:
+            rows = (await db.execute(statement.order_by(
+                desc(PromotionPredictionRun.as_of_at), desc(PromotionPredictionRun.id)
+            ).limit(max(1, min(int(limit), 200))))).all()
+        return {"count": len(rows), "runs": [dict(zip(fields, row)) for row in rows]}
     rows = list(
         (
             await db.execute(
@@ -196,7 +207,99 @@ async def prediction_run_detail(
     run_id: int,
     include_features: bool = False,
     db: AsyncSession = Depends(get_db),
+    direction_only: bool = False,
 ):
+    if direction_only:
+        # Explicit historical read only: no initializer, autoflush, regeneration,
+        # identity-map substitution, or fallback to any other run.
+        from sqlalchemy import case
+        from app.api.v1.promotion import _PROMOTION_OFFICIAL_CONTEXT_WINDOWS
+        from app.core.trade_calendar import is_official_closed_day
+        from app.promotion.direction_research import project_frozen_direction_research
+        from app.promotion.versioning import PromotionRuntimeMode
+
+        public_fields = (
+            "id", "reference_trade_date", "as_of_at", "snapshot_context", "status",
+            "gate_passed", "candidate_count", "ranked_count", "model_version",
+            "data_version", "feature_version",
+        )
+        fields = public_fields + ("snapshot_source", "runtime_mode", "created_at", "completed_at")
+        with db.no_autoflush:
+            run = (await db.execute(select(
+                *(getattr(PromotionPredictionRun, key) for key in fields),
+            ).where(PromotionPredictionRun.id == run_id))).one_or_none()
+            if run is None:
+                raise HTTPException(status_code=404, detail="prediction run not found")
+            # Validate the full batch's lightweight identity/clock denominator,
+            # but do not transfer large second-board feature JSON for this view.
+            snapshots = (await db.execute(select(
+                PromotionPredictionSnapshot.code, PromotionPredictionSnapshot.name,
+                PromotionPredictionSnapshot.target_board, PromotionPredictionSnapshot.horizon_days,
+                PromotionPredictionSnapshot.prediction_trade_date, PromotionPredictionSnapshot.created_at,
+                PromotionPredictionSnapshot.record_key,
+                PromotionPredictionSnapshot.calibrated_probability,
+                case((PromotionPredictionSnapshot.target_board == 1,
+                      PromotionPredictionSnapshot.features_json), else_=None).label("features_json"),
+            ).where(PromotionPredictionSnapshot.run_id == run_id))).all()
+
+        def local_clock(value):
+            return isinstance(value, datetime) and value.tzinfo is None
+
+        window = (_PROMOTION_OFFICIAL_CONTEXT_WINDOWS.get(run.snapshot_context)
+                  if type(run.snapshot_context) is str else None)
+        batch_valid = bool(
+            run.status == "completed" and run.snapshot_source == "schedule"
+            and run.runtime_mode in tuple(mode.value for mode in PromotionRuntimeMode)
+            and run.gate_passed is True
+            and type(run.candidate_count) is int and run.candidate_count > 0
+            and len(snapshots) == run.candidate_count
+            and all(local_clock(value) for value in (run.as_of_at, run.created_at, run.completed_at))
+            and run.as_of_at <= run.created_at <= run.completed_at <= datetime.now()
+            and type(run.reference_trade_date) is date
+            and run.as_of_at.date() == run.reference_trade_date
+            and run.reference_trade_date.weekday() < 5
+            and not is_official_closed_day(run.reference_trade_date)
+            and window is not None
+            and window[0] <= (run.as_of_at.hour, run.as_of_at.minute) <= window[1]
+            and len({row.record_key for row in snapshots}) == len(snapshots)
+            and all(
+                row.target_board in (1, 2) and row.horizon_days == 1
+                and type(row.prediction_trade_date) is date
+                and row.prediction_trade_date <= run.reference_trade_date
+                and (row.target_board != 1 or row.prediction_trade_date == run.reference_trade_date)
+                and local_clock(row.created_at)
+                and run.as_of_at <= row.created_at <= run.completed_at
+                for row in snapshots
+            )
+        )
+
+        def frozen_object(raw):
+            def object_pairs(pairs):
+                obj = {}
+                for key, value in pairs:
+                    if key in obj:
+                        raise ValueError("duplicate frozen JSON field")
+                    obj[key] = value
+                return obj
+
+            def invalid_constant(value):
+                raise ValueError("non-finite frozen JSON")
+
+            try:
+                value = json.loads(raw, object_pairs_hook=object_pairs, parse_constant=invalid_constant)
+                return value if type(value) is dict else {}
+            except (TypeError, ValueError, RecursionError, OverflowError):
+                return {}
+
+        research = project_frozen_direction_research([
+            {"code": row.code, "name": row.name,
+             "limit_up_probability": row.calibrated_probability, "factors": frozen_object(row.features_json)}
+            for row in snapshots if row.target_board == 1
+        ], batch_valid=batch_valid)
+        return {
+            "run": {key: getattr(run, key) for key in public_fields},
+            "direction_research": research,
+        }
     await ensure_prediction_ledger_storage(db)
     run = await db.get(PromotionPredictionRun, run_id)
     if run is None:

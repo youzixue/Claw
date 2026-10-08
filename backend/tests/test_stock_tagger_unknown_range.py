@@ -140,17 +140,24 @@ def test_every_live_code_prefix_is_registered():
 
     用真实库快照，未登记号段一出现这里就红，而不是等到整批标记静默丢失。
     """
+    import os
     import sqlite3
     from pathlib import Path
 
-    db = Path(__file__).resolve().parents[1] / "claw.db"
-    if not db.exists():
+    # 隔离发布验收使用事先只读导出的完整代码快照，不连接运行库。
+    frozen_db = os.environ.get("CLAW_STOCK_TAG_TEST_DB")
+    db = Path(frozen_db) if frozen_db else Path(__file__).resolve().parents[1] / "claw.db"
+    if frozen_db:
+        assert db.is_file(), "显式指定的真实代码快照必须存在，不能降级跳过"
+    elif not db.exists():
         pytest.skip("本地开发库不存在，跳过真实快照护栏")
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         rows = conn.execute("SELECT DISTINCT code FROM stock_tags").fetchall()
     finally:
         conn.close()
+    if frozen_db:
+        assert rows, "发布快照代码分母不能为空"
     unknown = sorted(code for (code,) in rows if stock_tagger.get_board_type(code) == "unknown")
     assert unknown == [], f"存在未登记号段: {unknown[:20]}"
 

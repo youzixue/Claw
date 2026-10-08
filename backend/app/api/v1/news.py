@@ -467,17 +467,8 @@ async def _news_decision_window(db: AsyncSession) -> dict:
 
 
 def _news_item_from_row(row: FinanceNews) -> NewsItem:
-    return NewsItem(
-        source=row.source,
-        title=row.title,
-        content=row.content or "",
-        url=row.url or "",
-        publish_time=row.publish_time,
-        source_id=row.source_id or "",
-        category=row.category or "",
-        related_codes=_json_list(row.related_codes),
-        related_sectors=_json_list(row.related_sectors),
-    )
+    from app.news.engine import news_item_from_row
+    return news_item_from_row(row)
 
 
 async def _analyze_pending_window(
@@ -1105,6 +1096,13 @@ async def news_impact_map(
 ):
     """新闻影响映射到个股、板块与模拟盘持仓"""
     holding_codes, positions = await _open_holding_codes(db)
+    # News refresh owns rollback on article failure, which expires all ORM rows.
+    # Keep the original holding observation, not a later reload after refresh.
+    holding_snapshot = [
+        {"code": p.code, "name": p.name, "buy_price": p.buy_price,
+         "current_price": p.current_price, "profit_pct": p.profit_pct}
+        for p in positions
+    ]
     name_to_codes = await _stock_name_aliases(db)
     window = await _news_decision_window(db)
     rows = await _ensure_news_cache(db, limit=limit, refresh=refresh, since=window["since"], refresh_items=0)
@@ -1137,8 +1135,8 @@ async def news_impact_map(
     sector_rows = [{"sector_name": key, **item} for key, item in sectors.items()]
 
     holding_rows = []
-    for position in positions:
-        impact = stocks.get(position.code, {
+    for position in holding_snapshot:
+        impact = stocks.get(position["code"], {
             "news_count": 0,
             "bullish_count": 0,
             "bearish_count": 0,
@@ -1147,11 +1145,11 @@ async def news_impact_map(
             "latest_news": [],
         })
         holding_rows.append({
-            "code": position.code,
-            "name": position.name or name_map.get(position.code, ""),
-            "buy_price": position.buy_price,
-            "current_price": position.current_price,
-            "profit_pct": position.profit_pct,
+            "code": position["code"],
+            "name": position["name"] or name_map.get(position["code"], ""),
+            "buy_price": position["buy_price"],
+            "current_price": position["current_price"],
+            "profit_pct": position["profit_pct"],
             **impact,
         })
 

@@ -2508,7 +2508,9 @@ async def _enrich_stock_rows_with_b1(
         })
 
     enriched_rows = []
-    for row in rows:
+    for index, row in enumerate(rows):
+        if index % 8 == 0:
+            await asyncio.sleep(0)
         code = str(row.get("code") or "").strip()
         row_copy = dict(row)
         bars = [dict(item) for item in (kline_map.get(code) or [])]
@@ -15852,7 +15854,10 @@ async def _load_main_wave_plan_candidates(
     )
     fund_5d_map = {code: item["total"] for code, item in fund_window["items"].items()}
 
-    kline_result = await db.execute(
+    # Bound row materialization as well as Python processing. execute/all buffers
+    # the entire market before yielding, even with an asynchronous DB driver.
+    # These batch sizes govern scheduling only, never candidate/trading cutoffs.
+    kline_result = await db.stream(
         select(
             StockKline.code,
             StockKline.trade_date,
@@ -15866,27 +15871,44 @@ async def _load_main_wave_plan_candidates(
         ).where(
             StockKline.trade_date >= screening_earliest_date,
             StockKline.trade_date <= target_date,
-        ).order_by(StockKline.code, StockKline.trade_date)
+        ).order_by(StockKline.code, StockKline.trade_date).execution_options(yield_per=2048)
     )
 
     from collections import defaultdict
     grouped: dict[str, list[tuple[float, float, float, float, float, float, float, date]]] = defaultdict(list)
-    for code, _trade_date, open_price, close, high, low, volume, turnover, row_change_pct in kline_result.all():
-        if code not in spot_map:
-            continue
-        grouped[code].append((
-            _safe_float(open_price),
-            _safe_float(close),
-            _safe_float(high),
-            _safe_float(low),
-            _safe_float(volume),
-            _safe_float(turnover),
-            _safe_float(row_change_pct),
-            _trade_date,
-        ))
+    try:
+        async for batch in kline_result.partitions(2048):
+            for code, _trade_date, open_price, close, high, low, volume, turnover, row_change_pct in batch:
+                if code not in spot_map:
+                    continue
+                grouped[code].append((
+                    _safe_float(open_price),
+                    _safe_float(close),
+                    _safe_float(high),
+                    _safe_float(low),
+                    _safe_float(volume),
+                    _safe_float(turnover),
+                    _safe_float(row_change_pct),
+                    _trade_date,
+                ))
+            await asyncio.sleep(0)
+    except BaseException:
+        # Keep the read/cancellation exception if cursor cleanup also fails.
+        # A new cancellation during close still propagates (not an Exception).
+        try:
+            await kline_result.close()
+        except Exception:
+            logger.warning("K线流式游标关闭失败，保留原异常；不改变调用方事务")
+        raise
+    else:
+        # Own only this cursor; never commit/rollback the caller-owned session.
+        # Cleanup failure on an otherwise successful read must not publish data.
+        await kline_result.close()
 
     candidates: list[dict] = []
-    for code, rows in grouped.items():
+    for index, (code, rows) in enumerate(grouped.items()):
+        if index % 16 == 0:
+            await asyncio.sleep(0)
         # 60根可识别短结构；120/250日字段会按实际样本降级，绝不补造历史。
         if code in exclude_codes or len(rows) < 60:
             continue
@@ -16408,7 +16430,9 @@ async def _load_main_wave_plan_candidates(
         ))
 
     validated: list[dict] = []
-    for candidate in selected:
+    for index, candidate in enumerate(selected):
+        if index % 16 == 0:
+            await asyncio.sleep(0)
         code = str(candidate.get("code") or "")
         full_rows = full_grouped.get(code) or []
         if len(full_rows) < 120:

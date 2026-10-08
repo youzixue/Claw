@@ -75,7 +75,7 @@ async def test_auction_data_upserts_snapshot_time_and_fills_volume_ratio(auction
         )
 
     assert saved == 2
-    assert saved_again == 2
+    assert saved_again == 0  # 同一源帧被唯一键去重；返回实际新增行数而非候选数。
     assert total == 2
     assert row is not None
     assert row.open_change == pytest.approx(3.0)

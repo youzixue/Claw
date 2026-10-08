@@ -231,11 +231,12 @@ async def test_event_loop_failure_keeps_shadow_evidence_but_never_dispatches_ent
     scheduler._quote_round_payload = payload
     scheduler._quote_round_event.set()
     risk = AsyncMock(side_effect=ValueError("failed") if failed else None)
-    entries = AsyncMock()
+    entries = AsyncMock(return_value={"status": "completed"})
     shadow_modes = []
     async def shadows(_payload, *, execute_challengers=True):
         shadow_modes.append(execute_challengers)
         scheduler.scheduler.running = False
+        return {"status": "completed" if execute_challengers else "evidence_only"}
     monkeypatch.setattr(scheduler, "_run_quote_round_position_risk", risk)
     monkeypatch.setattr(scheduler, "_run_paper_accounts_isolated", entries)
     monkeypatch.setattr(scheduler, "_process_quote_round_shadow", shadows)
@@ -252,13 +253,13 @@ async def test_shadow_only_mode_never_calls_challenger_account_executor(risk_env
     scheduler, _, payload = risk_env
     first = AsyncMock(return_value={})
     shapes = AsyncMock(return_value={})
-    execute_accounts = AsyncMock(return_value={})
+    execute_accounts = AsyncMock(return_value={"status": "completed"})
     monkeypatch.setattr(momentum_retest_shadow, "scan_momentum_retest_shadow", first)
     monkeypatch.setattr(strategy_iteration_shadow, "scan_strategy_iteration_shadow", shapes)
     monkeypatch.setattr(strategy_iteration_challenger, "run_strategy_iteration_challenger_accounts", execute_accounts)
     await scheduler._process_quote_round_shadow(payload, execute_challengers=execute)
     assert first.await_count == shapes.await_count == 1
-    assert execute_accounts.await_count == int(execute)
+    assert execute_accounts.await_count == int(execute) * len(paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE)
 
 
 def _frame(index, *, at=AT, quality="ok"):
@@ -275,7 +276,7 @@ async def test_coalesced_trading_payload_does_not_coalesce_a2_evidence(risk_env,
     frames = [_frame(i) for i in range(3)]
     first = AsyncMock(return_value={})
     shapes = AsyncMock(return_value={})
-    executor = AsyncMock(return_value={})
+    executor = AsyncMock(return_value={"status": "completed"})
     monkeypatch.setattr(momentum_retest_shadow, "scan_momentum_retest_shadow", first)
     monkeypatch.setattr(strategy_iteration_shadow, "scan_strategy_iteration_shadow", shapes)
     monkeypatch.setattr(strategy_iteration_challenger, "run_strategy_iteration_challenger_accounts", executor)
@@ -287,7 +288,10 @@ async def test_coalesced_trading_payload_does_not_coalesce_a2_evidence(risk_env,
     assert [call.args[2] for call in first.await_args_list] == [f["committed_at"] for f in frames]
     assert all(call.kwargs["coverage_loss"] is None for call in first.await_args_list)
     # 历史帧只给A2纯行情路径，绝不重放资金/板块扫描或任何隔离账户订单。
-    assert shapes.await_count == executor.await_count == 1
+    assert shapes.await_count == 1
+    assert executor.await_count == len(paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE)
+    assert all(call.kwargs["now"] == frames[-1]["committed_at"] for call in executor.await_args_list)
+    assert {call.kwargs["account_name"] for call in executor.await_args_list} == set(paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE.values())
     assert shapes.await_args.args[1] is frames[-1]["records"]
     assert not scheduler._momentum_quote_inbox
     await scheduler._drain_momentum_quote_rounds(frames[-1])

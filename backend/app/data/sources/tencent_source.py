@@ -42,8 +42,10 @@ class TencentSource(DataSourceBase):
     # 腾讯行情URL模板
     SPOT_URL = "https://qt.gtimg.cn/q="
 
-    def __init__(self):
+    def __init__(self, *, capture_response_observed_at: bool = False):
         super().__init__()
+        # Auction-only provenance; ordinary spot payloads retain their schema.
+        self._capture_response_observed_at = capture_response_observed_at
         # 盘口差分只属于当前实例、当前源交易日；进程内多实例和跨日均不得串用。
         self._previous_orderbook: dict[str, dict] = {}
         self._orderbook_trade_date = None
@@ -467,6 +469,10 @@ class TencentSource(DataSourceBase):
                         received_at=batch_received_at,
                     )
                     if spot and spot["price"] > 0:  # 过滤停牌/无效
+                        if self._capture_response_observed_at:
+                            # Actual per-response parse observation, before gather
+                            # or an unrelated slow batch/rescue can finish.
+                            spot["observed_at"] = datetime.now()
                         parsed.append(spot)
                 return parsed
 
@@ -506,6 +512,10 @@ class TencentSource(DataSourceBase):
                     received_at=rescue_received_at,
                 )
                 if spot and spot["price"] > 0:
+                    if self._capture_response_observed_at:
+                        # Rescue clocks are measured here, never backdated to
+                        # the earlier async collection or provider timestamp.
+                        spot["observed_at"] = datetime.now()
                     all_spots.append(spot)
             coverage_ratio = len(all_spots) / len(codes) if codes else 1.0
             if rescue_raw:

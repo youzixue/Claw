@@ -7,7 +7,7 @@ async function openReview(page, metrics, empty = false, candidates = {}) {
   const errors = []
   page.on('pageerror', error => errors.push(error.message))
   const row = { actual_trade_date: '2026-09-09', prediction_trade_date: '2026-09-08', ...metrics }
-  await page.route('**/api/v1/promotion/**', async route => {
+  await page.route('**/api/v1/**', async route => {
     const review = {
       latest: row,
       aggregate: { ...row, launch_precursor_metrics: empty ? {} : { fixture: { label: '测试分组', sample_count: 10, ...metrics } } },
@@ -17,6 +17,7 @@ async function openReview(page, metrics, empty = false, candidates = {}) {
     await route.fulfill({ json: url.includes('/learning-review') ? review : url.includes('/candidates') ? candidates : {} })
   })
   await page.goto(`${WEB_URL}/promotion`, { waitUntil: 'networkidle' })
+  await page.getByRole('tab', { name: '预测复盘', exact: true }).click()
   await expect(page.getByTestId('review-directional-latest')).toBeVisible()
   return errors
 }
@@ -66,6 +67,7 @@ test('legacy, null and empty rates remain unavailable on mobile with preserved e
   await expect(page.getByTestId('review-directional-daily')).toContainText('暂无逐日复盘')
   await expect(page.getByTestId('review-directional-cohorts')).toContainText('等待新版正式快照积累样本')
   await expect(page.getByTestId('review-directional-contract')).toContainText('未承诺、未认证')
+  await page.getByRole('tab', { name: '晋级候选', exact: true }).click()
   await expect(page.getByTestId('first-board-top12-table')).toContainText('暂无首板观察标的')
   await expect(page.getByRole('button', { name: '导出', exact: true })).toBeAttached()
   expect(errors).toEqual([])
@@ -135,6 +137,7 @@ test('research ranking stays separate from production and reports probability me
       production_unchanged: true, manual_review_eligible: false,
     },
   })
+  await page.getByRole('tab', { name: '研究观察', exact: true }).click()
   const panel = page.getByTestId('direction-research-panel')
   const table = page.getByTestId('direction-research-table')
   await expect(panel).toContainText('候选不足 · 不补齐旧榜')
@@ -145,6 +148,7 @@ test('research ranking stays separate from production and reports probability me
   await expect(table).toContainText('2.0%')
   await expect(table).toContainText('neutral_prior_insufficient_sample / 样本不足')
   await expect(table).not.toContainText('原生产榜')
+  await page.getByRole('tab', { name: '晋级候选', exact: true }).click()
   await expect(page.getByTestId('first-board-top12-table')).toContainText('原生产榜')
 })
 
@@ -153,21 +157,29 @@ test('old API does not backfill research ranking from the production table', asy
   await openReview(page, {}, true, {
     ranked_first_board_candidates: [{ code: '600099', name: '仅原榜', probability: 0.9 }],
   })
+  await page.getByRole('tab', { name: '研究观察', exact: true }).click()
   await expect(page.getByTestId('direction-research-table')).toContainText('等待新冻结批次，不补旧榜')
   await expect(page.getByTestId('direction-research-table')).not.toContainText('仅原榜')
+  await page.getByRole('tab', { name: '晋级候选', exact: true }).click()
   await expect(page.getByTestId('first-board-top12-table')).toContainText('仅原榜')
 })
 
 test('blocked ranking cannot expose stale candidates and null direction never uses limit-up probability', async ({ page }) => {
   await openReview(page, {}, true, { direction_research: {
+    version: 'direction_rank_research_v1', label_version: 'next_day_close_up_v1',
+    production_unchanged: true, manual_review_eligible: false,
     scope: 'research_only', status: 'blocked', candidates: [researchCandidate('600001', 0.7, 1)],
     reason: 'eligible_direction_probability_missing', missing_probability_count: 1,
   } })
+  await page.getByRole('tab', { name: '研究观察', exact: true }).click()
   await expect(page.getByTestId('direction-research-table')).toContainText('研究榜阻塞')
   await expect(page.getByTestId('direction-research-table')).not.toContainText('600001')
   await openReview(page, {}, true, { direction_research: {
-    scope: 'research_only', status: 'available', candidates: [researchCandidate('600001', null, 1, 'unknown')],
+    version: 'direction_rank_research_v1', label_version: 'next_day_close_up_v1',
+    production_unchanged: true, manual_review_eligible: false, selected_count: 1,
+    scope: 'research_only', status: 'insufficient_candidates', candidates: [researchCandidate('600001', null, 1, 'unknown')],
   } })
+  await page.getByRole('tab', { name: '研究观察', exact: true }).click()
   const row = page.getByTestId('direction-research-table').locator('.el-table__body-wrapper tbody tr').first()
   await expect(row.locator('td').nth(2)).toHaveText('--')
   await expect(row.locator('td').nth(3)).toHaveText('2.0%')

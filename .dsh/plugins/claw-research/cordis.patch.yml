@@ -1,0 +1,20 @@
+- insert:
+    - id: claw-ashare-readonly
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: claw_ashare
+        transport: stdio
+        command: /Library/Frameworks/Python.framework/Versions/3.11/bin/python3
+        args:
+          - /Users/youzix/WorkBuddy/Claw/backend/scripts/ashare_review_mcp.py
+        cwd: /Users/youzix/WorkBuddy/Claw
+        env:
+          CLAW_API_BASE_URL: http://127.0.0.1:8000/api/v1
+          CLAW_RESEARCH_CONTRACT: claw_two_phase_v1
+          CLAW_RESEARCH_READER_REVISION: '1.3.2-active-identity-news-pages-readable'
+          PYTHONDONTWRITEBYTECODE: '1'
+          TZ: Asia/Shanghai
+        failOnStartupError: true
+        toolCallTimeoutMs: 60000
+    - id: claw-review-automation
+      name: 'file:///Users/youzix/WorkBuddy/Claw/.dsh/plugins/claw-research/automation-native-schedule.mjs'

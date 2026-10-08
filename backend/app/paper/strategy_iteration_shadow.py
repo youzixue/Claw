@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.settings import settings
 from app.data.auction_evidence import auction_evidence_status
 from app.data.fund_flow_clock import local_clock
-from app.paper.account_policy import route_signal_policy
+from app.paper.account_policy import route_signal_policy, challenger_execution_policy
 from app.core.price_limit_rules import is_limit_up_change
 from app.core.stock_tagger import stock_tagger
 from app.models.paper import PaperShadowEvaluation, PaperShadowEvent
@@ -57,6 +57,53 @@ from app.data.price_chain import (
     PRICE_CHAIN_MAX_ABS_GAP as _PRICE_CHAIN_MAX_ABS_GAP,
     FORMAL_CLOSE_SOURCES as _FORMAL_CLOSE_SOURCES,
 )
+
+
+def _capture_candidate_projection(route_id, scan_at, *, code="MARKET", quote=None,
+                                  stage, reason, original_candidate=False,
+                                  original_confirmed=None, original_gate=None,
+                                  gate_inputs=None, identities=None, rules=None,
+                                  version=None, evidence_ref=None, metrics=None,
+                                  source_contract=None):
+    """Best-effort leaf handoff only; never mutate production events or transactions."""
+    try:
+        from app.paper.candidate_shadow import capture_frame
+
+        route, account = {
+            ROUTE_B: ("B2", "challenger_b"), ROUTE_C: ("C2", "challenger_c"),
+            ROUTE_D: ("D2", "challenger_d"), ROUTE_F2: ("F2", "challenger_f2"),
+            ROUTE_C3: ("C3", None),
+        }[route_id]
+        q = quote or {}
+        scan_id = str(q.get("quote_round_id") or f"shadow:{scan_at.isoformat()}")
+        at = datetime.now()  # actual predicate completion, never the quote/source clock
+        production_version = version or route_version_for(route_id)
+        identity = dict(identities or {})
+        if stage == "confirmed" and original_confirmed is True:
+            identity["original_confirmed_at"] = at
+        capture_frame({
+            "route": route, "account_id": None, "account_name": account,
+            "production_version": production_version,
+            # Original structure is day/route/version scoped; scan is only a receipt.
+            # Resets clear the experiment segment, never manufacture a new origin.
+            "episode_id": f"{route}:{production_version}:{scan_at.date().isoformat()}:{code}",
+            "code": code, "name": str(q.get("name") or code),
+            "observed_at": at, "producer_reported_at": scan_at, "scan_id": scan_id,
+            "evidence_ref": evidence_ref or f"{scan_id}:{route}:{code}:{stage}",
+            "stage": stage, "reason": reason,
+            "original_candidate": original_candidate,
+            "original_confirmed": original_confirmed, "original_gate": original_gate,
+            "quote": q, "gate_inputs": gate_inputs or {},
+            "rule_snapshot": rules if rules is not None else _rules(route_id),
+            "identities": identity, "source_contract": source_contract,
+            "relative_strength_pct": (metrics or {}).get("relative_strength_pct")
+                if route_id != ROUTE_C3 else None,
+            "sector_relative_strength_pct": (metrics or {}).get("relative_strength_pct")
+                if route_id == ROUTE_C3 else None,
+        })
+    except Exception:
+        # Includes an unavailable/disabled optional runtime and malformed audit input.
+        pass
 
 
 def route_version_for(route_id: str) -> str:
@@ -101,6 +148,8 @@ def _first_board_activation_date() -> date | None:
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
+    if isinstance(value, bool):
+        return default
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -277,6 +326,7 @@ def _reclaim_confirmed(
     max_open_pct: float | None = None,
     max_low_pct: float | None = None,
     route_id: str = ROUTE_B,
+    evidence: dict | None = None,
 ) -> bool:
     """Fail closed unless a reclaim is both strong and currently fillable."""
 
@@ -301,6 +351,10 @@ def _reclaim_confirmed(
         if high is not None and price is not None and high > 0 and high >= price
         else None
     )
+    if evidence is not None:
+        evidence.update(relative_strength_pct=relative_strength_pct,
+                        pullback_from_high_pct=pullback_from_high_pct,
+                        market_change_pct=market_change_pct)
     if (
         price is None
         or prev_close is None
@@ -392,6 +446,7 @@ async def _first_board_sector_contexts(
                 "missing_mapping": len(codes - mapped_codes),
                 "missing_current_sector_persistence": len(mapped_codes),
                 "non_causal_context_only": 0,
+                "sector_clock_unproven": 0,
                 "below_structural_sector_floor": 0,
             },
         }
@@ -415,6 +470,7 @@ async def _first_board_sector_contexts(
     persistence_context_codes: set[str] = set()
     causal_context_codes: set[str] = set()
     structural_context_codes: set[str] = set()
+    sector_clock_unproven_codes: set[str] = set()
     for mapping in mappings:
         mapping_code = str(mapping.code or "")
         sector_code = str(mapping.sector_code or "")
@@ -436,6 +492,13 @@ async def _first_board_sector_contexts(
         if not _is_causal_trade_driver_sector(mapping_leaf):
             continue
         causal_context_codes.add(mapping_code)
+        sector_at = local_clock(getattr(persistence, "observed_at", None))
+        if (sector_at is None or sector_at.date() != trade_date
+                or sector_at > observed_at):
+            # A trade-date upsert may already contain a later intraday/close
+            # state. Never splice it into an earlier quote confirmation.
+            sector_clock_unproven_codes.add(mapping_code)
+            continue
         strength = _safe_float(persistence.strength_score)
         change_pct = _safe_float(persistence.change_pct)
         fund_flow = _safe_float(persistence.fund_flow)
@@ -455,6 +518,8 @@ async def _first_board_sector_contexts(
         contexts_by_code[mapping_code].append({
             **mapping_leaf,
             "sector_trade_date": trade_date.isoformat(),
+            "sector_observed_at": sector_at.isoformat(),
+            "sector_visibility_contract": "c3_sector_observed_clock_v1",
             "sector_strength": round(strength, 4),
             "sector_change_pct": round(change_pct, 4),
             "sector_fund_flow": round(fund_flow, 4),
@@ -498,8 +563,9 @@ async def _first_board_sector_contexts(
             "non_causal_context_only": len(
                 persistence_context_codes - causal_context_codes
             ),
+            "sector_clock_unproven": len(sector_clock_unproven_codes),
             "below_structural_sector_floor": len(
-                causal_context_codes - structural_context_codes
+                causal_context_codes - structural_context_codes - sector_clock_unproven_codes
             ),
         },
     }
@@ -535,35 +601,30 @@ def _first_board_eligibility(
             high is not None and limit_up is not None and limit_up > 0 and high >= limit_up * 0.998
         ),
     }
-    eligible = bool(
-        price is not None
-        and price > 0
-        and prev_close is not None
-        and prev_close > 0
-        and high is not None
-        and high >= price
-        and limit_up is not None
-        and limit_up > 0
-        and high < limit_up * 0.998
-        and ask is not None
-        and ask > 0
-        and ask_volume is not None
-        and ask_volume > 0
-        and change_pct is not None
-        and settings.PAPER_FIRST_BOARD_SHADOW_MIN_CHANGE_PCT
-        <= change_pct
-        <= settings.PAPER_FIRST_BOARD_SHADOW_MAX_CHANGE_PCT
-        and volume_ratio is not None
-        and volume_ratio >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_VOLUME_RATIO
-        and sector_strength is not None
-        and sector_strength >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_SECTOR_STRENGTH
-        and sector_change is not None
-        and sector_change >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_SECTOR_CHANGE_PCT
-        and sector_flow is not None
-        and sector_flow > 0
-        and sector_limit_ups >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_SECTOR_LIMIT_UP_COUNT
+    # The predicate and its diagnostics have one source of truth. Keep the
+    # original thresholds/rounding; these codes are not a looser entry route.
+    checks = (
+        ("price_invalid", price is not None and price > 0),
+        ("prev_close_invalid", prev_close is not None and prev_close > 0),
+        ("high_invalid", high is not None and price is not None and high >= price),
+        ("limit_up_invalid", limit_up is not None and limit_up > 0),
+        ("already_touched_limit", not metrics["already_touched_limit"]),
+        ("offer_unavailable", metrics["valid_offer"]),
+        ("change_pct_gate", change_pct is not None
+         and settings.PAPER_FIRST_BOARD_SHADOW_MIN_CHANGE_PCT <= change_pct
+         <= settings.PAPER_FIRST_BOARD_SHADOW_MAX_CHANGE_PCT),
+        ("volume_ratio_gate", volume_ratio is not None
+         and volume_ratio >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_VOLUME_RATIO),
+        ("sector_strength_gate", sector_strength is not None
+         and sector_strength >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_SECTOR_STRENGTH),
+        ("sector_change_gate", sector_change is not None
+         and sector_change >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_SECTOR_CHANGE_PCT),
+        ("sector_flow_gate", sector_flow is not None and sector_flow > 0),
+        ("sector_limit_up_count_gate",
+         sector_limit_ups >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_SECTOR_LIMIT_UP_COUNT),
     )
-    return eligible, metrics
+    metrics["eligibility_gate_issues"] = [code for code, passed in checks if not passed]
+    return not metrics["eligibility_gate_issues"], metrics
 
 
 def _first_board_confirmation_frame(
@@ -599,21 +660,21 @@ def _first_board_confirmation_frame(
         ),
         "orderbook_imbalance": orderbook,
     })
-    confirmed_frame = bool(
-        eligible
-        and price is not None
-        and avg_price is not None
-        and avg_price > 0
-        and price >= avg_price
-        and pullback_pct is not None
-        and pullback_pct <= settings.PAPER_FIRST_BOARD_SHADOW_MAX_PULLBACK_FROM_HIGH_PCT
-        and relative_strength_pct is not None
-        and relative_strength_pct
-        >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_RELATIVE_STRENGTH_PCT
-        and orderbook is not None
-        and orderbook >= settings.PAPER_STRATEGY_ITERATION_MIN_ORDERBOOK_IMBALANCE
+    checks = (
+        ("vwap_gate", price is not None and avg_price is not None
+         and avg_price > 0 and price >= avg_price),
+        ("pullback_gate", pullback_pct is not None
+         and pullback_pct <= settings.PAPER_FIRST_BOARD_SHADOW_MAX_PULLBACK_FROM_HIGH_PCT),
+        ("relative_strength_gate", relative_strength_pct is not None
+         and relative_strength_pct >= settings.PAPER_FIRST_BOARD_SHADOW_MIN_RELATIVE_STRENGTH_PCT),
+        ("orderbook_gate", orderbook is not None
+         and orderbook >= settings.PAPER_STRATEGY_ITERATION_MIN_ORDERBOOK_IMBALANCE),
     )
-    return confirmed_frame, metrics
+    metrics["confirmation_gate_issues"] = [
+        *metrics["eligibility_gate_issues"],
+        *(code for code, passed in checks if not passed),
+    ]
+    return eligible and not metrics["confirmation_gate_issues"], metrics
 
 
 def _first_board_confirmation_time(at: datetime) -> bool:
@@ -702,7 +763,11 @@ def _first_board_session_observation_health(
     frame_times: Iterable[datetime],
     trade_day: date,
 ) -> dict[str, Any]:
-    """Prove that an unconfirmed C3 candidate was actually observed all day."""
+    """Prove C3 coverage, using a real bounded bracket at the route cutoff.
+
+    A post-cutoff frame proves the endpoint only; it cannot extend confirmation
+    time or supply missing in-window samples. Historical versions are not relabeled.
+    """
 
     timeline = sorted({
         item
@@ -772,10 +837,29 @@ def _first_board_session_observation_health(
     morning_last_frame_at = morning_frames[-1] if morning_frames else None
     afternoon_first_frame_at = afternoon_frames[0] if afternoon_frames else None
     last_frame_at = afternoon_frames[-1] if afternoon_frames else None
+    cutoff = datetime.combine(trade_day, last_required)
+    # Polling generally lands between clock boundaries. Requiring an exact
+    # 14:30:00 tick after excluding all later frames made coverage unattainable.
+    # The first real later healthy frame may bracket the cutoff, but only across
+    # the SAME already-configured maximum gap. It never adds to sample counts.
+    after_cutoff = next((
+        item for item in timeline
+        if cutoff < item <= datetime.combine(trade_day, time(15, 0))
+    ), None)
+    route_end_bracket_gap = (
+        (after_cutoff - last_frame_at).total_seconds()
+        if after_cutoff is not None and last_frame_at is not None else None
+    )
+    route_end_coverage_at = (
+        last_frame_at if last_frame_at == cutoff else after_cutoff
+        if route_end_bracket_gap is not None and route_end_bracket_gap <= max_gap_allowed
+        else None
+    )
+    observed_frame_count = len(morning_frames) + len(afternoon_frames)
     morning_required = min_morning_frames > 0
     afternoon_required = min_afternoon_frames > 0
     checks = {
-        "enough_frames": len(timeline) >= min_frames,
+        "enough_frames": observed_frame_count >= min_frames,
         "enough_morning_frames": len(morning_frames) >= min_morning_frames,
         "enough_afternoon_frames": len(afternoon_frames) >= min_afternoon_frames,
         "started_on_time": bool(
@@ -798,7 +882,7 @@ def _first_board_session_observation_health(
         ),
         "covered_route_end": bool(
             not afternoon_required
-            or (last_frame_at is not None and last_frame_at.time() >= last_required)
+            or route_end_coverage_at is not None
         ),
         "morning_gap_acceptable": bool(
             not morning_required
@@ -814,7 +898,9 @@ def _first_board_session_observation_health(
     }
     return {
         "complete": all(checks.values()),
-        "frame_count": len(timeline),
+        "frame_count": observed_frame_count,
+        "provided_frame_count": len(timeline),
+        "coverage_semantics": "bracketed_route_end_v2",
         "minimum_frame_count": min_frames,
         "morning_frame_count": len(morning_frames),
         "minimum_morning_frame_count": min_morning_frames,
@@ -833,6 +919,12 @@ def _first_board_session_observation_health(
             timespec="minutes"
         ),
         "last_frame_at": last_frame_at.isoformat() if last_frame_at else None,
+        "route_end_coverage_at": (
+            route_end_coverage_at.isoformat() if route_end_coverage_at else None
+        ),
+        "route_end_bracket_gap_sec": (
+            0.0 if last_frame_at == cutoff else route_end_bracket_gap
+        ),
         "last_frame_not_before": last_required.isoformat(timespec="minutes"),
         "morning_maximum_gap_sec": morning_max_gap,
         "afternoon_maximum_gap_sec": afternoon_max_gap,
@@ -844,6 +936,7 @@ def _first_board_session_observation_health(
 
 def _rules(route_id: str) -> dict[str, Any]:
     common = {
+        "quote_numeric_contract": "finite_nonbool_quote_v1",
         "shadow_only": True,
         "champion_order_connected": False,
         "challenger_paper_account_connected": bool(
@@ -900,6 +993,7 @@ def _rules(route_id: str) -> dict[str, Any]:
             "confirm_end": settings.PAPER_STRATEGY_B_WEAK_OPEN_CONFIRM_END,
         },
         ROUTE_C: {
+            "confirmed_path_contract": "c2_confirmed_path_terminal_v1",
             "structure": "latest_limit_up_then_1_to_4_break_sessions",
             "gap_sessions": [
                 settings.PAPER_STRATEGY_C_RELAUNCH_MIN_GAP_SESSIONS,
@@ -914,6 +1008,7 @@ def _rules(route_id: str) -> dict[str, Any]:
         },
         ROUTE_C3: {
             "continuity_semantics": "c3_continuity_v2",
+            "sector_visibility_contract": "c3_sector_observed_clock_v1",
             "source_quote_clock_required": True,
             "source_quote_max_age_sec": settings.ANOMALY_QUOTE_MAX_AGE_SEC,
             "confirmation_clock_jitter_sec": settings.PAPER_CONFIRMATION_CLOCK_JITTER_SEC,
@@ -954,6 +1049,7 @@ def _rules(route_id: str) -> dict[str, Any]:
             ),
             "confirm_end": settings.PAPER_FIRST_BOARD_SHADOW_CONFIRM_END,
             "session_observation": {
+                "coverage_semantics": "bracketed_route_end_v2",
                 "minimum_frames": settings.PAPER_FIRST_BOARD_SHADOW_MIN_SESSION_FRAMES,
                 "minimum_morning_frames": settings.PAPER_FIRST_BOARD_SHADOW_MIN_MORNING_FRAMES,
                 "minimum_afternoon_frames": settings.PAPER_FIRST_BOARD_SHADOW_MIN_AFTERNOON_FRAMES,
@@ -968,6 +1064,7 @@ def _rules(route_id: str) -> dict[str, Any]:
         },
         ROUTE_D: {
             "structure": "observed_pre0920_negative_auction_then_0925_recovery",
+            "path_selection": "verified_source_clock_first_v2",
             "baseline_max_pct": settings.PAPER_STRATEGY_D_AUCTION_BASELINE_MAX_PCT,
             "final_min_pct": settings.PAPER_STRATEGY_D_AUCTION_FINAL_MIN_PCT,
             "min_recovery_ppt": settings.PAPER_STRATEGY_D_AUCTION_MIN_RECOVERY_PPT,
@@ -1148,6 +1245,108 @@ async def _persist_events(
     return new_rows
 
 
+async def _load_confirmation_state(
+    db: AsyncSession,
+    trade_date: date,
+    observed_at: datetime,
+    route_versions: dict[str, str],
+    c3_history_sec: int,
+):
+    """Replay complete confirmation state; close history before C3 identity read.
+
+    Only local state changes here. Any read/processing/cleanup failure propagates;
+    transaction ownership and event persistence remain with the caller.
+    """
+    import asyncio
+
+    prior_confirmation_events = await db.stream(
+        select(
+            PaperShadowEvent.id,
+            PaperShadowEvent.route_id,
+            PaperShadowEvent.route_version,
+            PaperShadowEvent.code,
+            PaperShadowEvent.event_type,
+            PaperShadowEvent.observed_at,
+            PaperShadowEvent.snapshot_json,
+        ).where(
+            PaperShadowEvent.trade_date == trade_date,
+            or_(*(and_(
+                PaperShadowEvent.route_id == route_id,
+                PaperShadowEvent.route_version == version,
+            ) for route_id, version in route_versions.items())),
+            PaperShadowEvent.observed_at <= observed_at,
+            or_(
+                PaperShadowEvent.route_id != ROUTE_C3,
+                and_(
+                    PaperShadowEvent.route_version == route_versions[ROUTE_C3],
+                    PaperShadowEvent.observed_at >= observed_at - timedelta(seconds=c3_history_sec),
+                ),
+            ),
+            PaperShadowEvent.event_type.in_(
+                ("confirmation_sample", "confirmation_reset", "confirmed")
+            ),
+        ).order_by(PaperShadowEvent.observed_at, PaperShadowEvent.id).execution_options(yield_per=128)
+    )
+    try:
+        confirmation_samples: dict[tuple[str, str], list[datetime]] = defaultdict(list)
+        confirmation_avg_prices: dict[
+            tuple[str, str], dict[datetime, float]
+        ] = defaultdict(dict)
+        confirmation_sources: dict[tuple[str, str], dict[datetime, datetime]] = defaultdict(dict)
+        latest_sources: dict[tuple[str, str], datetime] = {}
+        confirmed_route_codes: set[tuple[str, str]] = set()
+        async for partition in prior_confirmation_events.partitions(128):
+            for event_row in partition:
+                route_code = (str(event_row.route_id), str(event_row.code))
+                if event_row.event_type == "confirmation_reset":
+                    confirmation_samples[route_code].clear()
+                    confirmation_avg_prices[route_code].clear()
+                    confirmation_sources[route_code].clear()
+                    boundary = local_clock(_parse_datetime(
+                        _json_dict(_json_dict(event_row.snapshot_json).get("prior_structure")).get("source_boundary_at")
+                    ))
+                    if boundary is not None:
+                        latest_sources[route_code] = max(boundary, latest_sources.get(route_code, boundary))
+                elif event_row.event_type == "confirmation_sample":
+                    confirmation_samples[route_code].append(event_row.observed_at)
+                    snapshot = _json_dict(event_row.snapshot_json)
+                    quote_leaf = (
+                        snapshot.get("quote")
+                        if isinstance(snapshot.get("quote"), dict)
+                        else {}
+                    )
+                    source_at = local_clock(_parse_datetime(quote_leaf.get("source_quote_at")))
+                    if source_at is not None:
+                        confirmation_sources[route_code][event_row.observed_at] = source_at
+                        latest_sources[route_code] = max(source_at, latest_sources.get(route_code, source_at))
+                    average = _safe_float(quote_leaf.get("avg_price"))
+                    if average is not None and average > 0:
+                        confirmation_avg_prices[route_code][event_row.observed_at] = average
+                elif event_row.event_type == "confirmed":
+                    confirmed_route_codes.add(route_code)
+            await asyncio.sleep(0)
+    except BaseException:
+        try:
+            await prior_confirmation_events.close()
+        except BaseException:
+            pass  # Preserve the active read/processing/cancellation exception.
+        raise
+    else:
+        await prior_confirmation_events.close()
+    confirmed_route_codes.update(
+        (ROUTE_C3, str(code)) for code in (await db.scalars(
+            select(PaperShadowEvent.code).where(
+                PaperShadowEvent.route_id == ROUTE_C3,
+                PaperShadowEvent.route_version == route_versions[ROUTE_C3],
+                PaperShadowEvent.trade_date == trade_date,
+                PaperShadowEvent.observed_at <= observed_at,
+                PaperShadowEvent.event_type == "confirmed",
+            )
+        )).all()
+    )
+    return confirmation_samples, confirmation_avg_prices, confirmation_sources, latest_sources, confirmed_route_codes
+
+
 async def scan_strategy_iteration_shadow(
     db: AsyncSession,
     quotes: Iterable[Mapping[str, Any]],
@@ -1157,13 +1356,22 @@ async def scan_strategy_iteration_shadow(
 
     observed_at = local_clock(observed_at)
     if observed_at is None:
+        for route_id in ROUTE_IDS:
+            _capture_candidate_projection(route_id, datetime.now(), stage="not_scanned",
+                                          reason="invalid_observation_clock")
         return {"events": 0, "confirmed": 0, "routes": {}}
     if not (
         settings.PAPER_STRATEGY_ITERATION_SHADOW_ENABLED
         or settings.PAPER_FIRST_BOARD_SHADOW_ENABLED
     ):
+        for route_id in ROUTE_IDS:
+            _capture_candidate_projection(route_id, observed_at, stage="not_scanned",
+                                          reason="producer_disabled")
         return {"events": 0, "confirmed": 0, "routes": {}}
     if observed_at.time() < time(9, 25) or observed_at.time() > time(14, 50):
+        for route_id in ROUTE_IDS:
+            _capture_candidate_projection(route_id, observed_at, stage="not_scanned",
+                                          reason="outside_producer_window")
         return {"events": 0, "confirmed": 0, "routes": {}}
 
     trade_date = observed_at.date()
@@ -1214,96 +1422,78 @@ async def scan_strategy_iteration_shadow(
     # The window exceeds source freshness: a source at/before an excluded reset
     # cannot become admissible merely because that reset fell outside this query.
     c3_history_sec = _c3_confirmation_history_seconds()
-    prior_confirmation_events = list(
-        (
-            await db.execute(
-                select(
-                    PaperShadowEvent.id,
-                    PaperShadowEvent.route_id,
-                    PaperShadowEvent.route_version,
-                    PaperShadowEvent.code,
-                    PaperShadowEvent.event_type,
-                    PaperShadowEvent.observed_at,
-                    PaperShadowEvent.snapshot_json,
-                ).where(
-                    PaperShadowEvent.trade_date == trade_date,
-                    or_(*(and_(
-                        PaperShadowEvent.route_id == route_id,
-                        PaperShadowEvent.route_version == version,
-                    ) for route_id, version in route_versions.items())),
-                    PaperShadowEvent.observed_at <= observed_at,
-                    or_(
-                        PaperShadowEvent.route_id != ROUTE_C3,
-                        and_(
-                            PaperShadowEvent.route_version == route_versions[ROUTE_C3],
-                            PaperShadowEvent.observed_at >= observed_at - timedelta(seconds=c3_history_sec),
-                        ),
-                    ),
-                    PaperShadowEvent.event_type.in_(
-                        ("confirmation_sample", "confirmation_reset", "confirmed")
-                    ),
-                ).order_by(PaperShadowEvent.observed_at, PaperShadowEvent.id)
-            )
-        ).all()
+    (
+        confirmation_samples,
+        confirmation_avg_prices,
+        confirmation_sources,
+        latest_sources,
+        confirmed_route_codes,
+    ) = await _load_confirmation_state(
+        db, trade_date, observed_at, route_versions, c3_history_sec,
     )
-    confirmation_samples: dict[tuple[str, str], list[datetime]] = defaultdict(list)
-    confirmation_avg_prices: dict[
-        tuple[str, str], dict[datetime, float]
-    ] = defaultdict(dict)
-    confirmation_sources: dict[tuple[str, str], dict[datetime, datetime]] = defaultdict(dict)
-    latest_sources: dict[tuple[str, str], datetime] = {}
-    confirmed_route_codes: set[tuple[str, str]] = {
-        (ROUTE_C3, str(code)) for code in (await db.scalars(
-            select(PaperShadowEvent.code).where(
-                PaperShadowEvent.route_id == ROUTE_C3,
-                PaperShadowEvent.route_version == route_versions[ROUTE_C3],
-                PaperShadowEvent.trade_date == trade_date,
-                PaperShadowEvent.observed_at <= observed_at,
-                PaperShadowEvent.event_type == "confirmed",
-            )
-        )).all()
-    }
-    for event_row in prior_confirmation_events:
-        route_code = (str(event_row.route_id), str(event_row.code))
-        if event_row.event_type == "confirmation_reset":
-            confirmation_samples[route_code].clear()
-            confirmation_avg_prices[route_code].clear()
-            confirmation_sources[route_code].clear()
-            boundary = local_clock(_parse_datetime(
-                _json_dict(_json_dict(event_row.snapshot_json).get("prior_structure")).get("source_boundary_at")
-            ))
-            if boundary is not None:
-                latest_sources[route_code] = max(boundary, latest_sources.get(route_code, boundary))
-        elif event_row.event_type == "confirmation_sample":
-            confirmation_samples[route_code].append(event_row.observed_at)
-            snapshot = _json_dict(event_row.snapshot_json)
-            quote_leaf = (
-                snapshot.get("quote")
-                if isinstance(snapshot.get("quote"), dict)
-                else {}
-            )
-            source_at = local_clock(_parse_datetime(quote_leaf.get("source_quote_at")))
-            if source_at is not None:
-                confirmation_sources[route_code][event_row.observed_at] = source_at
-                latest_sources[route_code] = max(source_at, latest_sources.get(route_code, source_at))
-            average = _safe_float(quote_leaf.get("avg_price"))
-            if average is not None and average > 0:
-                confirmation_avg_prices[route_code][event_row.observed_at] = average
-        elif event_row.event_type == "confirmed":
-            confirmed_route_codes.add(route_code)
+
+    # Only track still-executable first C2 tokens. Read small identity leaves,
+    # not the all-day universe, and stop after TTL or a durable segment reset.
+    active_confirmed_c = {}
+    if any(route == ROUTE_C for route, _code in confirmed_route_codes):
+        ttl = challenger_execution_policy(ROUTE_C)["max_execution_delay_sec"]
+        confirmed_rows = await db.execute(select(
+            PaperShadowEvent.code, PaperShadowEvent.event_key, PaperShadowEvent.observed_at,
+        ).where(
+            PaperShadowEvent.route_id == ROUTE_C,
+            PaperShadowEvent.route_version == route_versions[ROUTE_C],
+            PaperShadowEvent.trade_date == trade_date,
+            PaperShadowEvent.event_type == "confirmed",
+            PaperShadowEvent.observed_at <= observed_at,
+            PaperShadowEvent.observed_at >= observed_at - timedelta(seconds=ttl),
+        ))
+        active_confirmed_c = {str(row.code): row for row in confirmed_rows
+                              if confirmation_samples.get((ROUTE_C, str(row.code)))}
 
     events: list[dict[str, Any]] = []
     pending_keys: set[str] = set()
     handled_route_codes: set[tuple[str, str]] = set()
+    research_rules = {route_id: _rules(route_id) for route_id in ROUTE_IDS}
+
+    def project(route_id, code, *, stage, reason, gate=None, candidate=True,
+                confirmed=None, inputs=None, metrics=None, evidence_ref=None,
+                source_contract=None):
+        _capture_candidate_projection(
+            route_id, observed_at, code=code, quote=submitted_quotes.get(code),
+            stage=stage, reason=reason, original_candidate=candidate,
+            original_confirmed=confirmed, original_gate=gate, gate_inputs=inputs,
+            identities={"broken_board_identity": True} if route_id == ROUTE_F2 and candidate else {},
+            rules=research_rules[route_id], version=route_versions[route_id],
+            metrics=metrics, evidence_ref=evidence_ref, source_contract=source_contract,
+        )
 
     def emit(item: dict[str, Any]) -> None:
         if item["event_key"] not in pending_keys:
             pending_keys.add(item["event_key"])
             events.append(item)
+            if item["event_type"] in {"confirmed", "coverage_blocked", "evidence_blocked"}:
+                # Event existence is not the static gate. Confirmation metrics are
+                # consumed only from the already-created event, never re-evaluated.
+                snapshot = _json_dict(item["snapshot_json"])
+                prior_evidence = snapshot.get("prior_structure") or {}
+                project(item["route_id"], item["code"], stage=item["event_type"],
+                        reason=item["status"], candidate=item["code"] != "MARKET",
+                        confirmed=True if item["event_type"] == "confirmed" else None,
+                        inputs=prior_evidence,
+                        metrics=prior_evidence.get("confirmation_metrics"),
+                        evidence_ref=item["event_key"])
 
     def reset_confirmation(route_code: tuple[str, str], reason: str) -> None:
         route_id, code = route_code
+        confirmed_event = active_confirmed_c.get(code) if route_id == ROUTE_C else None
+        if route_id == ROUTE_C and route_code in confirmed_route_codes:
+            if (confirmed_event is None or not confirmation_samples.get(route_code)
+                    or observed_at <= max(confirmation_samples[route_code])):
+                # Expired/ended tokens and duplicate observations are not new boundaries.
+                return
         quote = submitted_quotes.get(code)
+        project(route_id, code, stage="reset", reason=reason, confirmed=False,
+                inputs={"reset_reason": reason})
         # After a negative/unknown observation, delayed source frames from
         # before that boundary must not start a supposedly recovered segment.
         source_at = local_clock(_parse_datetime((quote or {}).get("source_quote_at")))
@@ -1314,6 +1504,12 @@ async def scan_strategy_iteration_shadow(
             code=code, name=str((quote or {}).get("name") or code),
             event_type="confirmation_reset", status="reset", quote=quote,
             prior={"reason": reason, "market_frame_audit": market_frame_audit,
+                   **({"confirmed_path_contract": "c2_confirmed_path_terminal_v1",
+                       "invalidates_event_key": confirmed_event.event_key,
+                       "confirmed_at": confirmed_event.observed_at.isoformat(),
+                       # Missing coverage breaks proof, not a claim the market fell.
+                       "invalidation_kind": "path_continuity_lost"}
+                      if confirmed_event is not None else {}),
                    "source_boundary_at": boundary.isoformat(),
                    "confirmation_version": (
                        "c3_continuity_v2" if route_id == ROUTE_C3 else "persistent_observed_segments_v3"
@@ -1344,8 +1540,12 @@ async def scan_strategy_iteration_shadow(
     )
     previous_dates = await _previous_trade_dates(db, trade_date, lookback_count)
     if not previous_dates:
+        for route_id in ROUTE_IDS:
+            project(route_id, "MARKET", stage="not_scanned", reason="missing_prior_trade_dates",
+                    candidate=False, inputs={"valid_quote_count": len(quote_by_code)})
         for route_code in list(confirmation_samples):
-            if route_code not in confirmed_route_codes:
+            if (route_code not in confirmed_route_codes
+                    or (route_code[0] == ROUTE_C and route_code[1] in active_confirmed_c)):
                 reset_confirmation(route_code, "missing_prior_trade_dates")
         added = await _persist_events(db, events)
         return {"events": len(added), "confirmed": 0, "routes": {}}
@@ -1407,7 +1607,10 @@ async def scan_strategy_iteration_shadow(
         """Persist one qualifying frame, then confirm only a durable streak."""
 
         route_code = (route_id, code)
-        if route_code in confirmed_route_codes:
+        already_confirmed = route_code in confirmed_route_codes
+        # C2 keeps observing the original path after its first confirmation.
+        # A reset clears its segment permanently; never mint/revive the day token.
+        if already_confirmed and (route_id != ROUTE_C or code not in active_confirmed_c):
             return
         source_at = local_clock(_parse_datetime(quote.get("source_quote_at")))
         handled_route_codes.add(route_code)
@@ -1420,6 +1623,11 @@ async def scan_strategy_iteration_shadow(
             return
         latest_source = latest_sources.get(route_code)
         if latest_source is not None and source_at <= latest_source:
+            if (already_confirmed and confirmation_samples.get(route_code)
+                    and (observed_at - max(confirmation_samples[route_code])).total_seconds()
+                    > route_signal_policy(route_id)["max_sample_gap_sec"]):
+                reset_confirmation(route_code, "repeated_source_continuity_gap")
+                return
             if source_at < latest_source and confirmation_samples.get(route_code):
                 reset_confirmation(route_code, "source_clock_regressed")
             # An empty segment is waiting for its persisted recovery
@@ -1440,6 +1648,8 @@ async def scan_strategy_iteration_shadow(
                     or (observed_at - last_at).total_seconds() > max_gap
                     or (source_at - last_source).total_seconds() > max_gap):
                 reset_confirmation(route_code, "observation_or_source_gap")
+                if already_confirmed:
+                    return
         status = _confirmation_streak_status(
             confirmation_samples.get(route_code, []),
             observed_at,
@@ -1476,6 +1686,9 @@ async def scan_strategy_iteration_shadow(
                 >= route_signal_policy(route_id)["min_vwap_slope_pct"]
             )
         )
+        if already_confirmed and not vwap_slope_passed:
+            reset_confirmation(route_code, "confirmed_vwap_slope_not_met")
+            return
         ready = bool(status["ready"] and vwap_slope_passed)
         confirmation = {
             **status,
@@ -1529,7 +1742,7 @@ async def scan_strategy_iteration_shadow(
         latest_sources[route_code] = source_at
         if current_average is not None and current_average > 0:
             confirmation_avg_prices[route_code][observed_at] = current_average
-        if not ready:
+        if not ready or already_confirmed:
             return
         emit(
             _event(
@@ -1555,6 +1768,9 @@ async def scan_strategy_iteration_shadow(
     for code, prior_row in previous_first_boards.items():
         quote = quote_by_code.get(code)
         if quote is None:
+            project(ROUTE_B, code, stage="unknown", reason="missing_or_invalid_quote",
+                    inputs={"signal_trade_date": previous_date.isoformat(),
+                            "previous_consecutive_days": 1})
             continue
         prior = {
             "signal_trade_date": previous_date.isoformat(),
@@ -1596,14 +1812,21 @@ async def scan_strategy_iteration_shadow(
                     prior={**prior, "official_open_pct": round(open_pct, 4)},
                 )
             )
-        if weak_open_setup and observed_at.time() <= b_end and _reclaim_confirmed(
+        frame_metrics = {}
+        frame_gate = weak_open_setup and observed_at.time() <= b_end and _reclaim_confirmed(
             quote,
             route_id=ROUTE_B, min_change_pct=settings.PAPER_STRATEGY_B_RECLAIM_MIN_PCT,
             max_change_pct=settings.PAPER_STRATEGY_B_RECLAIM_MAX_PCT,
             market_change_pct=market_change_pct,
             min_open_pct=settings.PAPER_STRATEGY_B_WEAK_OPEN_MIN_PCT,
             max_open_pct=settings.PAPER_STRATEGY_B_WEAK_OPEN_MAX_PCT,
-        ):
+            evidence=frame_metrics,
+        )
+        project(ROUTE_B, code, stage="static_gate", reason="passed" if frame_gate else "failed",
+                gate=frame_gate, confirmed=((ROUTE_B, code) in confirmed_route_codes),
+                inputs={"structure": prior, "setup_passed": weak_open_setup,
+                        "market_frame_audit": market_frame_audit}, metrics=frame_metrics)
+        if frame_gate:
             emit_confirmation_frame(
                 route_id=ROUTE_B,
                 code=code,
@@ -1614,10 +1837,39 @@ async def scan_strategy_iteration_shadow(
 
     # C/F2 share the same latest historical limit-up row but remain disjoint:
     # C consumes one/two-board memory; F2 consumes high-board memory.
+    missing_structure_coverage = {
+        route: {"missing_quote_count": 0, "missing_gap_count": 0,
+                "unknown_structure_count": 0, "unknown_detail_count": 0,
+                "unknown_aggregated_count": 0}
+        for route in (ROUTE_C, ROUTE_F2)
+    }
     for code, prior_row in latest_limit_by_code.items():
         quote = quote_by_code.get(code)
         gap_sessions = date_gap.get(prior_row.trade_date)
         if quote is None or gap_sessions is None:
+            # Research-only receipt: a historical board family is NOT proof of
+            # today's structural eligibility. Bound detail, retain all unknowns.
+            try:
+                boards = int(prior_row.consecutive_days or 1)
+                missing_route = (ROUTE_C if boards <= 2 else ROUTE_F2
+                    if boards >= settings.PAPER_STRATEGY_F2_MIN_HIGHBOARD else None)
+                if missing_route is not None:
+                    coverage = missing_structure_coverage[missing_route]
+                    coverage["missing_quote_count"] += int(quote is None)
+                    coverage["missing_gap_count"] += int(gap_sessions is None)
+                    coverage["unknown_structure_count"] += 1
+                    if coverage["unknown_detail_count"] < 16:
+                        coverage["unknown_detail_count"] += 1
+                        project(missing_route, code, stage="unknown",
+                                reason="missing_quote_or_gap", candidate=False,
+                                inputs={"missing_quote": quote is None,
+                                        "missing_gap": gap_sessions is None,
+                                        "last_consecutive_days": boards,
+                                        "structural_eligibility": "unknown"})
+                    else:
+                        coverage["unknown_aggregated_count"] += 1
+            except Exception:
+                pass
             continue
         consecutive = int(prior_row.consecutive_days or 1)
         if (
@@ -1672,14 +1924,22 @@ async def scan_strategy_iteration_shadow(
                         },
                     )
                 )
-            if relaunch_setup and observed_at.time() <= time(14, 30) and _reclaim_confirmed(
+            frame_metrics = {}
+            frame_gate = relaunch_setup and (observed_at.time() <= time(14, 30)
+                or code in active_confirmed_c) and _reclaim_confirmed(
                 quote,
                 route_id=ROUTE_C, min_change_pct=settings.PAPER_STRATEGY_C_RELAUNCH_MIN_RECLAIM_PCT,
                 max_change_pct=settings.PAPER_STRATEGY_C_RELAUNCH_MAX_RECLAIM_PCT,
                 market_change_pct=market_change_pct,
                 max_open_pct=settings.PAPER_STRATEGY_C_RELAUNCH_MAX_OPEN_PCT,
                 max_low_pct=settings.PAPER_STRATEGY_C_RELAUNCH_MAX_LOW_PCT,
-            ):
+                evidence=frame_metrics,
+            )
+            project(ROUTE_C, code, stage="static_gate", reason="passed" if frame_gate else "failed",
+                    gate=frame_gate, confirmed=((ROUTE_C, code) in confirmed_route_codes),
+                    inputs={"structure": prior, "setup_passed": relaunch_setup,
+                            "market_frame_audit": market_frame_audit}, metrics=frame_metrics)
+            if frame_gate:
                 emit_confirmation_frame(
                     route_id=ROUTE_C,
                     code=code,
@@ -1740,14 +2000,21 @@ async def scan_strategy_iteration_shadow(
                         },
                     )
                 )
-            if reclaim_setup and observed_at.time() <= time(14, 30) and _reclaim_confirmed(
+            frame_metrics = {}
+            frame_gate = reclaim_setup and observed_at.time() <= time(14, 30) and _reclaim_confirmed(
                 quote,
                 route_id=ROUTE_F2, min_change_pct=settings.PAPER_STRATEGY_F2_MIN_RECLAIM_PCT,
                 max_change_pct=settings.PAPER_STRATEGY_F2_MAX_RECLAIM_PCT,
                 market_change_pct=market_change_pct,
                 max_open_pct=settings.PAPER_STRATEGY_F2_MAX_OPEN_PCT,
                 max_low_pct=settings.PAPER_STRATEGY_F2_MAX_LOW_PCT,
-            ):
+                evidence=frame_metrics,
+            )
+            project(ROUTE_F2, code, stage="static_gate", reason="passed" if frame_gate else "failed",
+                    gate=frame_gate, confirmed=((ROUTE_F2, code) in confirmed_route_codes),
+                    inputs={"structure": prior, "setup_passed": reclaim_setup,
+                            "market_frame_audit": market_frame_audit}, metrics=frame_metrics)
+            if frame_gate:
                 emit_confirmation_frame(
                     route_id=ROUTE_F2,
                     code=code,
@@ -1934,6 +2201,7 @@ async def scan_strategy_iteration_shadow(
                     member = {
                         "code": code, "name": str(quote.get("name") or code),
                         "eligible": eligible, "confirmation_frame": False,
+                        "gate_issues": eligibility["eligibility_gate_issues"],
                         "source_quote_at": (
                             local_clock(_parse_datetime(quote.get("source_quote_at"))).isoformat()
                             if local_clock(_parse_datetime(quote.get("source_quote_at"))) is not None else None
@@ -1947,6 +2215,9 @@ async def scan_strategy_iteration_shadow(
                     }
                     current_members.append(member)
                     if not eligible:
+                        project(ROUTE_C3, code, stage="static_gate", reason="eligibility_failed",
+                                gate=False, confirmed=((ROUTE_C3, code) in confirmed_route_codes),
+                                inputs={"eligibility": eligibility, "structure": prior})
                         continue
                     eligible_prior = {
                         **prior,
@@ -1975,11 +2246,22 @@ async def scan_strategy_iteration_shadow(
                         # v2 first-hit and current view both reject unknown book.
                         and _safe_float(quote.get("orderbook_imbalance")) is not None
                     )
+                    member["gate_issues"] = [
+                        *confirmation_metrics["confirmation_gate_issues"],
+                        *([] if _first_board_confirmation_time(observed_at)
+                          else ["outside_confirmation_window"]),
+                    ]
                     member["reason"] = (
                         "等待逐帧连续确认" if member["confirmation_frame"]
                         else "超出确认时段" if observed_at.time() > confirm_end
                         else "本帧未通过确认门槛"
                     )
+                    project(ROUTE_C3, code, stage="static_gate", reason=member["reason"],
+                            gate=member["confirmation_frame"],
+                            confirmed=((ROUTE_C3, code) in confirmed_route_codes),
+                            inputs={"eligibility": eligibility, "confirmation_metrics": confirmation_metrics,
+                                    "gate_issues": member["gate_issues"], "structure": prior},
+                            metrics=confirmation_metrics)
                     if member["confirmation_frame"]:
                         emit_confirmation_frame(
                             route_id=ROUTE_C3,
@@ -2026,6 +2308,7 @@ async def scan_strategy_iteration_shadow(
         auctions_by_code[str(row.code or "")].append(row)
 
     path_covered_codes = 0
+    verified_path_codes = 0
     d_end = _parse_hhmm(
         settings.PAPER_STRATEGY_D_AUCTION_CONFIRM_END,
         time(10, 0),
@@ -2056,10 +2339,26 @@ async def scan_strategy_iteration_shadow(
         if not early or not final:
             continue
         path_covered_codes += 1
-        baseline_row, baseline_pct = min(early, key=lambda item: item[1])
+        # 普通spot占位行只保留作诊断；不得以更低的伪指示价或更晚的接收
+        # 标签挤掉已有的真实竞价证据。有效末段按源时钟排序。
+        verified_early = [item for item in early if auction_evidence_status(
+            item[0], decision_at=observed_at, require_ratio=False) == "ok"]
+        verified_final = [item for item in final if auction_evidence_status(
+            item[0], decision_at=observed_at, require_ratio=False) == "ok"]
+        baseline_row, baseline_pct = min(verified_early or early, key=lambda item: item[1])
         final_row, final_pct = max(
-            final,
-            key=lambda item: _auction_time(item[0].auction_time) or time.min,
+            verified_final or final,
+            key=lambda item: (
+                (
+                    local_clock(item[0].source_quote_at).time()
+                    if verified_final else _auction_time(item[0].auction_time) or time.min
+                ),
+                # Independent source frames can share a provider second. Keep
+                # source-clock priority; break ties by actual observation only.
+                local_clock(item[0].observed_at) or datetime.min,
+                local_clock(item[0].received_at) or datetime.min,
+                item[0].id or 0,
+            ),
         )
         recovery_ppt = final_pct - baseline_pct
         quote = quote_by_code.get(code)
@@ -2085,6 +2384,7 @@ async def scan_strategy_iteration_shadow(
             and auction_evidence_status(final_row, decision_at=observed_at, require_ratio=False) == "ok"
             and cancel_phase_verified
         )
+        verified_path_codes += int(volume_path_verified)
         prior = {
             "baseline_time": baseline_row.auction_time,
             "baseline_change_pct": round(baseline_pct, 4),
@@ -2129,12 +2429,23 @@ async def scan_strategy_iteration_shadow(
                 prior=prior,
             )
         )
-        if (
-            baseline_pct > settings.PAPER_STRATEGY_D_AUCTION_BASELINE_MAX_PCT
-            or final_pct < settings.PAPER_STRATEGY_D_AUCTION_FINAL_MIN_PCT
-            or recovery_ppt < settings.PAPER_STRATEGY_D_AUCTION_MIN_RECOVERY_PPT
-        ):
-            continue
+        # Reuse the source decisions above; no query or auction predicate replay.
+        try:
+            source_rows = [baseline_row, *positive_cancel_rows, final_row]
+            source_clocks = [local_clock(row.source_quote_at) for row in source_rows]
+            visibility = [local_clock(row.observed_at) for row in source_rows]
+            source_ref = "auction:" + ":".join(str(row.id) for row in source_rows)
+            project(ROUTE_D, code, stage="source_contract", reason=prior["indicative_path_coverage"],
+                    inputs=prior, source_contract={
+                        "verified_early": bool(verified_early),
+                        "two_distinct_verified_middle": cancel_phase_verified,
+                        "verified_final": bool(verified_final),
+                        "evidence_ref": source_ref,
+                        "evidence_at": max(source_clocks) if all(source_clocks) else None,
+                        "observed_at": max(visibility) if all(visibility) else None,
+                    })
+        except Exception:
+            pass
         if not volume_path_verified:
             emit(
                 _event(
@@ -2148,10 +2459,16 @@ async def scan_strategy_iteration_shadow(
                     quote=quote,
                     prior={
                         **prior,
-                        "reason": "竞价价格路径成立，但缺少早段/不可撤单阶段/最终段的源时钟及匹配量价证据",
+                        "reason": "竞价路径未验证：缺少早段/不可撤单阶段/最终段的源时钟及匹配量价证据，无法判定修复形态",
                     },
                 )
             )
+            continue
+        if (
+            baseline_pct > settings.PAPER_STRATEGY_D_AUCTION_BASELINE_MAX_PCT
+            or final_pct < settings.PAPER_STRATEGY_D_AUCTION_FINAL_MIN_PCT
+            or recovery_ppt < settings.PAPER_STRATEGY_D_AUCTION_MIN_RECOVERY_PPT
+        ):
             continue
         emit(
             _event(
@@ -2166,12 +2483,19 @@ async def scan_strategy_iteration_shadow(
                 prior=prior,
             )
         )
-        if observed_at.time() <= d_end and _reclaim_confirmed(
+        frame_metrics = {}
+        frame_gate = observed_at.time() <= d_end and _reclaim_confirmed(
             quote,
             route_id=ROUTE_D, min_change_pct=settings.PAPER_STRATEGY_D_AUCTION_RECLAIM_MIN_PCT,
             max_change_pct=settings.PAPER_STRATEGY_D_AUCTION_RECLAIM_MAX_PCT,
             market_change_pct=market_change_pct,
-        ):
+            evidence=frame_metrics,
+        )
+        project(ROUTE_D, code, stage="static_gate", reason="passed" if frame_gate else "failed",
+                gate=frame_gate, confirmed=((ROUTE_D, code) in confirmed_route_codes),
+                inputs={"structure": prior, "setup_passed": volume_path_verified,
+                        "market_frame_audit": market_frame_audit}, metrics=frame_metrics)
+        if frame_gate:
             emit_confirmation_frame(
                 route_id=ROUTE_D,
                 code=code,
@@ -2180,7 +2504,7 @@ async def scan_strategy_iteration_shadow(
                 prior=prior,
             )
 
-    if path_covered_codes == 0:
+    if verified_path_codes == 0:
         emit(
             _event(
                 route_id=ROUTE_D,
@@ -2194,7 +2518,9 @@ async def scan_strategy_iteration_shadow(
                 prior={
                     "auction_row_count": len(auction_rows),
                     "quote_universe_count": len(quote_by_code),
-                    "reason": "缺少同股09:20前指示价与09:25后最终竞价价配对",
+                    "raw_price_path_codes": path_covered_codes,
+                    "verified_path_codes": verified_path_codes,
+                    "reason": "缺少同股09:20前、09:20-09:25及最终段完整可验证竞价路径",
                     "official_open_is_not_indicative_path": True,
                 },
             )
@@ -2207,7 +2533,12 @@ async def scan_strategy_iteration_shadow(
         (item["route_id"], item["code"]) for item in events
         if item["event_type"] == "eligible"
     }
-    for route_code in sorted(watched - handled_route_codes - confirmed_route_codes):
+    terminal_or_untracked = {
+        key for key in confirmed_route_codes
+        if key[0] != ROUTE_C or key[1] not in active_confirmed_c
+        or not confirmation_samples.get(key)
+    }
+    for route_code in sorted(watched - handled_route_codes - terminal_or_untracked):
         reason = (
             "missing_or_invalid_quote" if route_code[1] not in quote_by_code
             else "market_coverage_unknown" if not market_frame_usable
@@ -2215,6 +2546,17 @@ async def scan_strategy_iteration_shadow(
         )
         reset_confirmation(route_code, reason)
 
+    for route_id in ROUTE_IDS:
+        c3_disabled = route_id == ROUTE_C3 and not settings.PAPER_FIRST_BOARD_SHADOW_ENABLED
+        project(route_id, "MARKET", stage="not_scanned" if c3_disabled else "scan_complete",
+                reason="producer_disabled" if c3_disabled else "producer_scan_completed",
+                candidate=False, inputs={
+                    **missing_structure_coverage.get(route_id, {}),
+                    "valid_quote_count": len(quote_by_code),
+                    "structural_count": sum(item["route_id"] == route_id
+                        and item["event_type"] == "structural_pool" for item in events),
+                    "events_attempted": sum(item["route_id"] == route_id for item in events),
+                })
     added_rows = await _persist_events(db, events)
     confirmed = sum(
         1

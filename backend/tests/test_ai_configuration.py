@@ -101,6 +101,88 @@ async def test_error_responses_fail_closed(provider, status, payload):
         assert await provider.chat("prompt") is None
 
 
+@pytest.mark.asyncio
+async def test_payment_circuit_blocks_queued_calls_and_half_open_recovers(provider, monkeypatch):
+    await provider.configure(update(api_format="openai"))
+    tick = [100.0]
+    monkeypatch.setattr("app.ai.provider.monotonic", lambda: tick[0])
+    calls, entered = [], asyncio.Event()
+    async def handler(request):
+        calls.append(request)
+        await asyncio.sleep(0)
+        return httpx.Response(402, json={"error": "DO-NOT-LOG-test-secret"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider._client = client
+        assert all(value is None for value in await asyncio.gather(*(provider.chat("news") for _ in range(12))))
+        assert len(calls) <= 2
+        state = provider.runtime_status()
+        assert state["status"] == "payment_required" and state["http_status"] == 402
+        assert state["circuit_open"] is True
+        assert "test-secret" not in json.dumps(state)
+        assert await provider.chat("blocked") is None
+        assert len(calls) <= 2
+    tick[0] += 301
+    release = asyncio.Event()
+    async def recovered(request):
+        calls.append(request)
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(recovered)) as client:
+        provider._client = client
+        probe = asyncio.create_task(provider.chat("probe"))
+        await entered.wait()
+        assert await provider.chat("no second probe") is None
+        release.set()
+        assert await probe == "ok"
+        assert provider.runtime_status()["circuit_open"] is False
+        assert provider.runtime_status()["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_late_500_does_not_erase_open_payment_circuit_cause(provider):
+    await provider.configure(update(api_format="openai"))
+    both, release = asyncio.Event(), asyncio.Event()
+    calls=[]
+    async def handler(request):
+        index=len(calls); calls.append(request)
+        if len(calls)==2: both.set()
+        await both.wait()
+        if index==0:
+            return httpx.Response(402,json={"error":"no secret in diagnostics"})
+        await release.wait()
+        return httpx.Response(500,json={})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider._client=client
+        first=asyncio.create_task(provider.chat("first"))
+        second=asyncio.create_task(provider.chat("second"))
+        assert await first is None
+        release.set()
+        assert await second is None
+        state=provider.runtime_status()
+        assert state["status"]=="payment_required" and state["http_status"]==402
+        assert state["last_error"]["http_status"]==500 and state["circuit_open"] is True
+
+
+@pytest.mark.asyncio
+async def test_old_inflight_payment_failure_does_not_poison_new_config(provider):
+    await provider.configure(update(api_format="openai"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def handler(request):
+        entered.set()
+        await release.wait()
+        return httpx.Response(402, json={"error": "old endpoint"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider._client = client
+        old = asyncio.create_task(provider.chat("old"))
+        await entered.wait()
+        await provider.configure(update(model="new-model"))
+        release.set()
+        assert await old is None
+        assert provider.runtime_status()["http_status"] is None
+        assert provider.runtime_status()["circuit_open"] is False
+
+
 @pytest.mark.parametrize("kwargs", [
     {"base_url": "file:///etc/passwd"}, {"base_url": "https://u:password@host.example"},
     {"base_url": "http://host.example"}, {"temperature": float("nan")},

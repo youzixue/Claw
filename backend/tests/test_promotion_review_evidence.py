@@ -74,7 +74,12 @@ async def test_missing_next_pool_never_skips_to_later_pool(promotion_api_env):
         session.add(LimitUpPool(code="600001", trade_date=date(2026, 8, 14), consecutive_days=1, source="test"))
         await session.commit()
         payload = await promotion._build_promotion_daily_learning_review(session, now=datetime(2026, 8, 15))
-    row = payload["latest"]
+    # The recent calendar window now also retains the newer missing forecast.
+    # It must not relabel the recorded 08-12 prediction using the later 08-14 pool.
+    assert payload["latest"]["prediction_trade_date"] == "2026-08-13"
+    assert payload["latest"]["predicted_count"] == 0
+    assert "formal_ranked_predictions_unavailable" in payload["latest"]["evaluation_reasons"]
+    row = next(item for item in payload["daily"] if item["prediction_trade_date"] == "2026-08-12")
     assert row["actual_trade_date"] == "2026-08-13"
     assert row["limit_up_precision"] is None
     assert row["brier_score"] is None

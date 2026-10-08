@@ -1,0 +1,27 @@
+# 保留 Gitleaks 默认检测；只排除已人工核实的非凭据字面量。
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Synthetic prediction batch identifiers in shadow test fixtures"
+condition = "AND"
+paths = ['''(^|/)backend/tests/test_promotion_shadow\.py$''']
+regexTarget = "secret"
+regexes = ['''^shadow-test-20260827(-retry)?$''']
+
+[[rules.allowlists]]
+description = "KDJ display column name, not an API key"
+condition = "AND"
+paths = ['''(^|/)frontend/src/views/tenbagger/Index\.vue$''']
+regexTarget = "secret"
+regexes = ['''^b1_kdj_signal$''']
+
+[[rules.allowlists]]
+description = "Funding display column name, not an API key"
+condition = "AND"
+paths = ['''(^|/)frontend/src/views/promotion/Index\.vue$''']
+regexTarget = "secret"
+regexes = ['''^funding_positive_days_3d$''']

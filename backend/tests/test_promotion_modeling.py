@@ -203,6 +203,7 @@ async def _seed_historical_panel(session: AsyncSession) -> None:
                     volume=100_000 + day_index * 1000 + code_index * 100,
                     amount=20_000_000 + day_index * 100_000,
                     turnover=3.0 + code_index * 0.2,
+                    source="ths",
                 )
             )
             previous_close = close
@@ -546,7 +547,7 @@ async def test_historical_panel_reconstructs_point_in_time_features(modeling_ses
     assert dataset.diagnostics["clock_aligned_sample_count"] >= len(dataset.rows)
     assert "hist_return_20d" in dataset.rows[0].values
     assert dataset.rows[0].trade_date <= dataset.end_date.isoformat()
-    assert dataset.data_version.startswith("historical_panel_v2_")
+    assert dataset.data_version.startswith("historical_panel_v3_")
 
     daily = dataset.diagnostics["daily"]
     assert daily[0]["reference_prior_sample_count"] == 0

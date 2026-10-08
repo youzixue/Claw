@@ -16,6 +16,7 @@ from dataclasses import replace
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from app.config.settings import settings
 from app.core.trade_calendar import is_official_closed_day
@@ -304,7 +305,10 @@ async def build_ledger_training_dataset(
              "completed": a.completed_at, "summary": a.summary_json}
             for a in sorted(audits, key=lambda a: a.id)]
         diagnostics["calendar_evidence"] = sorted((d.isoformat(), state) for d, state in calendar.items())
-        events = list((await db.scalars(select(LimitUpPool).where(
+        events = list((await db.scalars(select(LimitUpPool).options(load_only(
+            LimitUpPool.id, LimitUpPool.code, LimitUpPool.trade_date,
+            LimitUpPool.quarantined, LimitUpPool.source, raiseload=True,
+        )).where(
             LimitUpPool.trade_date >= minimum,
             LimitUpPool.trade_date <= cutoff.date(),
         ))).all())

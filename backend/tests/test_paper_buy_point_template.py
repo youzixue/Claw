@@ -37,12 +37,12 @@ def test_single_card_has_readable_title_and_state_before_reason():
     message = points.build_message([sample])
     card = FeishuChannel()._build_card(message)["card"]
     assert sample == before
-    assert message.extra["template_version"] == "paper_buy_point_card_v4"
+    assert message.extra["template_version"] == "paper_buy_point_card_v6_execution_snapshot"
     title = card["header"]["title"]["content"]
     assert "B2" in title and "模板测试（600001）" in title
     assert "Claw 策略买点确认 · 1条 · 1" not in title
     assert card["header"]["template"] == "blue"
-    assert message.content.index("非下单或成交") < message.content.index("✅ 买点依据")
+    assert message.content.index("非下单或成交") < message.content.index("📋 原确认依据")
     assert "信号参考价 ¥10.50" in message.content and "非成交价" in message.content
     assert "昨日首板，弱开后收复零轴" in message.content
     assert "信号确认于09:40:00" in message.content
@@ -69,7 +69,7 @@ def test_account_badges_and_roles_are_unambiguous(account, badge):
     message = points.build_message([item(account)])
     role = "次账户" if account.startswith("challenger_") else "主账户"
     assert f"｜{badge} {role}" in message.content
-    assert message.extra["display_title"].startswith(f"策略买点｜{badge} · ")
+    assert message.extra["display_title"].startswith(f"条件确认·执行未核实｜{badge} · ")
 
 
 def test_six_item_batch_keeps_reasons_accounts_and_audits_separate():
@@ -81,7 +81,7 @@ def test_six_item_batch_keeps_reasons_accounts_and_audits_separate():
     for n, sample in enumerate(samples):
         stock_block = card["elements"][n]["content"]
         assert sample["payload"]["strategy_label"] in stock_block
-        assert "买点依据" in stock_block
+        assert "原确认依据" in stock_block
         assert sample["run_id"] not in stock_block  # 编号不抢占第一屏
         assert sample["run_id"] not in message.content
         assert sample["run_id"] == message.extra["signal_audits"][n]["run_id"]
@@ -104,7 +104,7 @@ def test_title_cleanup_does_not_change_throttle_identity(monkeypatch):
 
 def test_unknown_state_never_infers_fill_from_reason_text():
     message = points.build_message([item(reason="策略说明中提及已成交，但没有执行审计")])
-    assert "🔎 买点已确认 · 非下单或成交" in message.content
+    assert "🔎 原条件曾确认 · 执行未核实 · 非下单或成交" in message.content
     assert "✅ 已有模拟成交记录" not in message.content
 
 
@@ -129,7 +129,7 @@ def test_untrusted_text_cannot_create_feishu_mentions_or_links():
 
 @pytest.mark.parametrize("state,label", [
     ("filled", "已有模拟成交记录"), ("pending", "已提交模拟委托"),
-    ("waiting", "本轮未下单 · 等待条件"), ("blocked", "本轮未下单 · 已拦截"),
+    ("waiting", "本轮未下单 · 等待条件"), ("blocked", "本轮执行已拦截"),
     ("expired", "原买点已失效"),
 ])
 def test_footer_removal_keeps_real_execution_state_and_order_specific_note(state, label):

@@ -127,7 +127,8 @@ async def test_early_empty_band_keeps_history_without_restoring_candidate_or_ord
     monkeypatch.setattr(paper, "_champion_intraday_confirmation_status", confirmation_gate)
     async with maker() as db:
         account = await paper._get_or_create_account(db, "default")
-        db.add(StockSpot(code="600001", name="test", price=10, high=12, low=9,
+        # VWAP位于振幅顶部，已不满足回踩位置；历史确认不能恢复当前入口。
+        db.add(StockSpot(code="600001", name="test", price=10, high=12, low=9, avg_price=11.8,
                          change_pct=1, updated_at=AT))
         db.add(PaperAutoTradeLog(
             account_id=account.id, trade_date=DAY, code="600001", source="next_day_plan",

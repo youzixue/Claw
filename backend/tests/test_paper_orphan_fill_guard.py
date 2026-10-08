@@ -31,6 +31,18 @@ def isolate_crash_window_from_entry_signal_policy(monkeypatch):
     # These fixtures deliberately have no route evidence: exercise real booking
     # and orphan containment, not buy selection. Buy validity has its own suite.
     monkeypatch.setattr(service, "_requires_pending_buy_validity", lambda _order: False)
+    # T+1/hold-day reads use a closed local calendar, never an online fallback.
+    from app.core.trade_calendar import TradeCalendar
+    monkeypatch.setattr(paper.trade_calendar, "_cache", {
+        AT.date()-timedelta(days=i): (AT.date()-timedelta(days=i)).weekday() < 5
+        for i in range(40)})
+    async def fixture_loaded(self, year):
+        assert self is paper.trade_calendar and year == 2026
+    monkeypatch.setattr(TradeCalendar, "_ensure_loaded", fixture_loaded)
+    network = AsyncMock(side_effect=AssertionError("orphan fixture forbids calendar network"))
+    monkeypatch.setattr(TradeCalendar, "_sync_from_source", network)
+    yield
+    network.assert_not_awaited()
 
 
 def identity(account, side):

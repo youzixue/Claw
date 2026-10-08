@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 from math import exp, isfinite, log, log1p
 
 from fastapi import APIRouter, Depends
+from loguru import logger
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,13 +26,15 @@ from app.api.v1.tenbagger import (
     prewarm_anomaly_snapshot,
 )
 from app.core.data_date import resolve_latest_trade_date
-from app.data.auction_evidence import auction_context_complete, auction_evidence_status
+from app.data.auction_evidence import auction_context_complete, auction_evidence_status, latest_auction_ids
 from app.core.price_limit_rules import is_limit_up_change, limit_up_change_threshold
 from app.core.trade_calendar import is_official_closed_day, trade_calendar
 from app.db.session import get_db
 from app.core.stock_tagger import stock_tagger
 from app.models.stock import (
     AuctionData,
+    BrokenLimitPool,
+    QuoteRound,
     LimitUpPool,
     MarketSentiment,
     SectorInfo,
@@ -449,6 +452,7 @@ DRAGON_TIGER_DETAIL_TIMEOUT_SECONDS = 12
 _PROMOTION_PAGE_CANDIDATES_CACHE: dict[tuple[int, int, bool, str, int], tuple[float, dict]] = {}
 _PROMOTION_LATEST_CANDIDATES_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
 _PROMOTION_LEARNING_REVIEW_CACHE: dict[tuple[str, int, int], tuple[float, dict]] = {}
+_PROMOTION_LEARNING_REVIEW_FLIGHTS: dict[tuple[str, int, int], tuple[asyncio.Lock, int]] = {}
 _DRAGON_TIGER_DAILY_CACHE: dict[str, tuple[float, dict[str, list[dict]]]] = {}
 _DRAGON_TIGER_CONTEXT_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 _PROMOTION_LEARNING_STORAGE_READY = False
@@ -1000,26 +1004,9 @@ async def _load_dragon_tiger_context_map(trade_date: date, codes: list[str]) -> 
     if not normalized_codes:
         return {}
 
-    try:
-        from app.data.sources.eastmoney_source import EastMoneySource
-
-        source = EastMoneySource()
-        summary_by_code = await _load_dragon_tiger_daily_summary(source, trade_date)
-        listed_codes = [code for code in normalized_codes if summary_by_code.get(code)]
-        if not listed_codes:
-            return {}
-
-        result: dict[str, dict] = {}
-        for code in listed_codes:
-            result[code] = await _load_dragon_tiger_stock_context(
-                source,
-                trade_date,
-                code,
-                summary_by_code.get(code) or [],
-            )
-        return result
-    except Exception:
-        return {}
+    # 东财已退役；腾讯报价/问财涨停字段不提供可认证席位明细。
+    # 缺失为中性无证据，不再进行慢速网络回退；历史冻结解释仍保留。
+    return {}
 
 
 def _load_cached_dragon_tiger_context_map(trade_date: date, codes: list[str]) -> dict[str, dict]:
@@ -1215,6 +1202,48 @@ def _project_promotion_candidates_payload(
                     session_name=session_name,
                 )
             )
+    # Old dashboard snapshots may omit this top-level diagnostic while the
+    # original candidate annotations already record it. Project ONLY matching
+    # frozen counts: never re-annotate, recompute ranks, or clear their blocker.
+    research = projected.get("direction_research")
+    if (isinstance(research, dict) and research.get("status") == "blocked"
+            and research.get("reason") in {
+                "eligible_candidates_not_recordable", "direction_candidates_not_recordable",
+            } and research.get("missing_recordable_count") is None):
+        from app.promotion.direction_research import DIRECTION_RESEARCH_VERSION, DIRECTION_LABEL_VERSION
+        observed_proofs = []
+        for key in candidate_keys:
+            rows = projected.get(key)
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                if not isinstance(item, dict) or item.get("target_board", 1) != 1:
+                    continue
+                factors = item.get("probability_factors") or {}
+                if not isinstance(factors, dict):
+                    continue
+                proof = factors.get("direction_research")
+                if isinstance(proof, dict):
+                    observed_proofs.append(proof)
+        valid = bool(observed_proofs) and all(
+            proof.get("version") == research.get("version") == DIRECTION_RESEARCH_VERSION
+            and proof.get("label_version") == research.get("label_version") == DIRECTION_LABEL_VERSION
+            and proof.get("scope") == research.get("scope") == "research_only"
+            and proof.get("rank_contract_complete") is False
+            and proof.get("error") == research.get("reason")
+            and type(proof.get("candidate_count")) is int
+            and proof.get("candidate_count") == research.get("candidate_count")
+            and type(proof.get("eligible_count")) is int
+            and proof.get("eligible_count") == research.get("eligible_count")
+            and type(proof.get("missing_recordable_count")) is int
+            and proof["missing_recordable_count"] > 0
+            for proof in observed_proofs
+        )
+        if valid:
+            counts = {proof["missing_recordable_count"] for proof in observed_proofs}
+            if len(counts) == 1:
+                research["missing_recordable_count"] = next(iter(counts))
+                research["recordability_count_source"] = "original_candidate_annotations"
     projected.pop("_cache_capacity", None)
     if not compact:
         return projected
@@ -1615,6 +1644,10 @@ async def _evaluate_promotion_prediction_record(
     for trade_date_value, consecutive_days in limit_up_rows:
         if trade_date_value is None or trade_date_value not in allowed_limit_up_dates:
             continue
+        if consecutive_days is None:
+            # Tencent proves price state, not first/second-board identity.
+            # Missing Wencai metadata is unknown, never a positive/negative label.
+            return False
         limit_up_board_by_date[trade_date_value] = max(
             limit_up_board_by_date.get(trade_date_value, 0),
             max(_safe_int(consecutive_days, 1), 1),
@@ -1730,6 +1763,7 @@ async def _evaluate_promotion_prediction_records_bulk(
     bars_by_code: dict[str, list[StockKline]] = defaultdict(list)
     limit_up_dates_by_code: dict[str, set[date]] = defaultdict(set)
     limit_up_board_by_code: dict[str, dict[date, int]] = defaultdict(dict)
+    unknown_board_dates_by_code: dict[str, set[date]] = defaultdict(set)
     observed_market_date_set = set(completed_market_dates) | {
         record.prediction_trade_date for record in evaluable
     }
@@ -1763,6 +1797,9 @@ async def _evaluate_promotion_prediction_records_bulk(
                 and trade_date_value is not None
                 and trade_date_value in observed_market_date_set
             ):
+                if consecutive_days is None:
+                    unknown_board_dates_by_code[normalized_code].add(trade_date_value)
+                    continue
                 limit_up_dates_by_code[normalized_code].add(trade_date_value)
                 limit_up_board_by_code[normalized_code][trade_date_value] = max(
                     limit_up_board_by_code[normalized_code].get(trade_date_value, 0),
@@ -1773,6 +1810,9 @@ async def _evaluate_promotion_prediction_records_bulk(
     for record in evaluable:
         code = str(record.code or "").strip()
         outcome_date = outcome_dates[record.id]
+        if any(record.prediction_trade_date <= day <= outcome_date
+               for day in unknown_board_dates_by_code.get(code, set())):
+            continue
         bars = sorted(
             [
                 bar
@@ -1978,56 +2018,88 @@ def _promotion_record_uses_current_label_contract(
     return _prediction_record_model_version(record, factors) == PROMOTION_MODEL_VERSION
 
 
+async def _load_promotion_learning_records(db: AsyncSession, cutoff: date) -> list[PromotionPredictionRecord]:
+    # Bounded ORM hydration: fetchall() of the historical factor payload can
+    # monopolize the quote/scheduler event loop before the first Python yield.
+    result = await db.stream_scalars(
+        select(PromotionPredictionRecord).where(
+            PromotionPredictionRecord.outcome_status.in_(["success", "failed"]),
+            PromotionPredictionRecord.prediction_trade_date >= cutoff,
+            # The canonical selector always discards explicit schedule intraday
+            # batches. Do not hydrate their large JSON just to discard it later.
+            # Keep NULL/legacy/unknown identities for the existing JSON fallback;
+            # this is not a shorter history window or a different batch policy.
+            ~and_(
+                func.coalesce(PromotionPredictionRecord.snapshot_source, "") == "schedule",
+                func.coalesce(PromotionPredictionRecord.snapshot_context, "").in_(
+                    sorted(PROMOTION_INTRADAY_CONTEXTS)
+                ),
+            ),
+        ).execution_options(yield_per=256)
+    )
+    records = []
+    try:
+        async for partition in result.partitions(256):
+            records.extend(partition)
+            await asyncio.sleep(0)
+    except BaseException:
+        try:
+            await result.close()
+        except BaseException:
+            pass
+        raise
+    else:
+        await result.close()
+    return records
+
+
 async def _load_promotion_learning_stats(db: AsyncSession) -> dict[str, dict]:
     await _ensure_promotion_learning_storage(db)
     cutoff = date.today() - timedelta(days=180)
-    result = await db.execute(
-        select(PromotionPredictionRecord)
-        .where(
-            PromotionPredictionRecord.outcome_status.in_(["success", "failed"]),
-            PromotionPredictionRecord.prediction_trade_date >= cutoff,
-        )
-    )
-    latest_records = _latest_learning_batch_records(list(result.scalars().all()))
+    latest_records = _latest_learning_batch_records(await _load_promotion_learning_records(db, cutoff))
     learning_anchor_date = max(
         (record.prediction_trade_date for record in latest_records if record.prediction_trade_date),
         default=date.today(),
     )
     canonical_bucket_presence: set[str] = set()
-    for record in latest_records:
+    learning_meta = {}
+    canonical_close_ids = set()
+    for index, record in enumerate(latest_records):
+        if index % 128 == 0:
+            await asyncio.sleep(0)
+        # Retain only derived leaves, not another full decoded copy of tens of
+        # thousands of historical factor dictionaries. Reuse existing helpers.
         factors = _json_loads_safe(record.factors_json)
+        source = _prediction_record_snapshot_source(record, factors)
+        if (source == "schedule" and
+                _prediction_record_snapshot_context(record, factors) in PROMOTION_CANONICAL_CLOSE_CONTEXTS):
+            canonical_close_ids.add(record.id)
         if not _promotion_record_uses_current_label_contract(record, factors):
             continue
-        if _prediction_record_snapshot_source(record, factors) == "schedule":
-            canonical_bucket_presence.add(
-                _promotion_record_learning_bucket(record, factors).split("|state:", 1)[0]
-            )
+        bucket = _promotion_record_learning_bucket(record, factors).split("|state:", 1)[0]
+        if source == "schedule":
+            canonical_bucket_presence.add(bucket)
+        if _is_legacy_observation_first_board_record(record):
+            continue
+        context_bucket = _promotion_context_learning_bucket(bucket, factors)
+        eligible = (factors.get("learning_eligible") is True or (
+            "learning_eligible" not in factors and factors.get("prediction_ranked_selected", True) is not False))
+        learning_meta[record.id] = (bucket, context_bucket, source, eligible)
 
     grouped: dict[str, list[PromotionPredictionRecord]] = {}
     pool_grouped: dict[str, list[PromotionPredictionRecord]] = {}
-    for record in latest_records:
-        factors = _json_loads_safe(record.factors_json)
-        if _is_legacy_observation_first_board_record(record):
+    for index, record in enumerate(latest_records):
+        if index % 256 == 0:
+            await asyncio.sleep(0)
+        meta = learning_meta.get(record.id)
+        if meta is None:
             continue
-        if not _promotion_record_uses_current_label_contract(record, factors):
-            # Old outcomes may encode a next-day continuation as a T1 success.
-            # Never mix that incompatible truth into the governed v2 calibrator.
-            continue
-        bucket = _promotion_record_learning_bucket(record, factors).split("|state:", 1)[0]
-        context_bucket = _promotion_context_learning_bucket(bucket, factors)
-        source = _prediction_record_snapshot_source(record, factors)
+        bucket, context_bucket, source, is_learning_eligible = meta
         # 一旦某路由已有正式 schedule 样本，就不再把早期页面临时记录混入校准。
         if bucket in canonical_bucket_presence and source != "schedule":
             continue
         for learning_key in {bucket, context_bucket}:
             pool_grouped.setdefault(learning_key, []).append(record)
-        is_learning_eligible = (
-            factors.get("learning_eligible") is True
-            or (
-                "learning_eligible" not in factors
-                and factors.get("prediction_ranked_selected", True) is not False
-            )
-        )
         if not is_learning_eligible:
             continue
         for learning_key in {bucket, context_bucket}:
@@ -2045,27 +2117,41 @@ async def _load_promotion_learning_stats(db: AsyncSession) -> dict[str, dict]:
             record.prediction_trade_date for record in latest_records
         ), TradeCalendarModel.trade_date <= current.date()))).all())
         pairs = {}
-        for record in latest_records:
-            factors = _json_loads_safe(record.factors_json)
-            if (_prediction_record_snapshot_source(record, factors) != "schedule"
-                    or _prediction_record_snapshot_context(record, factors) not in PROMOTION_CANONICAL_CLOSE_CONTEXTS):
+        outcome_dates = {}
+        for index, record in enumerate(latest_records):
+            if index % 256 == 0:
+                await asyncio.sleep(0)
+            if record.id not in canonical_close_ids:
                 continue
-            outcome_day, error = next_recorded_trade_day(
-                record.prediction_trade_date, calendar, through=current.date()
-            )
+            if record.prediction_trade_date not in outcome_dates:
+                outcome_dates[record.prediction_trade_date] = next_recorded_trade_day(
+                    record.prediction_trade_date, calendar, through=current.date())
+            outcome_day, error = outcome_dates[record.prediction_trade_date]
             if not error and _is_completed_promotion_outcome_date(outcome_day, now=current):
                 pairs[record.id] = outcome_day
-        dates = {record.prediction_trade_date for record in latest_records} | set(pairs.values())
-        codes = sorted({record.code for record in latest_records})
+        # Only paired canonical-close records consume direction bars below.
+        # Page/unknown-calendar records cannot use these rows; do not load their
+        # entire history (or any Klines when there are no eligible pairs).
+        paired_records = [record for record in latest_records if record.id in pairs]
+        dates = {record.prediction_trade_date for record in paired_records} | set(pairs.values())
+        codes = sorted({record.code for record in paired_records})
         bars = {}
         for offset in range(0, len(codes), 700):
-            rows = (await db.execute(select(StockKline).where(
+            # Preserve the exact formal_outcome_bar_error inputs without
+            # hydrating unused full ORM objects into the publisher session.
+            rows = (await db.execute(select(
+                StockKline.code, StockKline.trade_date, StockKline.close,
+                StockKline.prev_close, StockKline.volume, StockKline.source,
+                StockKline.change_pct,
+            ).where(
                 StockKline.code.in_(codes[offset:offset + 700]),
                 StockKline.trade_date >= min(dates),
                 StockKline.trade_date <= max(dates),
-            ))).scalars().all()
+            ))).all()
             bars.update({(bar.code, bar.trade_date): bar for bar in rows})
-        for record in latest_records:
+        for index, record in enumerate(latest_records):
+            if index % 256 == 0:
+                await asyncio.sleep(0)
             after = bars.get((record.code, pairs.get(record.id)))
             before = bars.get((record.code, record.prediction_trade_date))
             if (record.id in pairs and not formal_outcome_bar_error(before, after)
@@ -2074,6 +2160,7 @@ async def _load_promotion_learning_stats(db: AsyncSession) -> dict[str, dict]:
 
     stats: dict[str, dict] = {}
     for bucket, raw_records in grouped.items():
+        await asyncio.sleep(0)
         records, version_meta = _select_versioned_learning_records(
             raw_records,
             anchor_date=learning_anchor_date,
@@ -2221,7 +2308,8 @@ def _is_legacy_observation_first_board_record(record: PromotionPredictionRecord)
     return route in FIRST_BOARD_LEGACY_OBSERVATION_RECORD_ROUTES
 
 
-def _is_recordable_prediction_candidate(item: dict) -> bool:
+def _is_base_recordable_prediction_candidate(item: dict) -> bool:
+    """Original storage policy, before frozen ranking eligibility is attached."""
     target_board = _safe_int(item.get("target_board"), 1)
     if target_board != 1:
         # 二板完整池必须落库，未通过闸门的样本以 pool_unranked 保存，才能
@@ -2241,25 +2329,61 @@ def _is_recordable_prediction_candidate(item: dict) -> bool:
     return _is_displayable_first_board_prediction(annotated)
 
 
+def _is_recordable_prediction_candidate(item: dict) -> bool:
+    if _is_base_recordable_prediction_candidate(item):
+        return True
+    factors = item.get("probability_factors") or {}
+    # Ranking eligibility authorizes a prediction record, never an execution.
+    # Only the new-batch metadata producer may certify this supplemental path.
+    return (
+        _safe_int(item.get("target_board"), 1) == 1
+        and factors.get("prediction_record_admission") == "rank_eligible_forecast_only"
+        and factors.get("prediction_record_policy_version") == "eligible_complete_v2"
+        and factors.get("prediction_rank_contract_version") == "promotion_rank_contract_v1"
+        and factors.get("prediction_rank_contract_complete") is True
+        and factors.get("prediction_rank_eligible") is True
+        and factors.get("prediction_trade_gate_passed") is False
+        and factors.get("prediction_watch_only") is True
+        and factors.get("prediction_actionable") is False
+    )
+
+
+def _prediction_record_input_universe(
+    candidates: list[dict], rank_eligible_candidates: list[dict],
+) -> tuple[list[dict], set[tuple[str, int, str]]]:
+    """Preserve the old pool, then append original facts for every missing rank key."""
+    original_keys = {_prediction_record_key(item) for item in candidates}
+    eligible_keys = {_prediction_record_key(item) for item in rank_eligible_candidates}
+    if eligible_keys - original_keys:
+        raise ValueError("prediction_record_universe: eligible_candidate_missing_from_source")
+    recordable = [item for item in candidates if _is_base_recordable_prediction_candidate(item)]
+    retained_keys = {_prediction_record_key(item) for item in recordable}
+    supplemental_keys = eligible_keys - retained_keys
+    # Use original candidates, not rank/display copies that rewrite trade_ready.
+    # Do not deduplicate malformed inputs: the complete-universe guard must see them.
+    return recordable + [item for item in candidates
+                         if _prediction_record_key(item) in supplemental_keys], supplemental_keys
+
+
 def _prediction_record_snapshot_source(
     record: PromotionPredictionRecord,
     factors: dict | None = None,
 ) -> str:
-    factors = factors or _json_loads_safe(record.factors_json)
     explicit = str(getattr(record, "snapshot_source", "") or "").strip()
-    return _normalize_prediction_snapshot_source(
-        explicit if explicit and explicit != "legacy" else factors.get("prediction_snapshot_source")
-    )
+    if explicit and explicit != "legacy":
+        return _normalize_prediction_snapshot_source(explicit)
+    factors = factors or _json_loads_safe(record.factors_json)
+    return _normalize_prediction_snapshot_source(factors.get("prediction_snapshot_source"))
 
 
 def _prediction_record_snapshot_context(
     record: PromotionPredictionRecord,
     factors: dict | None = None,
 ) -> str:
-    factors = factors or _json_loads_safe(record.factors_json)
     explicit = str(getattr(record, "snapshot_context", "") or "").strip().lower()
     if explicit and explicit != "legacy":
         return _normalize_prediction_snapshot_context(explicit)
+    factors = factors or _json_loads_safe(record.factors_json)
     return _normalize_prediction_snapshot_context(
         factors.get("prediction_snapshot_context"),
         source=_prediction_record_snapshot_source(record, factors),
@@ -2270,12 +2394,13 @@ def _prediction_record_model_version(
     record: PromotionPredictionRecord,
     factors: dict | None = None,
 ) -> str:
+    # Explicit columns already win over JSON. Avoid repeatedly decoding the
+    # entire historical feature payload solely to return that same identity.
+    explicit = getattr(record, "model_version", "")
+    if explicit:
+        return str(explicit).strip()
     factors = factors or _json_loads_safe(record.factors_json)
-    return str(
-        getattr(record, "model_version", "")
-        or factors.get("prediction_model_version")
-        or "legacy"
-    ).strip()
+    return str(factors.get("prediction_model_version") or "legacy").strip()
 
 
 def _prediction_record_snapshot_time(record: PromotionPredictionRecord) -> datetime:
@@ -2305,8 +2430,7 @@ def _latest_learning_batch_records(records: list[PromotionPredictionRecord]) -> 
     grouped: dict[tuple[date, int], list[PromotionPredictionRecord]] = {}
     passthrough: list[PromotionPredictionRecord] = []
     for record in records:
-        factors = _json_loads_safe(record.factors_json)
-        source = _prediction_record_snapshot_source(record, factors)
+        source = _prediction_record_snapshot_source(record)
         if source != "schedule" or not record.prediction_trade_date:
             passthrough.append(record)
             continue
@@ -2358,6 +2482,7 @@ def _annotate_prediction_record_metadata(
     recall_ranked_candidates: list[dict] | None = None,
     recall_ranked_limit: int = 0,
     rank_eligible_candidates: list[dict] | None = None,
+    recordability_supplement_keys: set[tuple[str, int, str]] | None = None,
     snapshot_source: str = "page",
     snapshot_context: str = "",
     news_end_time: datetime | None = None,
@@ -2409,6 +2534,12 @@ def _annotate_prediction_record_metadata(
     }
     if rank_eligible_candidates is None:
         rank_eligible_keys = set(ranked_positions) | set(recall_positions)
+    supplemental_keys = recordability_supplement_keys or set()
+    eligible_items_by_key = {
+        _prediction_record_key(item): item for item in (rank_eligible_candidates or [])
+    }
+    if not supplemental_keys <= rank_eligible_keys:
+        raise ValueError("prediction_record_universe: supplement_not_rank_eligible")
     pool_size = len(candidates)
     enriched: list[dict] = []
     for pool_index, item in enumerate(candidates, start=1):
@@ -2421,6 +2552,15 @@ def _annotate_prediction_record_metadata(
         recall_ranked_selected = recall_ranked_position > 0
         ranked_item = ranked_items_by_key.get(key) or {}
         execution_item = ranked_item or item
+        if key in supplemental_keys:
+            # Preserve the ranking producer's existing forecast-only gates,
+            # including for eligible names outside the formal Top12. Raw candidate
+            # probabilities/trade_ready are left untouched in the record payload.
+            execution_item = eligible_items_by_key[key]
+            if (execution_item.get("trade_ready") is not False
+                    or execution_item.get("prediction_watch_only") is not True
+                    or execution_item.get("prediction_actionable") is not False):
+                raise ValueError("prediction_record_universe: supplement_not_forecast_only")
         target_board = _safe_int(item.get("target_board"), 1)
         trade_gate_passed = bool(execution_item.get("trade_ready"))
         formal_actionable = bool(
@@ -2486,6 +2626,16 @@ def _annotate_prediction_record_metadata(
             ),
         }
         item_factors = dict(item.get("probability_factors") or {})
+        if key in supplemental_keys:
+            item_factors.update({
+                "prediction_record_policy_version": "eligible_complete_v2",
+                "prediction_record_admission": "rank_eligible_forecast_only",
+                "prediction_record_base_exclusions": {
+                    "keep_in_diagnostics": bool(item.get("keep_in_diagnostics")),
+                    "trade_ready_false": item.get("trade_ready") is False,
+                    "time_horizon": str(item.get("time_horizon") or ""),
+                },
+            })
         if candidate_anchor_trade_date is not None:
             item_factors["prediction_candidate_anchor_trade_date"] = (
                 candidate_anchor_trade_date.isoformat()
@@ -2589,19 +2739,39 @@ def _direction_research_payload(candidates: list[dict]) -> dict:
     """Project only new annotated records; never backfill cached/old snapshots."""
     lane = [item for item in candidates if _safe_int(item.get("target_board"), 1) == 1]
     proofs = [(item.get("probability_factors") or {}).get("direction_research") for item in lane]
+    unavailable = {"status": "unavailable", "reason": "direction_research_contract_missing",
+                   "candidates": [], "research_only": True, "frozen": False,
+                   "persistence_status": "not_verified", "target_precision": 0.8}
     if not lane or any(not isinstance(proof, dict) for proof in proofs):
-        return {"status": "unavailable", "reason": "direction_research_contract_missing",
-                "candidates": [], "research_only": True, "frozen": False,
-                "target_precision": 0.8}
-    # Pure recomputation supplies display metadata only; persisted proof wins
-    # when recordability validation blocked the rank.
-    _, metadata = annotate_direction_research(lane)
-    errors = sorted({proof.get("error") or "direction_research_contract_incomplete"
-                     for proof in proofs if proof.get("rank_contract_complete") is not True})
+        return unavailable
+    from app.promotion.direction_research import DIRECTION_RESEARCH_VERSION, DIRECTION_LABEL_VERSION
+    if any(proof.get("version") != DIRECTION_RESEARCH_VERSION
+           or proof.get("label_version") != DIRECTION_LABEL_VERSION
+           or proof.get("scope") != "research_only" for proof in proofs):
+        return {**unavailable, "reason": "direction_research_contract_unsupported"}
+    # Recompute only to verify the display contract, never to repair an old
+    # partial universe or replace recorded probabilities/ranks with current data.
+    projected, metadata = annotate_direction_research(lane)
+    errors = {str(proof.get("error") or "direction_research_contract_incomplete")
+              for proof in proofs if proof.get("rank_contract_complete") is not True}
+    if not errors:
+        fields = ("probability", "probability_method", "eligible", "selected",
+                  "rank_position", "rank_limit", "candidate_count", "eligible_count",
+                  "selected_count", "rank_contract_complete")
+        for original, item in zip(proofs, projected):
+            expected = item["probability_factors"]["direction_research"]
+            if any(type(original.get(key)) is not type(expected.get(key))
+                   or original.get(key) != expected.get(key) for key in fields):
+                errors.add("direction_research_contract_mismatch")
+    missing_counts = {proof.get("missing_recordable_count") for proof in proofs
+                      if type(proof.get("missing_recordable_count")) is int
+                      and proof["missing_recordable_count"] >= 0}
     metadata.update({"research_only": True, "frozen": False,
-                     "persistence_status": "not_verified"})
+                     "persistence_status": "not_verified",
+                     "missing_recordable_count": (next(iter(missing_counts))
+                                                  if len(missing_counts) == 1 else None)})
     if errors:
-        metadata.update({"status": "blocked", "reason": errors[0],
+        metadata.update({"status": "blocked", "reason": sorted(errors)[0],
                          "candidates": [], "selected_count": 0})
     return metadata
 
@@ -2991,14 +3161,17 @@ async def _load_stock_tag_map(db: AsyncSession, codes: list[str]) -> dict[str, S
     return {str(item.code or "").strip(): item for item in result.scalars().all()}
 
 
-def _select_best_prediction_record(records: list[PromotionPredictionRecord]) -> PromotionPredictionRecord | None:
+def _select_best_prediction_record(
+    records: list[PromotionPredictionRecord], *, factors_for_record=None,
+) -> PromotionPredictionRecord | None:
     if not records:
         return None
     records = [record for record in records if not _is_legacy_observation_first_board_record(record)]
     if not records:
         return None
     def rank_key(record: PromotionPredictionRecord) -> tuple:
-        factors = _json_loads_safe(record.factors_json)
+        factors = (factors_for_record(record) if factors_for_record is not None
+                   else _json_loads_safe(record.factors_json))
         snapshot_source = _prediction_record_snapshot_source(record, factors)
         snapshot_context = _prediction_record_snapshot_context(record, factors)
         snapshot_time = _prediction_record_snapshot_time(record)
@@ -3047,6 +3220,7 @@ def _resolve_actual_replay_status(
     snapshot_incomplete: bool = False,
     snapshot_record_count: int = 0,
     snapshot_min_record_count: int = 0,
+    factors: dict | None = None,
 ) -> tuple[str, str, str]:
     if record is None:
         board_tag = str(getattr(tag, "board_tag", "") or "")
@@ -3083,7 +3257,8 @@ def _resolve_actual_replay_status(
             "前一交易日没有留下该方向预测记录，通常表示消息/竞价/主线扩散触发没有被当时数据捕捉到。",
         )
 
-    factors = _json_loads_safe(record.factors_json)
+    if factors is None:
+        factors = _json_loads_safe(record.factors_json)
     probability = _safe_float(record.calibrated_probability, _safe_float(record.predicted_probability))
     route_score = _safe_float(factors.get("route_score"))
     ranked_selected = factors.get("prediction_ranked_selected", True) is not False
@@ -3406,7 +3581,7 @@ def _promotion_directional_metrics(predicted_count: int, evaluable_count: int, h
     return {
         "directional_evaluable_count": evaluable_count,
         "directional_unknown_count": unknown,
-        "directional_coverage": _promotion_review_ratio(evaluable_count, predicted_count),
+        "directional_coverage": _promotion_review_ratio(evaluable_count, predicted_count) if predicted_count else None,
         "directional_observed_precision": observed,
         "directional_precision_lower_bound": _promotion_review_ratio(hit_count, predicted_count) if predicted_count else None,
         "directional_precision_upper_bound": _promotion_review_ratio(hit_count + unknown, predicted_count) if predicted_count else None,
@@ -3509,13 +3684,15 @@ def _build_promotion_launch_precursor_metrics(
     strong_rising_codes: set[str],
     evaluable_codes: set[str] | None = None,
     limit_up_available: bool = True,
+    factors_for_record=None,
 ) -> dict[str, dict]:
     raw_metrics: dict[str, dict] = defaultdict(lambda: defaultdict(int))
     for record in records:
         code = str(record.code or "").strip()
         if not code:
             continue
-        factors = _json_loads_safe(record.factors_json)
+        factors = (factors_for_record(record) if factors_for_record is not None
+                   else _json_loads_safe(record.factors_json))
         actionable = factors.get("prediction_actionable") is True
         for cohort in _promotion_launch_precursor_cohorts(factors):
             item = raw_metrics[cohort]
@@ -3652,6 +3829,61 @@ def _promotion_review_recommendation(aggregate: dict) -> dict:
     }
 
 
+async def _load_promotion_review_close_records(
+    db: AsyncSession, prediction_dates: list[date],
+) -> list[PromotionPredictionRecord]:
+    """Choose the unchanged close batch before fetching large feature payloads."""
+    from types import SimpleNamespace
+
+    # SQLite legacy transaction mode does not start a snapshot for plain
+    # SELECTs. A local savepoint keeps identity and payload reads atomic without
+    # extending the snapshot over the builder's independent current-risk reads.
+    # Session.begin_nested() flushes even with autoflush disabled. Use a
+    # connection savepoint so pending caller state remains untouched, and suppress
+    # ORM autoflush for every read without changing the caller's transactions.
+    with db.no_autoflush:
+        connection = await db.connection()
+        async with connection.begin_nested():
+            model = PromotionPredictionRecord
+            rows = (await db.execute(select(
+                model.id, model.prediction_trade_date, model.target_board,
+                model.snapshot_source, model.snapshot_context, model.snapshot_recorded_at,
+                model.snapshot_batch_key, model.created_at, model.updated_at,
+            ).where(
+                model.prediction_trade_date.in_(prediction_dates),
+                model.target_board.in_([1, 2]),
+            ))).all()
+            # Keep the original query's scan order: max() uses first encounter on ties.
+            metadata = [SimpleNamespace(**dict(row._mapping), factors_json=None) for row in rows]
+            fallback_ids = [
+                row.id for row in metadata
+                if str(row.snapshot_source or "").strip() in {"", "legacy"}
+                or str(row.snapshot_context or "").strip().lower() in {"", "legacy"}
+                or not isinstance(row.snapshot_recorded_at, datetime)
+                or not str(row.snapshot_batch_key or "").strip()
+            ]
+            fallback = {}
+            for offset in range(0, len(fallback_ids), 400):
+                fallback.update((await db.execute(select(model.id, model.factors_json).where(
+                    model.id.in_(fallback_ids[offset:offset + 400]),
+                ))).all())
+            for row in metadata:
+                row.factors_json = fallback.get(row.id)
+            # Reuse the canonical/legacy selector, including context priority and keyed
+            # batches with unequal timestamps. Never prefilter observation routes here.
+            chosen_ids = [
+                row.id for row in _latest_learning_batch_records(metadata)
+                if _prediction_record_snapshot_source(row) == "schedule"
+            ]
+            records = {}
+            for offset in range(0, len(chosen_ids), 400):
+                loaded = (await db.execute(select(model).where(
+                    model.id.in_(chosen_ids[offset:offset + 400]),
+                ))).scalars().all()
+                records.update((row.id, row) for row in loaded)
+            return [records[row_id] for row_id in chosen_ids]
+
+
 async def _build_promotion_daily_learning_review(
     db: AsyncSession,
     *,
@@ -3672,17 +3904,48 @@ async def _build_promotion_daily_learning_review(
         PromotionPredictionRecord.prediction_trade_date
     ).where(PromotionPredictionRecord.prediction_trade_date < current.date()).distinct()
       .order_by(desc(PromotionPredictionRecord.prediction_trade_date)).limit(review_days))).scalars().all()
-    prediction_dates = list(recorded_dates) if recorded_dates else ordered_dates[1:review_days + 1]
+    # Preserve missing predictions in the bounded recent recorded-calendar window.
+    prediction_dates = sorted(set(recorded_dates) | set(ordered_dates[1:review_days + 1]), reverse=True)
     review_pairs = []
     for prediction_day in prediction_dates:
         outcome_day, reason = next_recorded_trade_day(prediction_day, calendar, through=current.date())
+        if reason == "outcome_session_not_available":
+            continue  # Known pending T+1 is not the latest completed review.
         if outcome_day is not None and not _is_completed_promotion_outcome_date(outcome_day, now=current):
             continue
         review_pairs.append((prediction_day, outcome_day, reason))
-    actual_dates = [day for _, day, _ in review_pairs if day is not None]
-    pool_dates = set((await db.execute(select(LimitUpPool.trade_date).where(
+        if len(review_pairs) >= review_days:
+            break
+    prediction_dates = [day for day, _, _ in review_pairs]
+    actual_dates = list(dict.fromkeys(day for _, day, _ in review_pairs if day is not None))
+    pool_rows = (await db.execute(select(LimitUpPool.trade_date, LimitUpPool.source_version).where(
         LimitUpPool.trade_date.in_(actual_dates + prediction_dates), LimitUpPool.quarantined.is_(False)
-    ).distinct())).scalars().all())
+    ))).all()
+    pool_dates = {day for day, _ in pool_rows}
+    new_pool_dates = {day for day, version in pool_rows if version}
+    pool_counts = defaultdict(int)
+    for day, _ in pool_rows:
+        pool_counts[day] += 1
+    from app.data.limit_pool import limit_pool_health
+    pool_health = {
+        day: await limit_pool_health(db, trade_date=day, decision_at=current, require_close=True)
+        for day in sorted(set(actual_dates + prediction_dates))
+    }
+
+    def pool_state(day):
+        health = pool_health.get(day)
+        if health is not None:
+            # A complete quote universe must also agree with its stored members.
+            up_count = health.get("up_count")
+            count_matches = type(up_count) is int and up_count >= 0 and up_count == pool_counts[day]
+            return "verified" if health.get("ready") is True and count_matches else "incomplete"
+        if day in new_pool_dates:
+            return "incomplete"  # New rows without their round are not legacy proof.
+        return "legacy" if day in pool_dates else "missing"
+
+    def review_ratio(numerator, denominator):
+        return (_promotion_review_ratio(numerator, denominator)
+                if numerator is not None and denominator is not None and denominator > 0 else None)
 
     actual_limit_ups_by_date: dict[date, list[dict]] = {}
     market_limit_up_counts_by_date: dict[date, int] = {}
@@ -3699,27 +3962,21 @@ async def _build_promotion_daily_learning_review(
             if stock_tagger.is_tradeable(str(item.get("code") or "").strip())
         ]
 
-    kline_rows = (await db.execute(select(StockKline).where(
-        StockKline.trade_date.in_(actual_dates + prediction_dates)
-    ))).scalars().all()
+    kline_rows = (await db.execute(select(
+        StockKline.code, StockKline.trade_date, StockKline.source,
+        StockKline.close, StockKline.volume, StockKline.prev_close, StockKline.change_pct,
+    ).where(StockKline.trade_date.in_(actual_dates + prediction_dates)))).all()
     bars = {(bar.code, bar.trade_date): bar for bar in kline_rows}
+    bars_by_date = defaultdict(list)
+    for (code, day), bar in bars.items():
+        bars_by_date[day].append((code, bar))
 
-    prediction_result = await db.execute(
-        select(PromotionPredictionRecord).where(
-            PromotionPredictionRecord.prediction_trade_date.in_(prediction_dates),
-            PromotionPredictionRecord.target_board.in_([1, 2]),
-        )
-    )
     latest_prediction_records = [
-        record
-        for record in _latest_learning_batch_records(list(prediction_result.scalars().all()))
+        record for record in await _load_promotion_review_close_records(db, prediction_dates)
         if not _is_legacy_observation_first_board_record(record)
     ]
     records_by_date_target: dict[tuple[date, int], list[PromotionPredictionRecord]] = defaultdict(list)
     for record in latest_prediction_records:
-        factors = _json_loads_safe(record.factors_json)
-        if _prediction_record_snapshot_source(record, factors) != "schedule":
-            continue
         records_by_date_target[(record.prediction_trade_date, _safe_int(record.target_board))].append(record)
 
     daily_rows: list[dict] = []
@@ -3729,20 +3986,24 @@ async def _build_promotion_daily_learning_review(
     aggregate_outcome_sum = 0
     for prediction_trade_date, actual_trade_date, calendar_reason in review_pairs:
         calendar_gap_days = (actual_trade_date - prediction_trade_date).days if actual_trade_date else 0
-        limit_up_available = prediction_trade_date in pool_dates and actual_trade_date in pool_dates
+        prediction_pool_state = pool_state(prediction_trade_date)
+        outcome_pool_state = pool_state(actual_trade_date)
+        # Verified Wencai heights carry the actual board directly. Only legacy
+        # normalization requires the immediately preceding pool as evidence.
+        limit_up_available = outcome_pool_state == "verified" or (
+            outcome_pool_state == "legacy" and prediction_pool_state in {"legacy", "verified"}
+        )
         pool_reasons = []
-        if prediction_trade_date not in pool_dates:
-            pool_reasons.append("prediction_limit_up_pool_missing")
-        if actual_trade_date not in pool_dates:
-            pool_reasons.append("outcome_limit_up_pool_missing")
+        if outcome_pool_state != "verified" and prediction_pool_state not in {"legacy", "verified"}:
+            pool_reasons.append("prediction_limit_up_pool_" + prediction_pool_state)
+        if outcome_pool_state in {"missing", "incomplete"}:
+            pool_reasons.append("outcome_limit_up_pool_" + outcome_pool_state)
         evaluation_reasons = ([calendar_reason] if calendar_reason else []) + pool_reasons
         evaluable_codes = set()
         rising_codes = set()
         strong_rising_codes = set()
         bar_errors = {}
-        for (code, day), after in bars.items():
-            if actual_trade_date is None or day != actual_trade_date:
-                continue
+        for code, after in bars_by_date.get(actual_trade_date, ()):
             error = formal_outcome_bar_error(bars.get((code, prediction_trade_date)), after)
             if not error and (not isinstance(after.change_pct, (int, float)) or not isfinite(after.change_pct)):
                 error = "candidate_outcome_change_invalid"
@@ -3755,8 +4016,8 @@ async def _build_promotion_daily_learning_review(
                 rising_codes.add(code)
             if change >= 5 and stock_tagger.is_tradeable(code):
                 strong_rising_codes.add(code)
-        # The shared normalizer can bridge absent pool dates. Without both
-        # endpoint pools its first/second-board classification is unknown.
+        # Do not turn filtered incomplete source rows into a verified empty pool.
+        # Legacy normalization still needs both endpoint pools.
         actual_limit_ups = (actual_limit_ups_by_date.get(actual_trade_date) or []) if limit_up_available else []
         actual_codes_by_target = {
             1: {
@@ -3788,14 +4049,26 @@ async def _build_promotion_daily_learning_review(
 
         for target_board in (1, 2):
             lane_records = records_by_date_target.get((prediction_trade_date, target_board), [])
+            # Only retain decoded payloads for this lane, never across requests.
+            decoded_factors = {}
+
+            def factors_for_record(record):
+                key = id(record)
+                if key not in decoded_factors:
+                    decoded_factors[key] = _json_loads_safe(record.factors_json)
+                return decoded_factors[key]
+
             best_records: dict[str, PromotionPredictionRecord] = {}
             for record in lane_records:
                 code = str(record.code or "").strip()
-                selected = _select_best_prediction_record([item for item in (best_records.get(code), record) if item is not None])
+                selected = _select_best_prediction_record(
+                    [item for item in (best_records.get(code), record) if item is not None],
+                    factors_for_record=factors_for_record,
+                )
                 if selected is not None:
                     best_records[code] = selected
             for record in best_records.values():
-                factors = _json_loads_safe(record.factors_json)
+                factors = factors_for_record(record)
                 model_version = str(
                     record.model_version
                     or factors.get("prediction_model_version")
@@ -3809,10 +4082,10 @@ async def _build_promotion_daily_learning_review(
             ranked_records = [
                 record
                 for record in best_records.values()
-                if _json_loads_safe(record.factors_json).get("prediction_ranked_selected") is True
+                if factors_for_record(record).get("prediction_ranked_selected") is True
             ]
             ranked_records.sort(
-                key=lambda record: _safe_int(_json_loads_safe(record.factors_json).get("prediction_ranked_position"), 9999)
+                key=lambda record: _safe_int(factors_for_record(record).get("prediction_ranked_position"), 9999)
             )
             ranked_codes = {str(record.code or "").strip() for record in ranked_records}
             pool_codes = {
@@ -3821,19 +4094,19 @@ async def _build_promotion_daily_learning_review(
                 if str(record.code or "").strip()
             }
             recall_ranked_available = any(
-                "prediction_recall_ranked_selected" in _json_loads_safe(record.factors_json)
+                "prediction_recall_ranked_selected" in factors_for_record(record)
                 for record in best_records.values()
             )
             recall_ranked_records = [
                 record
                 for record in best_records.values()
-                if _json_loads_safe(record.factors_json).get(
+                if factors_for_record(record).get(
                     "prediction_recall_ranked_selected"
                 ) is True
             ]
             recall_ranked_records.sort(
                 key=lambda record: _safe_int(
-                    _json_loads_safe(record.factors_json).get(
+                    factors_for_record(record).get(
                         "prediction_recall_ranked_position"
                     ),
                     9999,
@@ -3847,7 +4120,7 @@ async def _build_promotion_daily_learning_review(
             predicted_codes.update(ranked_codes)
             if target_board == 1:
                 for record in ranked_records:
-                    factors = _json_loads_safe(record.factors_json)
+                    factors = factors_for_record(record)
                     exposure_item = {
                         "sector_name": str(factors.get("sector_name") or ""),
                         "sector_code": str(factors.get("sector_code") or ""),
@@ -3868,12 +4141,12 @@ async def _build_promotion_daily_learning_review(
             actionability_labeled_records = [
                 record
                 for record in ranked_records
-                if "prediction_actionable" in _json_loads_safe(record.factors_json)
+                if "prediction_actionable" in factors_for_record(record)
             ]
             actionable_records = [
                 record
                 for record in actionability_labeled_records
-                if _json_loads_safe(record.factors_json).get("prediction_actionable") is True
+                if factors_for_record(record).get("prediction_actionable") is True
             ]
             actionable_codes = {
                 str(record.code or "").strip()
@@ -3889,6 +4162,7 @@ async def _build_promotion_daily_learning_review(
                     strong_rising_codes=strong_rising_codes,
                     evaluable_codes=evaluable_codes,
                     limit_up_available=limit_up_available,
+                    factors_for_record=factors_for_record,
                 )
             low_probability_cutoff = 0.10 if target_board == 1 else 0.08
             underestimated_hit_count = sum(
@@ -3918,6 +4192,7 @@ async def _build_promotion_daily_learning_review(
                     snapshot_incomplete=not lane_snapshot_complete,
                     snapshot_record_count=len(best_records),
                     snapshot_min_record_count=minimum_records,
+                    factors=factors_for_record(record) if record is not None else None,
                 )
                 missed_reason_counts[status] += 1
                 if status != "predicted_hit" and len(missed_examples) < 12:
@@ -3942,13 +4217,13 @@ async def _build_promotion_daily_learning_review(
                     )
 
             for record in ranked_records:
+                probability = _safe_float(record.calibrated_probability, _safe_float(record.predicted_probability))
+                day_probability_sum += probability
                 if not limit_up_available:
                     continue
-                probability = _safe_float(record.calibrated_probability, _safe_float(record.predicted_probability))
                 outcome = 1 if str(record.code or "").strip() in actual_codes else 0
                 day_brier_sum += (probability - outcome) ** 2
                 day_brier_count += 1
-                day_probability_sum += probability
                 day_outcome_sum += outcome
 
             lane_metrics[f"target_{target_board}"] = {
@@ -3990,8 +4265,24 @@ async def _build_promotion_daily_learning_review(
                 ),
                 "snapshot_complete": lane_snapshot_complete,
             }
+            decoded_factors.clear()
 
         for lane in lane_metrics.values():
+            # Empty/absent lists are not evaluated zero-hit forecasts.
+            if not lane["predicted_count"]:
+                for field in ("hit_count", "underestimated_hit_count", "precision", "recall"):
+                    lane[field] = None
+            else:
+                lane["recall"] = review_ratio(lane["hit_count"], lane["actual_count"])
+            lane["pool_recall"] = review_ratio(lane["pool_hit_count"], lane["actual_count"])
+            if not lane["pool_count"]:
+                lane["pool_hit_count"] = lane["pool_recall"] = None
+            if not lane["recall_ranked_available"] or not lane["recall_ranked_count"]:
+                lane["recall_hit_count"] = lane["recall_precision"] = lane["recall_recall"] = None
+            else:
+                lane["recall_recall"] = review_ratio(lane["recall_hit_count"], lane["actual_count"])
+            if not lane["actionable_predicted_count"]:
+                lane["actionable_hit_count"] = lane["actionable_precision"] = None
             lane["evaluation_reasons"] = (
                 (["snapshot_incomplete"] if not lane["snapshot_complete"] else [])
                 + (["candidate_outcome_bar_missing_or_invalid"] if lane["directional_unknown_count"] else [])
@@ -4034,6 +4325,7 @@ async def _build_promotion_daily_learning_review(
                 "actual_trade_date": str(actual_trade_date) if actual_trade_date else None,
                 "prediction_trade_date": str(prediction_trade_date),
                 "evaluation_scope": "previous_close_schedule_snapshot",
+                "outcome_universe_scope": "current_risk_filtered_main_board",
                 "calendar_gap_days": calendar_gap_days,
                 "has_unobservable_news_window": calendar_gap_days > 1,
                 "evaluation_scope_warning": (
@@ -4068,7 +4360,9 @@ async def _build_promotion_daily_learning_review(
                 "strong_rise_precision": _promotion_review_ratio(len(predicted_codes & strong_rising_codes), len(predicted_codes)),
                 "limit_up_precision": _promotion_review_ratio(total_hits, len(predicted_codes)),
                 "limit_up_recall": _promotion_review_ratio(total_hits, len(actual_target_codes)),
-                "average_predicted_probability": _promotion_review_ratio(day_probability_sum, day_brier_count),
+                "average_predicted_probability": review_ratio(
+                    day_probability_sum, sum(lane["predicted_count"] for lane in lane_metrics.values())
+                ),
                 "observed_hit_rate": _promotion_review_ratio(day_outcome_sum, day_brier_count),
                 "calibration_bias": round(
                     _promotion_review_ratio(day_probability_sum, day_brier_count)
@@ -4100,6 +4394,10 @@ async def _build_promotion_daily_learning_review(
             }
         )
         row = daily_rows[-1]
+        row["limit_up_recall"] = review_ratio(total_hits, len(actual_target_codes))
+        row["actionable_limit_up_precision"] = review_ratio(total_actionable_hits, total_actionable_predictions)
+        if not total_actionable_predictions:
+            row["actionable_limit_up_hit_count"] = None
         if pool_reasons:
             for cohort in launch_precursor_metrics.values():
                 cohort["evaluation_reasons"] = sorted(set(
@@ -4120,7 +4418,10 @@ async def _build_promotion_daily_learning_review(
                                     "partial" if predicted_codes and (limit_up_available or row["directional_evaluable_count"]) else "unavailable")
         row["limit_up_evaluable_count"] = len(predicted_codes) if limit_up_available else 0
         if not predicted_codes:
-            for field in ("limit_up_precision", "actionable_limit_up_precision", "brier_score", "observed_hit_rate", "calibration_bias"):
+            for field in ("predicted_rising_hit_count", "predicted_strong_rising_hit_count",
+                          "predicted_limit_up_hit_count", "underestimated_limit_up_hit_count",
+                          "limit_up_precision", "limit_up_recall", "actionable_limit_up_precision",
+                          "brier_score", "observed_hit_rate", "calibration_bias"):
                 row[field] = None
         if not limit_up_available:
             for field in ("market_target_limit_up_count", "actual_target_limit_up_count", "predicted_limit_up_hit_count",
@@ -4133,6 +4434,7 @@ async def _build_promotion_daily_learning_review(
         aggregate_outcome_sum += day_outcome_sum
 
     aggregate = {
+        "outcome_universe_scope": "current_risk_filtered_main_board",
         "review_days": len(daily_rows),
         "valid_review_days": sum(1 for item in daily_rows if item.get("evaluation_status") == "complete"),
         "actual_rising_count": sum(_safe_int(item.get("actual_rising_count")) for item in daily_rows),
@@ -4162,7 +4464,10 @@ async def _build_promotion_daily_learning_review(
             1 for item in daily_rows if bool((item.get("prediction_exposure") or {}).get("overconcentrated"))
         ),
         "brier_score": round(aggregate_brier_sum / aggregate_brier_count, 4) if aggregate_brier_count else 0.0,
-        "average_predicted_probability": _promotion_review_ratio(aggregate_probability_sum, aggregate_brier_count),
+        "average_predicted_probability": review_ratio(
+            aggregate_probability_sum,
+            sum(lane["predicted_count"] for row in daily_rows for lane in row["lane_metrics"].values()),
+        ),
         "observed_hit_rate": _promotion_review_ratio(aggregate_outcome_sum, aggregate_brier_count),
     }
     aggregate["launch_precursor_metrics"] = _aggregate_promotion_launch_precursor_metrics(daily_rows)
@@ -4198,14 +4503,30 @@ async def _build_promotion_daily_learning_review(
     aggregate["limit_up_evaluable_count"] = sum(row["limit_up_evaluable_count"] for row in daily_rows)
     if aggregate["directional_precision"] is None:
         aggregate["strong_rise_precision"] = None
+    # Market counts are independent of whether a formal forecast was recorded.
+    # Conversely, unknown daily event counts must not become full-window zeros.
+    for field in ("predicted_rising_hit_count", "predicted_strong_rising_hit_count",
+                  "predicted_limit_up_hit_count", "underestimated_limit_up_hit_count",
+                  "actual_target_limit_up_count", "market_target_limit_up_count"):
+        if not daily_rows or any(row[field] is None for row in daily_rows):
+            aggregate[field] = None
+    actionable_rows = [row for row in daily_rows if row["actionable_predicted_count"]]
+    if not actionable_rows or any(row["actionable_limit_up_hit_count"] is None for row in actionable_rows):
+        aggregate["actionable_limit_up_hit_count"] = None
+    aggregate["actionable_limit_up_precision"] = review_ratio(
+        aggregate["actionable_limit_up_hit_count"], aggregate["actionable_predicted_count"]
+    )
+    aggregate["limit_up_recall"] = review_ratio(
+        aggregate["predicted_limit_up_hit_count"], aggregate["actual_target_limit_up_count"]
+    )
     if not daily_rows or any(row["limit_up_precision"] is None for row in daily_rows):
-        for field in ("limit_up_precision", "limit_up_recall", "actionable_limit_up_precision",
-                      "observed_hit_rate", "calibration_bias", "brier_score",
-                      "predicted_limit_up_hit_count", "actual_target_limit_up_count", "market_target_limit_up_count"):
+        for field in ("limit_up_precision", "limit_up_recall",
+                      "observed_hit_rate", "calibration_bias", "brier_score"):
             aggregate[field] = None
     recommendation = _promotion_review_recommendation(aggregate)
     return {
         "status": "ok" if daily_rows else "insufficient_data",
+        "outcome_universe_scope": "current_risk_filtered_main_board",
         "evaluation_as_of": current.isoformat(timespec="seconds"),
         "latest_completed_trade_date": str(ordered_dates[0]) if ordered_dates else None,
         "lookback_days": review_days,
@@ -4221,7 +4542,9 @@ async def _build_promotion_daily_learning_review(
             "lane_metrics 将 pool_recall、正式 Top12 和 Top30 宽召回成绩分开，首板/二板也分别统计，不能把候选池覆盖或二板命中冒充首板精度",
             "prediction_actionable 单独统计当时已通过交易执行闸门的子集；正式预测命中与可执行交易命中不得混成一个精度",
             "跨周末/节假日的消息在上一交易日收盘时尚不可见，daily.has_unobservable_news_window 会明确标记，不能据此把周末突发催化算作收盘模型漏选",
-            "实际结果同时统计全市场首/二板数和主板上涨、强涨(>=5%)、首板、二板；模型精度/召回只按可交易主板目标严格对齐",
+            "outcome_universe_scope=current_risk_filtered_main_board仅描述主板涨停事件统计；market_target_limit_up_count经过当前风控过滤但包含非主板观察范围，不是主板分母",
+            "actual_rising_count/actual_strong_rising_count基于正式K线证据及is_tradeable代码前缀，不经过当前数据库StockTag过滤；方向候选结果按冻结名单与K线证据评价，不证明历史可交易性",
+            "涨停事件采用的当前StockTag/风控标签不是历史时点身份（非PIT）；相应范围会随当前标签变化，不代表已认证历史完整可交易宇宙或当时交易资格",
             "每天的漏选按未入池、分数低、排序截断、快照不完整分开归因",
             "prediction_exposure 记录首板主榜的板块/宽主题集中度；预测榜不再硬删题材簇，集中风险只作用于独立交易执行闸门",
             "launch_precursor_metrics 分组跟踪中低位修复、三日资金、主营行业点火和直接消息的上涨/强涨/首板表现；各组可重叠且不会把预测证据当作交易闸门",
@@ -4251,28 +4574,8 @@ async def _build_auction_snapshot_health(
     db: AsyncSession,
     trade_date: date,
 ) -> dict:
-    latest_time_subquery = (
-        select(
-            AuctionData.code.label("code"),
-            func.max(AuctionData.auction_time).label("latest_auction_time"),
-        )
-        .where(
-            AuctionData.trade_date == trade_date,
-            AuctionData.auction_time.between("09:15:00", "09:25:30"),
-        )
-        .group_by(AuctionData.code)
-        .subquery()
-    )
     result = await db.execute(
-        select(AuctionData)
-        .join(
-            latest_time_subquery,
-            and_(
-                latest_time_subquery.c.code == AuctionData.code,
-                latest_time_subquery.c.latest_auction_time == AuctionData.auction_time,
-            ),
-        )
-        .where(AuctionData.trade_date == trade_date)
+        select(AuctionData).where(AuctionData.id.in_(latest_auction_ids(trade_date)))
     )
     rows = list(result.scalars().all())
     latest_code_count = len(rows)
@@ -5049,38 +5352,49 @@ def _default_burst_pullback_restart_meta() -> dict:
 def _build_burst_pullback_restart_meta(bars: list[dict]) -> dict:
     """识别爆量点火后缩量深调、再度收复均线的主升浪前兆。"""
     default_meta = _default_burst_pullback_restart_meta()
-    cleaned_bars = [
-        item
-        for item in (bars or [])
-        if _safe_float(item.get("close")) > 0
-        and _safe_float(item.get("high")) > 0
-        and _safe_float(item.get("low")) > 0
-        and _safe_float(item.get("volume")) > 0
-    ]
+    cleaned_bars = []
+    closes, highs, lows, volumes = [], [], [], []
+    for item in (bars or []):
+        # Preserve the original filter's field order and short-circuit behavior.
+        close = _safe_float(item.get("close"))
+        if not close > 0:
+            continue
+        high = _safe_float(item.get("high"))
+        if not high > 0:
+            continue
+        low = _safe_float(item.get("low"))
+        if not low > 0:
+            continue
+        volume = _safe_float(item.get("volume"))
+        if not volume > 0:
+            continue
+        cleaned_bars.append(item)
+        closes.append(close)
+        highs.append(high)
+        lows.append(low)
+        volumes.append(volume)
     if len(cleaned_bars) < 18:
         return default_meta
 
     latest_bar = cleaned_bars[-1]
-    latest_close = _safe_float(latest_bar.get("close"))
-    latest_volume = _safe_float(latest_bar.get("volume"))
-    closes = [_safe_float(item.get("close")) for item in cleaned_bars]
-    highs = [_safe_float(item.get("high")) for item in cleaned_bars]
-    volumes = [_safe_float(item.get("volume")) for item in cleaned_bars]
+    latest_close = closes[-1]
+    latest_volume = volumes[-1]
     ma10 = _mean(closes[-10:]) if len(closes) >= 10 else 0.0
     ma20 = _mean(closes[-20:]) if len(closes) >= 20 else 0.0
     latest_prev_close = _safe_float(latest_bar.get("prev_close"))
     if latest_prev_close <= 0 and len(cleaned_bars) >= 2:
-        latest_prev_close = _safe_float(cleaned_bars[-2].get("close"))
+        latest_prev_close = closes[-2]
     latest_change_pct = _safe_float(latest_bar.get("change_pct"))
     if latest_change_pct == 0 and latest_prev_close > 0:
         latest_change_pct = _safe_percent_change(latest_close, latest_prev_close)
 
     best_meta = default_meta
+    restart_volume_ratio_cached = None
     search_start = max(10, len(cleaned_bars) - 55)
     search_end = max(search_start, len(cleaned_bars) - 5)
     for idx in range(search_start, search_end):
         burst_bar = cleaned_bars[idx]
-        burst_volume = _safe_float(burst_bar.get("volume"))
+        burst_volume = volumes[idx]
         if burst_volume <= 0:
             continue
         prev_volumes = volumes[max(0, idx - 20):idx]
@@ -5094,9 +5408,9 @@ def _build_burst_pullback_restart_meta(bars: list[dict]) -> dict:
         )
         burst_prev_close = _safe_float(burst_bar.get("prev_close"))
         if burst_prev_close <= 0 and idx > 0:
-            burst_prev_close = _safe_float(cleaned_bars[idx - 1].get("close"))
-        burst_high = _safe_float(burst_bar.get("high"))
-        burst_close = _safe_float(burst_bar.get("close"))
+            burst_prev_close = closes[idx - 1]
+        burst_high = highs[idx]
+        burst_close = closes[idx]
         burst_change_pct = _safe_float(burst_bar.get("change_pct"))
         if burst_change_pct == 0 and burst_prev_close > 0:
             burst_change_pct = _safe_percent_change(burst_close, burst_prev_close)
@@ -5104,25 +5418,26 @@ def _build_burst_pullback_restart_meta(bars: list[dict]) -> dict:
         if burst_volume_ratio < 3.0 or max(burst_change_pct, burst_high_pct) < 5.0:
             continue
 
-        after_burst = cleaned_bars[idx + 1:]
-        if len(after_burst) < 4:
+        after_burst_lows = lows[idx + 1:]
+        if len(after_burst_lows) < 4:
             continue
-        low_rel_idx, low_bar = min(enumerate(after_burst), key=lambda item: _safe_float(item[1].get("low")) or 999999.0)
+        low_rel_idx, low_price = min(enumerate(after_burst_lows), key=lambda item: item[1] or 999999.0)
         low_idx = idx + 1 + low_rel_idx
-        low_price = _safe_float(low_bar.get("low"))
         if low_price <= 0:
             continue
         pullback_depth_pct = _safe_percent_change(burst_high, low_price)
         days_since_low = len(cleaned_bars) - low_idx - 1
         if days_since_low < 1:
             continue
-        low_window = cleaned_bars[max(idx + 1, low_idx - 1): min(len(cleaned_bars), low_idx + 3)]
-        low_window_volume = _mean([_safe_float(item.get("volume")) for item in low_window if _safe_float(item.get("volume")) > 0])
+        low_window = volumes[max(idx + 1, low_idx - 1): min(len(cleaned_bars), low_idx + 3)]
+        low_window_volume = _mean([volume for volume in low_window if volume > 0])
         burst_shrink_ratio = low_window_volume / burst_volume if burst_volume > 0 and low_window_volume > 0 else 1.0
         rebound_pct = _safe_percent_change(latest_close, low_price)
         burst_high_gap_pct = max(_safe_percent_change(burst_high, latest_close), 0.0)
-        previous_volume = _mean(volumes[-11:-1]) if len(volumes) >= 11 else _mean(volumes[:-1])
-        restart_volume_ratio = latest_volume / previous_volume if previous_volume > 0 else 0.0
+        if restart_volume_ratio_cached is None:
+            previous_volume = _mean(volumes[-11:-1]) if len(volumes) >= 11 else _mean(volumes[:-1])
+            restart_volume_ratio_cached = latest_volume / previous_volume if previous_volume > 0 else 0.0
+        restart_volume_ratio = restart_volume_ratio_cached
         reclaim_ma = bool(
             (ma10 > 0 and latest_close >= ma10 * 0.99)
             or (ma20 > 0 and latest_close >= ma20 * 0.97)
@@ -5328,29 +5643,39 @@ def _weekday_gap(start_date: date, end_date: date) -> int:
     return days
 
 
-def _evaluate_platform_cycle_window(window_bars: list[dict], latest_close: float, config: dict) -> dict | None:
+def _evaluate_platform_cycle_window(
+    window_bars: list[dict], latest_close: float, config: dict, *,
+    _numeric_bars: list[tuple[float, float, float]] | None = None,
+) -> dict | None:
     if len(window_bars) < 8 or latest_close <= 0:
         return None
 
-    highs = [_safe_float(item.get("high")) for item in window_bars if _safe_float(item.get("high")) > 0]
-    lows = [_safe_float(item.get("low")) for item in window_bars if _safe_float(item.get("low")) > 0]
-    volumes = [_safe_float(item.get("volume")) for item in window_bars if _safe_float(item.get("volume")) >= 0]
+    # A resolver evaluates many overlapping suffixes of the same immutable bars.
+    # Normalize once per bar, retaining the original order of filtering/summing.
+    # Do not use prefix-sum subtraction: its rounding can change a gate boundary.
+    numeric_bars = _numeric_bars if _numeric_bars is not None else [
+        (_safe_float(item.get("high")), _safe_float(item.get("low")),
+         _safe_float(item.get("volume"))) for item in window_bars
+    ]
+    highs = [item[0] for item in numeric_bars if item[0] > 0]
+    lows = [item[1] for item in numeric_bars if item[1] > 0]
+    volumes = [item[2] for item in numeric_bars if item[2] >= 0]
     if not highs or not lows or len(volumes) < len(window_bars):
         return None
 
     recent_three = window_bars[-3:]
-    earlier_window = window_bars[:-3] or window_bars
-    reference_window = window_bars[:-3] or window_bars[:-1] or window_bars
+    earlier_values = numeric_bars[:-3] or numeric_bars
+    reference_values = numeric_bars[:-3] or numeric_bars[:-1] or numeric_bars
 
     platform_high = max(highs)
     platform_low = min(lows)
     platform_range_pct = _safe_percent_change(platform_high, platform_low)
-    reference_highs = [_safe_float(item.get("high")) for item in reference_window if _safe_float(item.get("high")) > 0]
+    reference_highs = [item[0] for item in reference_values if item[0] > 0]
     reference_high = max(reference_highs) if reference_highs else platform_high
     overhead_gap_pct = max(_safe_percent_change(reference_high, latest_close), 0.0) if reference_high > 0 else 0.0
 
-    recent_three_volumes = [_safe_float(item.get("volume")) for item in recent_three]
-    earlier_volumes = [_safe_float(item.get("volume")) for item in earlier_window]
+    recent_three_volumes = [item[2] for item in numeric_bars[-3:]]
+    earlier_volumes = [item[2] for item in earlier_values]
     platform_avg_volume = _mean(volumes)
     earlier_avg_volume = _mean(earlier_volumes) or platform_avg_volume
     recent_three_avg_volume = _mean(recent_three_volumes)
@@ -5409,6 +5734,11 @@ def _evaluate_platform_cycle_window(window_bars: list[dict], latest_close: float
 
 def _resolve_platform_cycle_context(completed_bars: list[dict], latest_close: float) -> dict:
     best_fallback: dict | None = None
+    max_window_days = max(_safe_int(config.get("max_days")) for config in PLATFORM_CYCLE_CONFIGS)
+    numeric_bars = [
+        (_safe_float(item.get("high")), _safe_float(item.get("low")),
+         _safe_float(item.get("volume"))) for item in completed_bars[-max_window_days:]
+    ] if len(completed_bars) >= 8 and not latest_close <= 0 else []
 
     for config in PLATFORM_CYCLE_CONFIGS:
         min_days = _safe_int(config.get("min_days"))
@@ -5417,7 +5747,10 @@ def _resolve_platform_cycle_context(completed_bars: list[dict], latest_close: fl
             continue
 
         for days in range(max_days, min_days - 1, -1):
-            metrics = _evaluate_platform_cycle_window(completed_bars[-days:], latest_close, config)
+            metrics = _evaluate_platform_cycle_window(
+                completed_bars[-days:], latest_close, config,
+                _numeric_bars=numeric_bars[-days:],
+            )
             if not metrics:
                 continue
             if metrics.get("qualifies"):
@@ -5430,7 +5763,10 @@ def _resolve_platform_cycle_context(completed_bars: list[dict], latest_close: fl
 
     fallback_config = PLATFORM_CYCLE_CONFIGS[-1]
     fallback_days = min(len(completed_bars), _safe_int(fallback_config.get("min_days"), 8))
-    metrics = _evaluate_platform_cycle_window(completed_bars[-fallback_days:], latest_close, fallback_config)
+    metrics = _evaluate_platform_cycle_window(
+        completed_bars[-fallback_days:], latest_close, fallback_config,
+        _numeric_bars=numeric_bars[-fallback_days:],
+    )
     if metrics is not None:
         return metrics
     return {
@@ -7415,12 +7751,21 @@ async def _normalize_limit_up_consecutive_days(
     return normalized_current
 
 
-async def _load_filtered_limit_ups(db: AsyncSession, trade_date: date | None) -> list[dict]:
+async def _load_filtered_limit_ups(
+    db: AsyncSession, trade_date: date | None, *, market_view: bool = False,
+) -> list[dict]:
     if trade_date is None:
         return []
 
     rows = await _load_limit_up_rows(db, trade_date)
-    normalized_days = await _normalize_limit_up_consecutive_days(db, trade_date, rows)
+    from app.data.limit_pool import limit_row_usable
+    # New price-state observations without Wencai details are not first boards
+    # or zero-break boards. Keep them in storage/quality diagnostics, not ranking.
+    rows = [row for row in rows if not row.source_version
+            or limit_row_usable(row, decision_at=datetime.now())]
+    # Verified Wencai heights are authoritative; only legacy rows need history.
+    legacy_rows = [row for row in rows if not row.source_version]
+    normalized_days = await _normalize_limit_up_consecutive_days(db, trade_date, legacy_rows)
     raw_items = [
         {
             "code": row.code,
@@ -7429,14 +7774,40 @@ async def _load_filtered_limit_ups(db: AsyncSession, trade_date: date | None) ->
             "break_count": int(row.break_count or 0),
             "turnover": float(row.turnover or 0),
             "limit_up_time": row.limit_up_time or "",
-            "consecutive_days": normalized_days.get(str(row.code or "").strip(), int(row.consecutive_days or 1)),
+            "consecutive_days": (int(row.consecutive_days) if row.source_version
+                                 else normalized_days.get(str(row.code or "").strip(), int(row.consecutive_days or 1))),
             "trade_date": str(row.trade_date),
             "source": row.source or "",
             "limit_up_reason": row.limit_up_reason or "",
         }
         for row in rows
     ]
+    if market_view:
+        return await _filter_promotion_market_rows(db, raw_items)
     return await stock_tagger.filter_signals(db, raw_items)
+
+
+async def _filter_promotion_market_rows(db: AsyncSession, items: list[dict]) -> list[dict]:
+    """Market observations are not entry permissions; never clear risk projections."""
+    tagged = await stock_tagger.filter_signals(
+        db, items, exclude_suspended=False, exclude_blocked=False,
+    )
+    result = []
+    for item in tagged:
+        status = item["stock_status"]
+        # A sticky "is_delisting" is a risk warning, not a delisted fact (the
+        # quote universe uses the same name distinction). Keep the entry ban.
+        _, delisted_name = stock_tagger.name_risks(item.get("name"))
+        if status["is_st"] or delisted_name:
+            continue
+        if status["board_tag"] == "suspended":
+            # A verified traded quote can conflict with a sticky old halt tag.
+            # Display the evidence without granting permission or claiming a halt.
+            item["tag"] = "停牌标签待核验 · 禁止交易"
+        elif status["is_delisting"]:
+            item["tag"] = "退市风险标签 · 禁止交易"
+        result.append(item)
+    return result
 
 
 async def _load_sentiment_cycle(db: AsyncSession, trade_date: date) -> str:
@@ -8373,29 +8744,10 @@ async def _load_auction_surge_context_map(
     # 竞价是逐分钟快照。旧实现按涨幅倒序后保留历史最高值，会把09:15
     # 的虚假顶板当作09:25最终竞价，既制造诱多也漏掉临近结束才集体转强
     # 的板块。先锁定每只股票最新一帧，再做个股和板块宽度判断。
-    latest_time_subquery = (
-        select(
-            AuctionData.code.label("code"),
-            func.max(AuctionData.auction_time).label("latest_auction_time"),
-        )
-        .where(
-            AuctionData.trade_date == trade_date,
-            AuctionData.auction_time.between("09:15:00", "09:25:30"),
-        )
-        .group_by(AuctionData.code)
-        .subquery()
-    )
     result = await db.execute(
         select(AuctionData)
-        .join(
-            latest_time_subquery,
-            and_(
-                latest_time_subquery.c.code == AuctionData.code,
-                latest_time_subquery.c.latest_auction_time == AuctionData.auction_time,
-            ),
-        )
         .where(
-            AuctionData.trade_date == trade_date,
+            AuctionData.id.in_(latest_auction_ids(trade_date)),
             # 板块集体修复时允许把1%~2.6%的跟随成员纳入预测观察，但
             # 单股强攻和可交易闸门仍沿用2.6%的原阈值。
             AuctionData.open_change >= 1.0,
@@ -8421,31 +8773,14 @@ async def _load_auction_surge_context_map(
     # 不得变成 trade_ready，避免把撤单造成的虚假翻红当作买点。
     baseline_rows: dict[str, AuctionData] = {}
     if latest_rows:
-        baseline_time_subquery = (
-            select(
-                AuctionData.code.label("code"),
-                func.max(AuctionData.auction_time).label("baseline_auction_time"),
-            )
-            .where(
-                AuctionData.trade_date == trade_date,
-                AuctionData.auction_time.between("09:15:00", "09:20:30"),
-                AuctionData.auction_price > 0,
-                AuctionData.prev_close > 0,
-                AuctionData.code.in_(list(latest_rows.keys())),
-            )
-            .group_by(AuctionData.code)
-            .subquery()
-        )
         baseline_result = await db.execute(
-            select(AuctionData)
-            .join(
-                baseline_time_subquery,
-                and_(
-                    baseline_time_subquery.c.code == AuctionData.code,
-                    baseline_time_subquery.c.baseline_auction_time == AuctionData.auction_time,
+            select(AuctionData).where(AuctionData.id.in_(latest_auction_ids(
+                trade_date, end_time="09:20:30", conditions=(
+                    AuctionData.auction_price > 0,
+                    AuctionData.prev_close > 0,
+                    AuctionData.code.in_(list(latest_rows.keys())),
                 ),
-            )
-            .where(AuctionData.trade_date == trade_date)
+            )))
         )
         baseline_rows = {
             str(item.code or "").strip(): item
@@ -8906,7 +9241,7 @@ async def _load_pre_board_probe_context_map(
         trade_date,
     )
     codes = list(latest_rows.keys())
-    history_result = await db.execute(
+    history_result = await db.stream(
         select(
             StockKline.code,
             StockKline.trade_date,
@@ -8931,28 +9266,39 @@ async def _load_pre_board_probe_context_map(
             StockKline.low > 0,
             StockKline.volume > 0,
         )
-        .order_by(StockKline.code, StockKline.trade_date)
+        .order_by(StockKline.code, StockKline.trade_date).execution_options(yield_per=2048)
     )
     history_bars: dict[str, list[dict]] = {}
-    for row in history_result.all():
-        normalized_code = str(row[0] or "").strip()
-        if not normalized_code:
-            continue
-        history_bars.setdefault(normalized_code, []).append(
-            {
-                "code": normalized_code,
-                "trade_date": row[1],
-                "open": _safe_float(row[2]),
-                "close": _safe_float(row[3]),
-                "high": _safe_float(row[4]),
-                "low": _safe_float(row[5]),
-                "volume": _safe_float(row[6]),
-                "amount": _safe_float(row[7]),
-                "turnover": _safe_float(row[8]),
-                "change_pct": _safe_float(row[9]),
-                "prev_close": _safe_float(row[10]),
-            }
-        )
+    try:
+        async for batch in history_result.partitions(2048):
+            for row in batch:
+                normalized_code = str(row[0] or "").strip()
+                if not normalized_code:
+                    continue
+                history_bars.setdefault(normalized_code, []).append(
+                    {
+                        "code": normalized_code,
+                        "trade_date": row[1],
+                        "open": _safe_float(row[2]),
+                        "close": _safe_float(row[3]),
+                        "high": _safe_float(row[4]),
+                        "low": _safe_float(row[5]),
+                        "volume": _safe_float(row[6]),
+                        "amount": _safe_float(row[7]),
+                        "turnover": _safe_float(row[8]),
+                        "change_pct": _safe_float(row[9]),
+                        "prev_close": _safe_float(row[10]),
+                    }
+                )
+            await asyncio.sleep(0)
+    except BaseException:
+        try:
+            await history_result.close()
+        except BaseException:
+            pass
+        raise
+    else:
+        await history_result.close()
 
     name_result = await db.execute(
         select(
@@ -8972,7 +9318,9 @@ async def _load_pre_board_probe_context_map(
     }
 
     candidates: list[tuple[float, str, dict]] = []
-    for code, latest_row in latest_rows.items():
+    for index, (code, latest_row) in enumerate(latest_rows.items()):
+        if index % 16 == 0:
+            await asyncio.sleep(0)
         latest = dict(latest_row)
         spot_meta = spot_meta_map.get(code) or {}
         spot_updated_at = spot_meta.get("updated_at")
@@ -10058,7 +10406,7 @@ async def _load_first_board_kline_context(
         return {}
 
     start_date = trade_date - timedelta(days=lookback_days)
-    result = await db.execute(
+    result = await db.stream(
         select(
             StockKline.code,
             StockKline.trade_date,
@@ -10074,51 +10422,58 @@ async def _load_first_board_kline_context(
             StockKline.code.in_(codes),
             StockKline.trade_date <= trade_date,
             StockKline.trade_date >= start_date,
-        ).order_by(StockKline.code, StockKline.trade_date)
+        ).order_by(StockKline.code, StockKline.trade_date).execution_options(yield_per=2048)
     )
 
-    current_session = session_name or trade_calendar.get_trade_session()
-    intraday_sessions = {"morning", "afternoon"}
-    current_trade_date = as_of_date or trade_date
     grouped: dict[str, list[dict]] = {}
-    for (
-        code,
-        trade_day,
-        open_price,
-        close_price,
-        high_price,
-        low_price,
-        volume,
-        turnover,
-        change_pct,
-        source,
-    ) in result.all():
-        is_provisional = (
-            str(source or "") == "spot_fallback"
-            and trade_day == trade_date
-            and trade_day == current_trade_date
-            and current_session in intraday_sessions
-        )
-        grouped.setdefault(str(code or ""), []).append(
-            {
-                "trade_date": trade_day,
-                "open": _safe_float(open_price),
-                "close": _safe_float(close_price),
-                "high": _safe_float(high_price),
-                "low": _safe_float(low_price),
-                "volume": _safe_float(volume),
-                "turnover": _safe_float(turnover),
-                "change_pct": _safe_float(change_pct),
-                "source": str(source or ""),
-                "is_provisional": is_provisional,
-            }
-        )
+    try:
+        current_session = session_name or trade_calendar.get_trade_session()
+        intraday_sessions = {"morning", "afternoon"}
+        current_trade_date = as_of_date or trade_date
+        async for batch in result.partitions(2048):
+            for (
+                code, trade_day, open_price, close_price, high_price, low_price,
+                volume, turnover, change_pct, source,
+            ) in batch:
+                is_provisional = (
+                    str(source or "") == "spot_fallback"
+                    and trade_day == trade_date
+                    and trade_day == current_trade_date
+                    and current_session in intraday_sessions
+                )
+                grouped.setdefault(str(code or ""), []).append(
+                    {
+                        "trade_date": trade_day,
+                        "open": _safe_float(open_price),
+                        "close": _safe_float(close_price),
+                        "high": _safe_float(high_price),
+                        "low": _safe_float(low_price),
+                        "volume": _safe_float(volume),
+                        "turnover": _safe_float(turnover),
+                        "change_pct": _safe_float(change_pct),
+                        "source": str(source or ""),
+                        "is_provisional": is_provisional,
+                    }
+                )
+            await asyncio.sleep(0)
+    except BaseException:
+        # Own only this cursor, not the caller's transaction. Preserve a primary
+        # read/cancellation error even when cursor cleanup independently fails.
+        try:
+            await result.close()
+        except Exception:
+            logger.warning("晋级K线流式游标关闭失败，保留原异常")
+        raise
+    else:
+        await result.close()
 
-    return {
-        code: _build_first_board_kline_confirmation(bars[-260:])
-        for code, bars in grouped.items()
-        if code
-    }
+    contexts: dict[str, dict] = {}
+    for index, (code, bars) in enumerate(grouped.items()):
+        if index % 16 == 0:
+            await asyncio.sleep(0)
+        if code:
+            contexts[code] = _build_first_board_kline_confirmation(bars[-260:])
+    return contexts
 
 
 async def _load_recent_limit_up_memory(
@@ -10132,7 +10487,7 @@ async def _load_recent_limit_up_memory(
         return {}
 
     start_date = trade_date - timedelta(days=lookback_days)
-    kline_result = await db.execute(
+    kline_result = await db.stream(
         select(
             StockKline.code,
             StockKline.trade_date,
@@ -10144,25 +10499,37 @@ async def _load_recent_limit_up_memory(
             StockKline.code.in_(codes),
             StockKline.trade_date <= trade_date,
             StockKline.trade_date >= start_date,
-        )
+        ).execution_options(yield_per=512)
     )
-    kline_map = {
-        (str(code or ""), kline_trade_date): {
-            "change_pct": _safe_float(change_pct),
-            "prev_close": _safe_float(prev_close),
-            "close": _safe_float(close),
-            "high": _safe_float(high_price),
-        }
-        for code, kline_trade_date, change_pct, prev_close, close, high_price in kline_result.all()
-    }
+    kline_map = {}
+    try:
+        async for partition in kline_result.partitions(512):
+            for code, kline_trade_date, change_pct, prev_close, close, high_price in partition:
+                kline_map[(str(code or ""), kline_trade_date)] = {
+                    "change_pct": _safe_float(change_pct),
+                    "prev_close": _safe_float(prev_close),
+                    "close": _safe_float(close),
+                    "high": _safe_float(high_price),
+                }
+            await asyncio.sleep(0)
+    except BaseException:
+        try:
+            await kline_result.close()
+        except BaseException:
+            pass  # Cleanup must not replace the active read failure/cancellation.
+        raise
+    else:
+        await kline_result.close()
     kline_coverage_count = {}
-    for code, _kline_trade_date in kline_map.keys():
+    for index, (code, _kline_trade_date) in enumerate(kline_map.keys()):
+        if index % 512 == 0:
+            await asyncio.sleep(0)
         normalized_code = str(code or "")
         if not normalized_code:
             continue
         kline_coverage_count[normalized_code] = kline_coverage_count.get(normalized_code, 0) + 1
 
-    result = await db.execute(
+    result = await db.stream(
         select(
             LimitUpPool.code,
             LimitUpPool.name,
@@ -10174,29 +10541,48 @@ async def _load_recent_limit_up_memory(
             LimitUpPool.code.in_(codes),
             LimitUpPool.trade_date <= trade_date,
             LimitUpPool.trade_date >= start_date,
-        ).order_by(LimitUpPool.code, desc(LimitUpPool.trade_date))
+        ).order_by(LimitUpPool.code, desc(LimitUpPool.trade_date)).execution_options(yield_per=512)
     )
 
     grouped: dict[str, list[dict]] = {}
-    for code, name, limit_up_trade_date, consecutive_days, seal_amount, break_count in result.all():
-        grouped.setdefault(str(code or ""), []).append(
-            {
-                "name": str(name or ""),
-                "trade_date": limit_up_trade_date,
-                "consecutive_days": _safe_int(consecutive_days, 1),
-                "seal_amount": _safe_float(seal_amount),
-                "break_count": _safe_int(break_count),
-            }
-        )
+    try:
+        async for partition in result.partitions(512):
+            for code, name, limit_up_trade_date, consecutive_days, seal_amount, break_count in partition:
+                # Unknown quality is not a first-board/zero-break memory bonus.
+                # Keep the bounded cursor and legacy SQL projection unchanged.
+                if consecutive_days is None or break_count is None or seal_amount is None:
+                    continue
+                grouped.setdefault(str(code or ""), []).append(
+                    {
+                        "name": str(name or ""),
+                        "trade_date": limit_up_trade_date,
+                        "consecutive_days": _safe_int(consecutive_days, 1),
+                        "seal_amount": _safe_float(seal_amount),
+                        "break_count": _safe_int(break_count),
+                    }
+                )
+            await asyncio.sleep(0)
+    except BaseException:
+        try:
+            await result.close()
+        except BaseException:
+            pass  # Cleanup must not replace the active read failure/cancellation.
+        raise
+    else:
+        await result.close()
 
     day_gap_cache: dict[date, int] = {}
     features_by_code: dict[str, dict] = {}
-    for code in codes:
+    for index, code in enumerate(codes):
+        if index % 16 == 0:
+            await asyncio.sleep(0)
         raw_entries = grouped.get(code, [])
         validated_entries: list[dict] = []
         invalid_hits = 0
         missing_kline_hits = 0
-        for entry in raw_entries:
+        for entry_index, entry in enumerate(raw_entries):
+            if entry_index % 512 == 0:
+                await asyncio.sleep(0)
             kline = kline_map.get((code, entry["trade_date"]))
             if kline is None:
                 if kline_coverage_count.get(code, 0) > 0:
@@ -17404,15 +17790,99 @@ def _merge_ranked_candidates(first_board: list[dict], second_board: list[dict], 
     return merged[:limit]
 
 
+async def _load_promotion_market_view(db: AsyncSession) -> dict:
+    """One dated, quality-gated read contract for the chart, ladder and metrics."""
+    from app.data.limit_pool import evidence_dict, limit_pool_health
+
+    now = datetime.now()
+    trade_date = await _get_latest_limit_up_trade_date(db)
+    if trade_date > now.date():
+        trade_date = now.date()  # Future-only dirty rows are not a market date.
+    # A verified zero-limit-up session has no pool rows. Do not silently show
+    # yesterday's ladder when today's quote-round explicitly observed that zero.
+    latest_round = (await db.execute(
+        select(QuoteRound.trade_date, QuoteRound.component_watermarks_json)
+        .where(QuoteRound.trade_date <= now.date(), QuoteRound.committed_at <= now)
+        .order_by(desc(QuoteRound.trade_date), desc(QuoteRound.committed_at)).limit(1)
+    )).first()
+    if (latest_round
+            and isinstance(evidence_dict(latest_round[1]).get("limit_pool"), dict)
+            and await trade_calendar.is_trade_day(latest_round[0])):
+        has_selected_pool = await db.scalar(select(LimitUpPool.id).where(
+            LimitUpPool.trade_date == trade_date, LimitUpPool.quarantined.is_(False),
+        ).limit(1))
+        if latest_round[0] >= trade_date or not has_selected_pool:
+            trade_date = latest_round[0]
+    source_health = await limit_pool_health(
+        db, trade_date=trade_date, decision_at=now,
+        require_close=trade_date != now.date() or now.hour >= 15,
+    )
+    if source_health is not None and not source_health["ready"]:
+        return {"trade_date": trade_date, "source_health": source_health,
+                "status": "source_incomplete", "rows": [], "method": "source_incomplete"}
+    rows = await _load_filtered_limit_ups(db, trade_date, market_view=True)
+    method = "verified_pool_state" if source_health is not None else "historical_pool"
+    if source_health is None and trade_date == now.date() and rows:
+        spot_map = await _load_spot_map(db, [item["code"] for item in rows])
+        if spot_map:
+            rows = [
+                item for item in rows
+                if (spot := spot_map.get(item["code"])) is not None
+                and _safe_float(getattr(spot, "price", 0)) > 0
+                and _safe_float(getattr(spot, "limit_up", 0)) > 0
+                and _safe_float(spot.price) >= _safe_float(spot.limit_up) - 0.005
+            ]
+            method = "live_price_at_limit"
+    status = "ok" if rows or source_health is not None else "missing"
+    return {"trade_date": trade_date, "source_health": source_health,
+            "status": status, "rows": rows, "method": method}
+
+
+async def _promotion_verified_broken_count(db, view):
+    """Count same-clock broken states, with the same identity filter as the ups."""
+    from app.config.settings import settings
+    from app.data.fund_flow_clock import local_clock
+    from app.data.limit_pool_source import TENCENT_LIMIT_VERSION
+
+    health = view["source_health"]
+    if not health or not health["ready"]:
+        return None
+    rows = list((await db.scalars(select(BrokenLimitPool).where(
+        BrokenLimitPool.trade_date == view["trade_date"],
+    ))).all())
+    # Partial quote rounds can retain stale states. A watermark count alone
+    # must not certify those extra rows as today's complete touched denominator.
+    if len(rows) != health.get("broken_count"):
+        return None
+    now = datetime.now()
+    up_codes = {item["code"] for item in view["rows"]}
+    for row in rows:
+        source, observed = local_clock(row.source_quote_at), local_clock(row.observed_at)
+        if (row.source_version != TENCENT_LIMIT_VERSION or source is None or observed is None
+                or source.date() != view["trade_date"] or source > observed or observed > now
+                or row.final_state != "broken" or row.code in up_codes
+                or (health.get("required_close") and source.hour < 15)
+                or (source.hour < 15 and (now - source).total_seconds()
+                    > settings.LIMIT_POOL_SOURCE_MAX_AGE_SEC)):
+            return None
+    filtered = await _filter_promotion_market_rows(
+        db, [{"code": row.code, "name": row.name or ""} for row in rows],
+    )
+    return len(filtered)
+
+
 @router.get("/ladder")
 async def promotion_ladder(db: AsyncSession = Depends(get_db)):
-    """连板梯队(已过滤停牌/退市/ST)"""
-    trade_date = await _get_latest_limit_up_trade_date(db)
-    limit_ups = await _load_filtered_limit_ups(db, trade_date)
-    ladders = tracker.build_ladder(limit_ups)
+    """非ST/退市市场梯队，保留风险标记；市场观察不等于交易许可。"""
+    view = await _load_promotion_market_view(db)
+    ladders = tracker.build_ladder(view["rows"])
 
     return {
-        "trade_date": str(trade_date),
+        "trade_date": str(view["trade_date"]),
+        "source_health": view["source_health"],
+        "status": view["status"],
+        "seal_rate_method": "zero_break_share",
+        "scope": "non_st_market_with_risk_annotations",
         "ladder": [
             {
                 "consecutive_days": ladder.consecutive_days,
@@ -17426,7 +17896,7 @@ async def promotion_ladder(db: AsyncSession = Depends(get_db)):
                         "tag": stock.get("tag"),
                         "is_tradeable": stock.get("is_tradeable", True),
                     }
-                    for stock in ladder.stocks[:5]
+                    for stock in ladder.stocks
                 ],
             }
             for ladder in ladders
@@ -17436,45 +17906,61 @@ async def promotion_ladder(db: AsyncSession = Depends(get_db)):
 
 @router.get("/board-height")
 async def board_height(db: AsyncSession = Depends(get_db)):
-    """市场连板高度"""
-    trade_date = await _get_latest_limit_up_trade_date(db)
-    limit_ups = await _load_filtered_limit_ups(db, trade_date)
-    active_limit_ups = list(limit_ups)
-    seal_rate_method = "historical_pool"
-    if trade_date == date.today() and limit_ups:
-        spot_map = await _load_spot_map(
-            db,
-            [str(item.get("code") or "").strip() for item in limit_ups],
-        )
-        live_rows = []
-        for item in limit_ups:
-            spot = spot_map.get(str(item.get("code") or "").strip())
-            current_price = _safe_float(getattr(spot, "price", 0))
-            limit_up_price = _safe_float(getattr(spot, "limit_up", 0)) or _safe_float(item.get("limit_up_price"))
-            if current_price > 0 and limit_up_price > 0 and current_price >= limit_up_price - 0.005:
-                live_rows.append(item)
-        if spot_map:
-            active_limit_ups = live_rows
-            seal_rate_method = "live_price_at_limit"
-
+    """市场连板高度；续板率只能对照紧邻的真实交易日。"""
+    view = await _load_promotion_market_view(db)
+    trade_date, active_limit_ups = view["trade_date"], view["rows"]
+    seal_rate_method, source_health = view["method"], view["source_health"]
     board = tracker.get_board_height(active_limit_ups)
+    if view["status"] != "ok":
+        # Price-only observations are not a complete classified ladder. The UI
+        # already renders NULL as --; do not publish a fabricated zero market.
+        return {
+            "trade_date": str(trade_date), "height": None, "leader": None,
+            "ladder_summary": [], "limit_up_count": None, "touched_limit_up_count": None,
+            "seal_rate": None, "zero_break_count": None, "promotion_rate": None,
+            "promoted_count": None, "seal_rate_method": "source_incomplete",
+            "source_health": source_health,
+            "status": view["status"],
+            "promotion_rate_status": "current_pool_incomplete",
+        }
 
-    previous_trade_date = await _get_previous_limit_up_trade_date(db, trade_date)
-    previous_limit_ups = await _load_filtered_limit_ups(db, previous_trade_date)
+    from app.data.limit_pool import limit_pool_health
+    previous_trade_date = await trade_calendar.previous_trade_day(trade_date)
+    previous_health = await limit_pool_health(
+        db, trade_date=previous_trade_date, decision_at=datetime.now(), require_close=True,
+    )
+    previous_limit_ups = (
+        await _load_filtered_limit_ups(db, previous_trade_date, market_view=True)
+        if previous_health is None or previous_health["ready"] else []
+    )
     previous_codes = {item["code"] for item in previous_limit_ups}
     current_codes = {item["code"] for item in active_limit_ups}
-    promoted_count = len(previous_codes & current_codes) if previous_codes else 0
+    previous_ready = bool(previous_codes) or bool(previous_health and previous_health["ready"])
+    promoted_count = len(previous_codes & current_codes) if previous_ready else None
+    promotion_rate = (
+        round(promoted_count / len(previous_codes), 4) if previous_codes else None
+    )
+    promotion_rate_status = (
+        "ok" if previous_codes else "previous_pool_empty" if previous_ready
+        else "previous_pool_missing_or_incomplete"
+    )
 
-    touched_limit_up_count = len(limit_ups)
     limit_up_count = len(active_limit_ups)
-    zero_break_count = sum(1 for item in limit_ups if int(item.get("break_count") or 0) == 0)
-    if seal_rate_method == "live_price_at_limit":
-        seal_rate = round(limit_up_count / touched_limit_up_count * 100, 1) if touched_limit_up_count else 0
-    else:
-        # 历史池没有可靠的实时现价，沿用收盘快照的零炸板口径。
-        # 这与盘中“当前仍封住/曾触板”的口径明确分开。
-        seal_rate = round(zero_break_count / touched_limit_up_count * 100, 1) if touched_limit_up_count else 0
-    promotion_rate = round(promoted_count / len(previous_codes), 4) if previous_codes else 0
+    zero_break_count = sum(1 for item in active_limit_ups if item.get("break_count") == 0)
+    broken_count = await _promotion_verified_broken_count(db, view)
+    touched_limit_up_count = None
+    seal_rate = None
+    if seal_rate_method == "verified_pool_state":
+        if broken_count is not None:
+            touched_limit_up_count = limit_up_count + broken_count
+            seal_rate = (round(limit_up_count / touched_limit_up_count * 100, 1)
+                         if touched_limit_up_count else None)
+    elif seal_rate_method == "historical_pool":
+        # Legacy compatibility: explicitly labelled zero-break share, not a
+        # fabricated touched-market denominator for missing broken-pool evidence.
+        touched_limit_up_count = limit_up_count
+        seal_rate = (round(zero_break_count / limit_up_count * 100, 1)
+                     if limit_up_count else None)
 
     return {
         **board,
@@ -17484,9 +17970,15 @@ async def board_height(db: AsyncSession = Depends(get_db)):
         "touched_limit_up_count": touched_limit_up_count,
         "seal_rate": seal_rate,
         "seal_rate_method": seal_rate_method,
+        "source_health": source_health,
         "zero_break_count": zero_break_count,
+        "broken_limit_count": broken_count,
         "promotion_rate": promotion_rate,
         "promoted_count": promoted_count,
+        "promotion_rate_status": promotion_rate_status,
+        "previous_source_health": previous_health,
+        "status": view["status"],
+        "scope": "non_st_market_with_risk_annotations",
     }
 
 
@@ -17529,8 +18021,9 @@ async def build_promotion_candidates(
     compact: bool = False,
     db: AsyncSession | None = None,
     quality_gate: dict | None = None,
+    on_committed=None,
 ):
-    """Internal builder; only the scheduler may request append-only official runs."""
+    """Internal builder; on_committed is a synchronous scheduler-only receipt."""
 
     if db is None:
         raise ValueError("database session is required")
@@ -17703,6 +18196,11 @@ async def build_promotion_candidates(
                     }
                 )
     evaluated_learning_records = await _refresh_promotion_learning(db) if is_schedule_snapshot else 0
+    if is_schedule_snapshot and (evaluated_learning_records or frozen_regime_by_date):
+        # Historical outcome evaluation / regime freezing is independent of the
+        # new prediction ledger. Never hold its SQLite writer across slow market
+        # reads or network enrichment. A later failed build retains its barrier.
+        await db.commit()
     learning_stats = await _load_promotion_learning_stats(db)
     prediction_news_end_time = await _resolve_promotion_snapshot_news_end_time(
         first_board_trade_date,
@@ -17818,9 +18316,11 @@ async def build_promotion_candidates(
     )
     recorded_predictions = 0
     prediction_run_id = None
-    recordable_first_board_candidates = [
-        item for item in first_board_all_candidates if _is_recordable_prediction_candidate(item)
-    ]
+    recordable_first_board_candidates, recordability_supplement_keys = (
+        _prediction_record_input_universe(
+            first_board_all_candidates, first_board_rank_eligible_candidates,
+        )
+    )
     annotated_first_board_records = _annotate_prediction_record_metadata(
         recordable_first_board_candidates,
         ranked_first_board_candidates,
@@ -17828,6 +18328,7 @@ async def build_promotion_candidates(
         recall_ranked_candidates=ranked_first_board_recall_candidates,
         recall_ranked_limit=canonical_recall_ranked_limit,
         rank_eligible_candidates=first_board_rank_eligible_candidates,
+        recordability_supplement_keys=recordability_supplement_keys,
         snapshot_source=normalized_snapshot_source,
         snapshot_context=snapshot_context,
         news_end_time=prediction_news_end_time,
@@ -17882,6 +18383,10 @@ async def build_promotion_candidates(
         # A canonical schedule run must persist its exact point-in-time regime
         # even when prediction rows are idempotent and therefore add no new rows.
         await db.commit()
+        if is_schedule_snapshot and recorded_predictions and prediction_run_id and on_committed is not None:
+            # No await between the durable commit receipt and process completion.
+            # Replay/dashboard health is optional postprocessing, not publication.
+            on_committed(prediction_run_id)
     if is_schedule_snapshot and recorded_predictions:
         prediction_health = await _build_prediction_snapshot_health(
             db,
@@ -18138,9 +18643,30 @@ async def promotion_learning_review(
         payload["cache_hit"] = True
         payload["cache_age_seconds"] = round(now - cached[0], 3)
         return payload
-    payload = await _build_promotion_daily_learning_review(db, lookback_days=normalized_days)
-    _PROMOTION_LEARNING_REVIEW_CACHE[cache_key] = (time.monotonic(), payload)
-    return payload
+    # Keep the builder in its owning request/session, not a detached shared task.
+    # A cancelled/failed owner releases the gate; a waiter retries with its own DB.
+    lock, users = _PROMOTION_LEARNING_REVIEW_FLIGHTS.get(cache_key, (asyncio.Lock(), 0))
+    _PROMOTION_LEARNING_REVIEW_FLIGHTS[cache_key] = (lock, users + 1)
+    try:
+        async with lock:
+            # Another request may have populated the cache while we waited.
+            cached = _PROMOTION_LEARNING_REVIEW_CACHE.get(cache_key)
+            now = time.monotonic()
+            if cached and now - cached[0] <= PROMOTION_PAGE_CACHE_TTL_SECONDS:
+                payload = dict(cached[1])
+                payload["cache_hit"] = True
+                payload["cache_age_seconds"] = round(now - cached[0], 3)
+                return payload
+            payload = await _build_promotion_daily_learning_review(db, lookback_days=normalized_days)
+            _PROMOTION_LEARNING_REVIEW_CACHE[cache_key] = (time.monotonic(), payload)
+            return payload
+    finally:
+        # Count waiters too: removing a held gate would let a third request race.
+        _, users = _PROMOTION_LEARNING_REVIEW_FLIGHTS[cache_key]
+        if users == 1:
+            _PROMOTION_LEARNING_REVIEW_FLIGHTS.pop(cache_key)
+        else:
+            _PROMOTION_LEARNING_REVIEW_FLIGHTS[cache_key] = (lock, users - 1)
 
 
 @router.get(

@@ -1,0 +1,3 @@
+- insert:
+    - id: claw-task-router
+      name: 'file:///Users/youzix/WorkBuddy/Claw/.dsh/plugins/claw-task-router/live-entry.mjs'

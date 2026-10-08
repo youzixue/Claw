@@ -127,13 +127,15 @@ def test_version_is_distinct_bounded_and_protocol_sensitive(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_e2_accepts_strong_entry_without_relaxing_yesterday_seal(db, monkeypatch):
+async def test_e2_accepts_strong_entry_with_its_configured_seal_floor(db, monkeypatch):
     day = date(2026, 9, 8)
+    # 自定义1亿元门槛仍生效；默认5,000万元的边界另有专项测试。
+    monkeypatch.setattr(settings, "PAPER_CHALLENGER_E_MIN_SEAL_AMOUNT", 1.0)
     monkeypatch.setattr(paper.trade_calendar, "previous_trade_day", AsyncMock(return_value=date(2026, 9, 7)))
     db.add(LimitUpPool(code="600001", name="测试", trade_date=date(2026, 9, 7),
                        consecutive_days=5, seal_amount=200_000_000, break_count=1, quarantined=False))
     db.add(StockSpot(code="600001", name="测试", price=10.8, prev_close=10, open=10.5,
-                     high=10.8, low=10.4, avg_price=10.6, change_pct=8, limit_up=11,
+                     high=10.8, low=10.4, avg_price=10.6, change_pct=8, limit_up=11, limit_down=9,
                      ask1_price=10.81, ask1_volume=100))
     await db.flush()
     primary, _ = await paper._tenbagger_midline_candidates(db, limit=10, trade_date=day)
@@ -141,7 +143,8 @@ async def test_e2_accepts_strong_entry_without_relaxing_yesterday_seal(db, monke
         db, limit=10, trade_date=day, account_name="challenger_e")
     assert primary == []
     assert [item["code"] for item in secondary] == ["600001"]
-    assert secondary[0]["entry_variant"] == "e2_strong_reseal"
+    assert secondary[0]["entry_variant"] == "e2_strong_entry"
+    assert secondary[0]["entry_mode_evidence"]["reseal_path_status"] == "unverified"
     assert secondary[0]["stop_loss_pct"] == settings.PAPER_HIGHBOARD_STOP_LOSS_PCT
     row = await db.get(LimitUpPool, 1)
     row.seal_amount = 79_146_374

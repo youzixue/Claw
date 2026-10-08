@@ -210,15 +210,19 @@ async def test_index_http_contract_raw_day_and_explicit_market(monkeypatch, firs
     monkeypatch.setattr("app.data.sources.index_source.httpx.AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
     frame = await IndexSource().get_index_history_window("000001", start_date=date(2026, 6, 1), end_date=THROUGH)
-    assert frame.iloc[0]["close"] == "3940"
-    assert frame.attrs["index_symbol"] == "sh000001"
-    assert frame.attrs["source_contract"] == ("tencent_index_raw_day_v1" if first_ok else "eastmoney_index_raw_day_v1")
+    if first_ok:
+        assert frame.iloc[0]["close"] == "3940"
+        assert frame.attrs["index_symbol"] == "sh000001"
+        assert frame.attrs["source_contract"] == "tencent_index_raw_day_v1"
+    else:
+        assert frame.empty
+        assert frame.attrs["source_failures"] == [{"provider": "tencent", "error_type": "ValueError"}]
     assert "volume" not in frame.columns and "amount" not in frame.columns
-    assert len(calls) == (1 if first_ok else 2)
+    assert len(calls) == 1  # 禁止回退东财
 
 
 @pytest.mark.asyncio
-async def test_stale_primary_window_falls_back_instead_of_relabelling_old_day(monkeypatch):
+async def test_stale_primary_window_stays_missing_without_eastmoney_fallback(monkeypatch):
     calls = []
     def handler(request):
         calls.append(request)
@@ -232,9 +236,9 @@ async def test_stale_primary_window_falls_back_instead_of_relabelling_old_day(mo
                         lambda **kw: client(transport=httpx.MockTransport(handler), **kw))
     frame = await IndexSource().get_index_history_window("000001", start_date=THROUGH,
         end_date=THROUGH, expected_trade_dates=[THROUGH])
-    assert len(calls) == 2
-    assert frame.attrs["source_contract"] == "eastmoney_index_raw_day_v1"
-    assert frame.iloc[0]["date"] == "2026-09-08"
+    assert len(calls) == 1
+    assert frame.empty
+    assert frame.attrs["source_failures"][0]["provider"] == "tencent"
 
 
 @pytest.mark.asyncio

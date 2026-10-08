@@ -16,12 +16,13 @@ from datetime import date, datetime, time
 from typing import Any, Iterable
 
 from loguru import logger
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import settings
 from app.core.price_limit_rules import price_limit_rule
 from app.models.paper import (
+    PaperAccount,
     PaperAutoTradeLog,
     PaperControlSample,
     PaperNav,
@@ -312,6 +313,8 @@ async def _current_version_execution_summary(
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
+    if isinstance(value, bool):
+        return default
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -500,7 +503,21 @@ def _live_route_confirmation_valid(
     *,
     audit: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """Revalidate strength and fillability against the latest quote."""
+    """Revalidate once; entry and pending consumers share explicit wait semantics."""
+    from app.paper.experiment import LIVE_ROUTE_CONFIRMATION_CONTRACT_VERSION
+
+    if audit is not None:
+        audit.update({
+            "execution_confirmation_contract": LIVE_ROUTE_CONFIRMATION_CONTRACT_VERSION,
+            "execution_confirmation_status": "valid",
+            "execution_confirmation_recoverable": None,
+            "execution_confirmation_issue": "",
+        })
+
+    issues: list[dict[str, Any]] = []
+
+    def reject(code: str, reason: str, *, recoverable: bool = False) -> None:
+        issues.append({"code": code, "reason": reason, "recoverable": recoverable})
 
     price = _safe_float(getattr(spot, "price", None))
     prev_close = _safe_float(getattr(spot, "prev_close", None))
@@ -524,11 +541,11 @@ def _live_route_confirmation_valid(
         or avg_price is None
         or avg_price <= 0
     ):
-        return False, "暂缺有效价格/昨收/均价证据，等待新轮次"
-    if price < avg_price:
-        return False, "执行前已跌破实时成交均价线，原确认信号失效"
+        reject("missing_price_evidence", "暂缺有效价格/昨收/均价证据，等待新轮次", recoverable=True)
+    if price is not None and price > 0 and avg_price is not None and avg_price > 0 and price < avg_price:
+        reject("below_vwap", "执行前已跌破实时成交均价线，原确认信号失效")
     if ask is None or ask <= 0 or ask_volume is None or ask_volume <= 0:
-        return False, "暂缺可成交卖一价格或数量，不把排队当成交"
+        reject("offer_unavailable", "暂缺可成交卖一价格或数量，不把排队当成交", recoverable=True)
     if is_momentum:
         liquidity_issues = momentum_liquidity_gate_issues(
             {key: getattr(spot, key, None) for key in (
@@ -538,33 +555,36 @@ def _live_route_confirmation_valid(
         if audit is not None:
             audit["execution_liquidity_contract"] = MOMENTUM_LIQUIDITY_CONTRACT_VERSION
             audit["execution_liquidity_issues"] = liquidity_issues
-        if liquidity_issues:
-            return False, liquidity_issues[0]["reason"]
-    if volume_ratio is None:
-        return False, "暂缺执行前量比证据"
-    if volume_ratio < min_volume:
-        return False, "执行前量比已低于自身策略确认门槛"
-    if orderbook is None:
-        return False, "暂缺执行前盘口失衡证据"
-    if orderbook < min_orderbook:
-        return False, "执行前盘口失衡已低于自身策略确认门槛"
+        issues.extend(liquidity_issues)
+    else:
+        if volume_ratio is None:
+            reject("missing_volume_ratio", "暂缺执行前量比证据", recoverable=True)
+        elif volume_ratio < min_volume:
+            reject("volume_ratio_below_min", "执行前量比已低于自身策略确认门槛")
+        if orderbook is None:
+            reject("missing_orderbook_imbalance", "暂缺执行前盘口失衡证据", recoverable=True)
+        elif orderbook < min_orderbook:
+            reject("orderbook_below_min", "执行前盘口失衡已低于自身策略确认门槛")
     if is_momentum:
         state = snapshot.get("state") if isinstance(snapshot.get("state"), dict) else {}
         peak = _safe_float(state.get("peak_price"))
         if peak is None or peak <= 0:
-            return False, "首次回踩确认事件缺少不可变跟踪峰值，不能以日内高点替代"
+            reject("original_peak_missing", "首次回踩确认事件缺少不可变跟踪峰值，不能以日内高点替代")
         max_gap = _safe_float(rules.get("max_peak_gap_pct"), settings.PAPER_MOMENTUM_RETEST_MAX_PEAK_GAP_PCT)
-        if (peak / price - 1) * 100 > max_gap:
-            return False, "执行前已离开首次回踩的跟踪峰值确认区间"
+        if (peak is not None and peak > 0 and price is not None and price > 0
+                and (peak / price - 1) * 100 > max_gap):
+            reject("peak_gap_exceeded", "执行前已离开首次回踩的跟踪峰值确认区间")
     else:
-        if high is None or high <= 0 or high < price:
-            return False, "暂缺有效日内高点证据"
-        pullback_pct = (high - price) / high * 100.0
-        if pullback_pct > route_signal_policy(event.route_id)["max_pullback_from_high_pct"]:
-            return False, f"执行前较日内高点回撤{pullback_pct:.2f}%，持续性失效"
+        if high is None or high <= 0 or (price is not None and high < price):
+            reject("missing_high", "暂缺有效日内高点证据", recoverable=True)
+        elif price is not None and price > 0:
+            pullback_pct = (high - price) / high * 100.0
+            if pullback_pct > route_signal_policy(event.route_id)["max_pullback_from_high_pct"]:
+                reject("pullback_exceeded", f"执行前较日内高点回撤{pullback_pct:.2f}%，持续性失效")
     # Never trust a potentially stale/rounded upstream percentage when the live
     # price and previous close can deterministically reproduce it.
-    change_pct = (price / prev_close - 1.0) * 100.0
+    change_pct = ((price / prev_close - 1.0) * 100.0
+                  if price is not None and price > 0 and prev_close is not None and prev_close > 0 else None)
     if event.route_id == "momentum_first_retest":
         rules = snapshot.get("rule_snapshot") if isinstance(snapshot.get("rule_snapshot"), dict) else {}
         lower = _safe_float(rules.get("candidate_min_change_pct"), 3.0) or 3.0
@@ -572,8 +592,8 @@ def _live_route_confirmation_valid(
         # 量比/累计成交额/盘口/撤单统一使用上面的流动性契约，不再单独回退0值规则。
     else:
         lower, upper = _route_reclaim_bounds(event.route_id)
-    if not lower <= change_pct <= upper:
-        return False, f"执行前重算涨跌幅{change_pct:.2f}%已离开路由确认区间"
+    if change_pct is not None and not lower <= change_pct <= upper:
+        reject("change_out_of_range", f"执行前重算涨跌幅{change_pct:.2f}%已离开路由确认区间")
 
     if event.route_id == "d_auction_recovery":
         prior = (
@@ -585,8 +605,66 @@ def _live_route_confirmation_valid(
             prior.get("auction_volume_path_verified") is not True
             or prior.get("cancel_phase_verified") is not True
         ):
-            return False, "D2缺少09:20至09:25不可撤单阶段及最终竞价的可验证正量路径证据"
+            reject("auction_path_unverified", "D2缺少09:20至09:25不可撤单阶段及最终竞价的可验证正量路径证据")
+    # Evaluate independent leaves before reducing severity: unknown data must
+    # not conceal a known-invalid signal on any shared confirmation route.
+    if audit is not None:
+        audit["execution_confirmation_issues"] = issues
+    if issues:
+        issue = next((item for item in issues if not item["recoverable"]), issues[0])
+        recoverable = all(item["recoverable"] for item in issues)
+        if audit is not None:
+            audit.update({
+                "execution_confirmation_status": "waiting" if recoverable else "invalidated",
+                "execution_confirmation_recoverable": recoverable,
+                "execution_confirmation_issue": issue["code"],
+            })
+        return False, issue["reason"]
     return True, ""
+
+
+async def _confirmed_path_valid(
+    db: AsyncSession, event: PaperShadowEvent, *, now: datetime,
+    audit: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """C2 first-submit and pending orders consume the same immutable boundary.
+
+    Historical confirmation remains true. A later observed break/unknown segment
+    ends only that original token; later prices cannot retroactively repair it.
+    Both observation and persistence clocks must be visible to this decision.
+    """
+    if event.route_id != "c_recent_limit_relaunch":
+        return True, ""
+    boundaries = await db.scalars(select(PaperShadowEvent).where(
+        PaperShadowEvent.route_id == event.route_id,
+        PaperShadowEvent.route_version == event.route_version,
+        PaperShadowEvent.code == event.code,
+        PaperShadowEvent.trade_date == event.trade_date,
+        PaperShadowEvent.event_type == "confirmation_reset",
+        PaperShadowEvent.observed_at > event.observed_at,
+        PaperShadowEvent.observed_at <= now,
+        PaperShadowEvent.created_at <= now,
+    ).order_by(PaperShadowEvent.observed_at, PaperShadowEvent.id))
+    for boundary in boundaries:
+        prior = _json_dict(_json_dict(boundary.snapshot_json).get("prior_structure"))
+        if (prior.get("confirmed_path_contract") == "c2_confirmed_path_terminal_v1"
+                and prior.get("invalidates_event_key") == event.event_key):
+            break
+    else:
+        return True, ""
+    reason = str(prior.get("reason") or "path_continuity_unknown")
+    if audit is not None:
+        audit.update({
+            "confirmed_path_contract": "c2_confirmed_path_terminal_v1",
+            "confirmation_boundary_event_key": boundary.event_key,
+            "confirmation_boundary_observed_at": boundary.observed_at.isoformat(),
+            "confirmation_boundary_reason": reason,
+            "execution_confirmation_status": "invalidated",
+            "execution_confirmation_recoverable": False,
+            "execution_confirmation_issue": "confirmation_path_ended",
+            "execution_block_class": "signal_invalidated",
+        })
+    return False, f"confirmation_path_ended：原C2确认后的路径已中断({reason})，禁止一帧反抽复用旧确认"
 
 
 def _event_candidate(event: PaperShadowEvent, snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -601,6 +679,74 @@ def _event_candidate(event: PaperShadowEvent, snapshot: dict[str, Any]) -> dict[
         "rule_snapshot": snapshot.get("rule_snapshot") or {},
         "prior_structure": snapshot.get("prior_structure") or {},
     }
+
+
+def _processed_log(row, quote_round_id: str) -> bool:
+    """One shared predicate for scalar and positive-only batch checks."""
+    if (row.executed_trade_id is not None
+            or row.action in {"buy", "deferred_buy", "skip_terminal", "dry_run"}
+            or row.decision in {"dry_run", "skipped"}):
+        return True
+    logged_round_id = str(row.quote_round_id or "")
+    if not logged_round_id:
+        logged_round_id = str(_json_dict(row.candidate_json).get("decision_round_id") or "")
+    return row.decision == "wait" and logged_round_id == quote_round_id
+
+
+async def _processed_event_keys(db, events, accounts_by_route, *, quote_round_id: str) -> set[str]:
+    """Batch *positive* idempotency evidence; never cache an unprocessed decision.
+
+    No date/version relaxation: use exactly the original account + run/token
+    predicates. Keep the live scalar check for every remaining candidate, since
+    a preceding order commit or another writer may have changed its status.
+    This snapshot lasts one consumer call and never removes history or reranks.
+    """
+    groups = defaultdict(list)
+    for event in events:
+        account = accounts_by_route.get(event.route_id)
+        if account is not None:
+            groups[account].append(event)
+    processed = set()
+    for (account_id, account_name), group in groups.items():
+        for start in range(0, len(group), 200):
+            chunk = group[start:start + 200]
+            token_keys, run_keys = defaultdict(set), defaultdict(set)
+            for event in chunk:
+                token_keys[_signal_token(event.event_key, event.route_id)].add(event.event_key)
+                run_keys[_run_id(event.event_key)].add(event.event_key)
+            orders = (await db.execute(select(TradeOrder.signal_id).where(
+                TradeOrder.broker == "paper", TradeOrder.account_id == account_name,
+                TradeOrder.side == "buy", TradeOrder.signal_id.in_(tuple(token_keys)),
+                TradeOrder.status.in_(("pending", "submitted", "partial", "filled", "canceled", "risk_blocked")),
+            ))).scalars().all()
+            for token in orders:
+                processed.update(token_keys[token])
+            # Positive evidence is already terminal for this invocation. Do not
+            # re-read trade/log history for those keys; negatives stay live below.
+            remaining_tokens = tuple(
+                token for token, keys in token_keys.items() if not keys <= processed
+            )
+            if remaining_tokens:
+                trades = (await db.execute(select(PaperTradeLog.signal_id).where(
+                    PaperTradeLog.account_id == account_id, PaperTradeLog.signal_id.in_(remaining_tokens),
+                ))).scalars().all()
+                for token in trades:
+                    processed.update(token_keys[token])
+            remaining_runs = tuple(
+                run for run, keys in run_keys.items() if not keys <= processed
+            )
+            if not remaining_runs:
+                continue
+            logs = (await db.execute(select(
+                PaperAutoTradeLog.run_id, PaperAutoTradeLog.action, PaperAutoTradeLog.decision,
+                PaperAutoTradeLog.executed_trade_id, PaperAutoTradeLog.quote_round_id,
+                PaperAutoTradeLog.candidate_json,
+            ).where(PaperAutoTradeLog.account_id == account_id,
+                    PaperAutoTradeLog.run_id.in_(remaining_runs)))).all()
+            for row in logs:
+                if _processed_log(row, quote_round_id):
+                    processed.update(run_keys[row.run_id])
+    return processed
 
 
 async def _already_processed(
@@ -639,22 +785,7 @@ async def _already_processed(
             PaperAutoTradeLog.run_id == run_id,
         ).order_by(PaperAutoTradeLog.id.desc())
     )).all())
-    terminal_actions = {"buy", "deferred_buy", "skip_terminal", "dry_run"}
-    for row in logs:
-        if (
-            row.executed_trade_id is not None
-            or row.action in terminal_actions
-            or row.decision in {"dry_run", "skipped"}
-        ):
-            return True
-        logged_round_id = str(row.quote_round_id or "")
-        if not logged_round_id:
-            logged_round_id = str(
-                _json_dict(row.candidate_json).get("decision_round_id") or ""
-            )
-        if row.decision == "wait" and logged_round_id == quote_round_id:
-            return True
-    return False
+    return any(_processed_log(row, quote_round_id) for row in logs)
 
 
 async def _record_terminal_log(
@@ -822,20 +953,78 @@ async def _legacy_challenger_exit_reasons(
     return reasons
 
 
-async def _today_buy_count(db: AsyncSession, account_id: int, trade_date: date) -> int:
+async def _today_buy_count(
+    db: AsyncSession, account_id: int, trade_date: date, *, as_of: datetime | None = None,
+) -> int:
+    from app.paper.position_policy import buy_order_evidence
+
     start = datetime.combine(trade_date, time.min)
-    end = datetime.combine(trade_date, time.max)
-    return int(
-        await db.scalar(
-            select(func.count(func.distinct(PaperTradeLog.code))).where(
+    end = min(datetime.combine(trade_date, time.max), as_of) if as_of is not None else datetime.combine(trade_date, time.max)
+    rows = list((await db.scalars(
+            select(PaperTradeLog).where(
                 PaperTradeLog.account_id == account_id,
                 PaperTradeLog.trade_type == "buy",
                 PaperTradeLog.trade_time >= start,
                 PaperTradeLog.trade_time <= end,
             )
-        )
-        or 0
-    )
+        )).all())
+    evidence = await buy_order_evidence(db, account_id=account_id, trades=rows, as_of=end)
+    # 仅原委托的明确scale_in可覆盖其已核实分片；禁止按signal文本扩散。
+    logs = list((await db.scalars(select(PaperAutoTradeLog).where(
+        PaperAutoTradeLog.account_id == account_id,
+        PaperAutoTradeLog.trade_date == trade_date,
+        PaperAutoTradeLog.created_at <= end,
+        PaperAutoTradeLog.action == "buy", PaperAutoTradeLog.decision == "executed",
+    ))).all())
+    logs_by_trade = {}
+    for log in logs:
+        logs_by_trade.setdefault(log.executed_trade_id, []).append(log)
+    def exact_audit(log, row):
+        # _add_auto_log.created_at can be the accepted quote-round clock, not
+        # physical fill time. An earlier clock needs the same nonempty round ID.
+        return (log.code == row.code and log.strategy_version == row.strategy_version
+                and log.created_at.date() == trade_date and log.created_at <= end
+                and (row.trade_time <= log.created_at
+                     or (bool(log.quote_round_id)
+                         and log.quote_round_id in {row.decision_round_id, row.fill_round_id})))
+
+    new_codes = set()
+    for row in rows:
+        proof = evidence[row.id]
+        linked_logs = logs_by_trade.get(row.id, [])
+        if proof["status"] == "verified" and proof["scale_in"] is True:
+            # A contradictory exact receipt cannot be hidden by the order marker.
+            if all(exact_audit(log, row)
+                   and _json_dict(log.candidate_json).get("scale_in") is not False
+                   for log in linked_logs):
+                continue
+        # 缺回报的legacy仅保留精确executed_trade_id凭证；无传播、无冲突兜底。
+        if (proof["status"] != "invalid" and proof.get("scale_in") is None
+                and len(linked_logs) == 1):
+            log = linked_logs[0]
+            if (exact_audit(log, row)
+                    and _json_dict(log.candidate_json).get("scale_in") is True):
+                continue
+        new_codes.add(row.code)
+    return len(new_codes)
+
+
+async def _begin_challenger_write(db: AsyncSession) -> None:
+    """Start an owned, short write phase, never upgrade a WAL read snapshot.
+
+    Only the challenger orchestration boundary may call this. No retry/rollback
+    here: the caller must report failure and reconcile uncertain order commits.
+    Account initialization stays outside this phase (its Python lock must not be
+    acquired while holding SQLite's writer). Dirty caller work is never discarded
+    or implicitly committed. Production sessions use expire_on_commit=False.
+    """
+    from app.trading.paper_authorization import paper_transaction_active
+
+    if paper_transaction_active(db) or db.new or db.dirty or db.deleted:
+        raise RuntimeError("challenger write boundary requires clean owned session")
+    await db.commit()  # Release read snapshot, retaining already-loaded ranking.
+    if db.get_bind().dialect.name == "sqlite":
+        await db.execute(text("BEGIN IMMEDIATE"))
 
 
 async def run_strategy_iteration_challenger_accounts(
@@ -843,23 +1032,39 @@ async def run_strategy_iteration_challenger_accounts(
     *,
     now: datetime | None = None,
     event_keys: Iterable[str] | None = None,
+    account_name: str | None = None,
 ) -> dict[str, Any]:
     """Execute fresh confirmed events in isolated paper accounts and manage exits.
 
     The function is idempotent per shadow event.  It intentionally refuses stale
     confirmations, sealed limit-ups, absent ask quotes and all warn/block risk
     outcomes.  No non-paper broker can be selected by callers.
+    Optional account_name isolates a scheduler retry without dropping/reranking
+    that route's batch. Caller owns error rollback; committed orders are re-read
+    by event identity before any retry. Never retry uncertain execution commits.
+    No internal catch-and-continue: errors propagate to the account-scoped caller.
+    Only a finished cycle returns status=completed; disabled/window skips do not.
     """
 
     from app.api.v1 import paper
     from app.trading.service import SubmitOrderCommand, submit_order
 
+    selected_routes = {
+        route: name for route, name in paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE.items()
+        if account_name is None or name == account_name
+    }
+    if account_name is not None and not selected_routes:
+        raise ValueError("unknown event-driven challenger account")
     now = now or datetime.now()
     if not settings.PAPER_CHALLENGER_ACCOUNT_ENABLED:
-        return {"enabled": False, "entries": 0, "sells": 0, "skipped": 0, "blocked": 0}
+        return {"status": "skipped", "reason": "challenger_accounts_disabled",
+                "failed_accounts": [], "enabled": False,
+                "entries": 0, "sells": 0, "skipped": 0, "blocked": 0}
     order_window_ok, order_window_reason = await paper._paper_order_window_status(now)
     if not order_window_ok:
         return {
+            "status": "skipped",
+            "failed_accounts": [],
             "enabled": True,
             "entries": 0,
             "sells": 0,
@@ -871,12 +1076,14 @@ async def run_strategy_iteration_challenger_accounts(
     sell_logs: list[PaperAutoTradeLog] = []
     route_by_account = {
         account_name: route_id
-        for route_id, account_name in paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE.items()
+        for route_id, account_name in selected_routes.items()
     }
     # A2/B2/C2/D2/F2均由confirmed事件驱动并在此管理退出；E2由独立高标主循环管理。
     for account_name, route_id in route_by_account.items():
         account = await paper._get_or_create_account(db, account_name)
+        await _begin_challenger_write(db)
         account = await paper._refresh_account(db, account)
+        await _begin_challenger_write(db)
         open_positions = await paper._open_positions(db, account.id)
         current_strategy_version = paper._strategy_version(account_name)
         forced_exit_reasons = await _legacy_challenger_exit_reasons(
@@ -905,14 +1112,17 @@ async def run_strategy_iteration_challenger_accounts(
                 quote_now=now,
             )
         )
-    await db.commit()
+        await db.commit()  # Do not hold an exit writer across account boundaries.
 
     quote_context = paper._quote_round_context()
     quote_round_id = str(quote_context.get("round_id") or "")
     scan_round_id = quote_round_id or now.strftime("%Y%m%d%H%M%S")
     execution_round_id = quote_round_id or scan_round_id
-    for route_id, account_name in paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE.items():
+    accounts_by_route = {}
+    for route_id, account_name in selected_routes.items():
         account = await paper._get_or_create_account(db, account_name)
+        await _begin_challenger_write(db)
+        accounts_by_route[route_id] = (account.id, account_name)
         strategy_version = paper._strategy_version(account_name)
         heartbeat_exists = await db.scalar(
             select(PaperAutoTradeLog.id).where(
@@ -947,11 +1157,11 @@ async def run_strategy_iteration_challenger_accounts(
                 stage_code="runtime_scan", reason_code="account_scan_entered",
                 created_at=now,
             )
-    await db.commit()
+        await db.commit()  # Release each heartbeat before scanning another route.
 
     route_versions = {
         route_id: _route_shadow_version(route_id)
-        for route_id in paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE
+        for route_id in selected_routes
     }
     version_scope = or_(*(
         and_(
@@ -1016,11 +1226,18 @@ async def run_strategy_iteration_challenger_accounts(
         rank_by_route[route_id] += 1
         ranked_candidate["pre_entry_rank_within_route"] = rank_by_route[route_id]
 
+    processed_keys = await _processed_event_keys(
+        db, events, accounts_by_route, quote_round_id=execution_round_id,
+    )
+    await db.commit()  # Ranking/positive dedupe is read-only; no writer across batch.
     entries = 0
     skipped = 0
     blocked = 0
     deferred = 0
     for event, snapshot, candidate, _priority_score in ranked_events:
+        await db.commit()  # Also end read-only already-processed/early-window paths.
+        if candidate["event_key"] in processed_keys:
+            continue
         # A prior definite rejection rolls back/expires the shared identity map.
         await paper._refresh_expired_paper_rows(db, event)
         account_name = paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE.get(event.route_id)
@@ -1047,7 +1264,21 @@ async def run_strategy_iteration_challenger_accounts(
             deferred += 1
             continue
 
+        from app.paper.confirmation_evidence import entry_consumer_timing
+        candidate["execution_timing"] = entry_consumer_timing(
+            decision_at=now, confirmed_at=event.observed_at, event_created_at=event.created_at,
+        )
+        await _begin_challenger_write(db)
         account = await paper._refresh_account(db, account)
+        # Refresh commits valuation then reads the account. That read must not
+        # become the outer stale snapshot of the notification SAVEPOINT.
+        await _begin_challenger_write(db)
+        if await _already_processed(
+            db, account_id=account.id, account_name=account_name,
+            run_id=run_id, signal_token=signal_token,
+            quote_round_id=execution_round_id,
+        ):
+            continue
         if not _route_auto_order_enabled(event.route_id, now=now):
             skipped += 1
             await _record_terminal_log(
@@ -1080,6 +1311,16 @@ async def run_strategy_iteration_challenger_accounts(
                 price=_safe_float(event.assumed_fill_price),
                 amount=None,
                 candidate=candidate,
+            )
+            continue
+
+        path_valid, path_reason = await _confirmed_path_valid(db, event, now=now, audit=candidate)
+        if not path_valid:
+            skipped += 1
+            await _record_terminal_log(
+                db, paper=paper, account_id=account.id, event=event, run_id=run_id,
+                action="skip_terminal", decision="skipped", reason=path_reason,
+                price=_safe_float(event.assumed_fill_price), amount=None, candidate=candidate,
             )
             continue
 
@@ -1129,7 +1370,16 @@ async def run_strategy_iteration_challenger_accounts(
             snapshot=snapshot,
             spot=spot,
         )
-        if entry_price is None:
+        live_valid, live_reason = _live_route_confirmation_valid(
+            event, snapshot, spot, audit=candidate,
+        )
+        entry_terminal = "价格漂移" in entry_reason or "confirmed事件缺少" in entry_reason
+        # A recoverable pricing wait must not bypass an independent known
+        # failure in this healthy quote. Preserve immutable/price-drift terminals.
+        if entry_price is None and (
+            entry_terminal or live_valid
+            or candidate.get("execution_confirmation_recoverable") is True
+        ):
             skipped += 1
             await _record_terminal_log(
                 db,
@@ -1150,17 +1400,9 @@ async def run_strategy_iteration_challenger_accounts(
             )
             continue
 
-        live_valid, live_reason = _live_route_confirmation_valid(
-            event,
-            snapshot,
-            spot,
-            audit=candidate,
-        )
         if not live_valid:
             skipped += 1
-            liquidity_issues = candidate.get("execution_liquidity_issues") or []
-            recoverable = (all(issue["recoverable"] for issue in liquidity_issues)
-                           if liquidity_issues else live_reason.startswith("暂缺"))
+            recoverable = candidate.get("execution_confirmation_recoverable") is True
             candidate["execution_block_class"] = "recoverable_data_wait" if recoverable else "signal_invalidated"
             await _record_terminal_log(
                 db,
@@ -1178,6 +1420,17 @@ async def run_strategy_iteration_challenger_accounts(
             continue
 
         # 完整confirmed事件+本轮价格/量比/盘口复核通过才记买点，先于现金/持仓约束。
+        from app.paper.portfolio_ingress import capture_confirmed_signal
+        origin_entry_policy = _entry_policy(event.route_id)
+        await capture_confirmed_signal(
+            db, account=account, source=event.route_id,
+            candidate={**candidate, "code": event.code, "name": str(event.name or event.code)},
+            source_signal_id=signal_token, confirmed_at=event.observed_at,
+            quote_context=quote_context, price=entry_price,
+            stop_loss_price=round(entry_price * (1.0 - float(origin_entry_policy["stop_loss_pct"]) / 100.0), 2),
+            shadow_event_key=event.event_key,
+            entry_details={"route_id": event.route_id, "origin_entry_policy": origin_entry_policy},
+        )
         from app.push.paper_buy_points import record_buy_point, event_reason
         await record_buy_point(
             db, account=account, strategy_version=paper._strategy_version(account_name),
@@ -1215,7 +1468,10 @@ async def run_strategy_iteration_challenger_accounts(
         candidate["pending_buy_codes"] = sorted(pending_codes)
         candidate["reserved_buy_cash"] = round(reserved_cash, 2)
         max_daily_buys, max_positions = paper._strategy_buy_limits(account_name)
-        if event.code in position_codes | pending_codes:
+        position = next((item for item in positions if item.code == event.code), None)
+        execution_policy = challenger_execution_policy(event.route_id)
+        top_up = position is not None and execution_policy.get("target_top_up_enabled", False)
+        if event.code in pending_codes or (position is not None and not top_up):
             skipped += 1
             await _record_terminal_log(
                 db,
@@ -1231,8 +1487,43 @@ async def run_strategy_iteration_challenger_accounts(
                 candidate=candidate,
             )
             continue
-        daily_buys = await _today_buy_count(db, account.id, now.date()) + len(pending_codes - position_codes)
-        if len(position_codes | pending_codes) >= max_positions or daily_buys >= max_daily_buys:
+        if top_up:
+            layers, last_buy_at = await paper._same_day_buy_layers(
+                db, account_id=account.id, code=event.code, now=now,
+                as_of=paper._public_order_clock(),
+            )
+            prior_at = last_buy_at or position.buy_time
+            cost = float(position.buy_price or 0)
+            cost_return = (entry_price / cost - 1) * 100 if cost > 0 else None
+            # 只消费建仓后新生成的confirmed事件，绝不重用原事件补足目标仓位。
+            top_up_ok = (
+                position.strategy_version == paper._strategy_version(account_name)
+                and isinstance(prior_at, datetime)
+                and (event.observed_at - prior_at).total_seconds() >= execution_policy["top_up_cooldown_sec"] + 60
+                and layers < execution_policy["top_up_max_daily_layers"]
+                and cost_return is not None
+                and 0 <= cost_return <= execution_policy["top_up_max_cost_return_pct"]
+                and entry_price > float(position.stop_loss_price or 0)
+            )
+            if not top_up_ok:
+                skipped += 1
+                await _record_terminal_log(
+                    db, paper=paper, account_id=account.id, event=event, run_id=run_id,
+                    action="skip_terminal", decision="skipped",
+                    reason="目标仓位追加未满足同版本、新事件冷却、同股层数或成本/止损条件",
+                    price=entry_price, amount=None, candidate=candidate,
+                )
+                continue
+            candidate["scale_in"] = True
+            candidate["scale_in_evidence"] = {
+                "prior_buy_at": prior_at.isoformat(), "daily_layers_before": layers,
+                "new_event_key": event.event_key, "target_top_up": True,
+            }
+        # Do not omit an earlier candidate filled a few seconds after round start.
+        daily_buys = await _today_buy_count(
+            db, account.id, now.date(), as_of=paper._public_order_clock(),
+        ) + len(pending_codes - position_codes)
+        if not top_up and (len(position_codes | pending_codes) >= max_positions or daily_buys >= max_daily_buys):
             skipped += 1
             await _record_terminal_log(
                 db,
@@ -1266,10 +1557,20 @@ async def run_strategy_iteration_challenger_accounts(
             * float(policy["position_pct"])
             * position_factor
         )
+        if top_up:
+            # 当前市值计入目标，优先补足已有优质持仓，不能每次再给完整20%。
+            budget = max(0.0, budget - int(position.buy_amount or 0) * entry_price)
         cash_cap = max(0.0, float(account.current_capital or 0) - reserved_cash) * (
             1.0 - max(float(challenger_execution_policy(event.route_id)["cash_buffer_pct"]), 0.0)
         )
         amount = int(min(budget, cash_cap) / entry_price / 100) * 100
+        stop_loss_price = round(entry_price * (1.0 - float(policy["stop_loss_pct"]) / 100.0), 2)
+        if top_up:
+            stop_loss_price = max(stop_loss_price, float(position.stop_loss_price or 0))
+            amount = paper._scale_in_risk_amount(
+                amount, position=position, price=entry_price, stop_loss=stop_loss_price,
+                total_assets=float(account.total_assets or 0),
+            )
         if amount < 100:
             skipped += 1
             await _record_terminal_log(
@@ -1306,10 +1607,6 @@ async def run_strategy_iteration_challenger_accounts(
             )
             continue
 
-        stop_loss_price = round(
-            entry_price * (1.0 - float(policy["stop_loss_pct"]) / 100.0),
-            2,
-        )
         reason = (
             f"隔离候选策略前向模拟成交：{ROUTE_META[event.route_id]['hypothesis']}；"
             f"事件编号={event.event_key}；不连接真实券商"
@@ -1353,6 +1650,9 @@ async def run_strategy_iteration_challenger_accounts(
             ),
         )
         await paper._refresh_expired_paper_rows(db, account, event)
+        # submit_order owns and commits its atomic fill. Its final refresh is a
+        # new read phase; audit failures must not replay that committed order.
+        await _begin_challenger_write(db)
         order = result.get("order") or {}
         fills = result.get("fills") or []
         if str(order.get("status") or "") == "filled" and fills:
@@ -1374,6 +1674,7 @@ async def run_strategy_iteration_challenger_accounts(
                 executed_trade_id=int(fills[0].get("broker_trade_id") or 0) or None,
             )
             # paper broker has already created the position; retain the route stop.
+            await _begin_challenger_write(db)
             position = next(
                 (
                     item
@@ -1409,23 +1710,36 @@ async def run_strategy_iteration_challenger_accounts(
             )
         else:
             blocked += 1
+            # These persisted orders are permanently deduplicated by
+            # _already_processed. Do not promise a retry that cannot happen.
+            terminal_order = str(order.get("status") or "") in {"risk_blocked", "canceled", "filled"}
+            candidate["submission_order_status"] = str(order.get("status") or "")
+            candidate["submission_recoverable"] = not terminal_order
+            submission_reason = str(order.get("error_message") or "paper委托本轮未形成可验证成交")
             await _record_terminal_log(
                 db,
                 paper=paper,
                 account_id=account.id,
                 event=event,
                 run_id=run_id,
-                action="wait_buy",
-                decision="wait",
-                reason=str(order.get("error_message") or "paper委托本轮未形成可验证成交；仅在新轮重评"),
+                action="skip_terminal" if terminal_order else "wait_buy",
+                decision="skipped" if terminal_order else "wait",
+                reason=(
+                    submission_reason + "；原事件已有终态委托，不自动重试"
+                    if terminal_order else str(order.get("error_message")
+                    or "paper委托本轮未形成可验证成交；仅在新轮重评")),
                 price=entry_price,
                 amount=amount,
                 candidate=candidate,
                 risk=result.get("risk") or risk,
             )
 
+    await db.commit()  # No open read/writer phase escapes the batch.
     await paper._refresh_expired_paper_rows(db, *sell_logs)
     return {
+        "status": "completed",
+        "failed_accounts": [],
+        "accounts": list(selected_routes.values()),
         "enabled": True,
         "entries": entries,
         "sells": sum(1 for item in sell_logs if item.action == "sell" and item.decision == "executed"),

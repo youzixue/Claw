@@ -1,0 +1,3 @@
+- insert:
+    - id: local-prompt-optimizer
+      name: dsh-local-prompt-optimizer

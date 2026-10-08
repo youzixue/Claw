@@ -2,6 +2,9 @@
 
 import asyncio
 from pathlib import Path
+from datetime import datetime, timedelta
+from time import monotonic
+from zoneinfo import ZoneInfo
 import httpx
 from typing import Optional
 from loguru import logger
@@ -45,6 +48,11 @@ class AIProvider:
 
     def _apply_config(self, config: AIConfiguration):
         self._config = config
+        # A configuration generation owns its circuit. Late failures from the
+        # old endpoint/key must never disable the newly saved configuration.
+        self._runtime = {"status": "idle", "http_status": None, "observed_at": None,
+                         "error_count": 0, "blocked_until_tick": 0.0,
+                         "circuit_open_until": None, "probe_running": False}
         self.enabled = config.enabled
         self.base_url = config.base_url
         self.api_key = config.api_key.get_secret_value()
@@ -55,6 +63,41 @@ class AIProvider:
         self.api_format = config.api_format
         self.oauth_model = config.oauth_model
         self.oauth_reasoning_effort = config.oauth_reasoning_effort
+
+
+    def runtime_status(self):
+        """Safe current runtime observation; not historical per-article evidence."""
+        data = {key: value for key, value in self._runtime.items()
+                if key not in {"blocked_until_tick", "probe_running"}}
+        data["circuit_open"] = monotonic() < self._runtime["blocked_until_tick"]
+        data["half_open_probe_running"] = self._runtime["probe_running"]
+        data["scope"] = "current_process_current_configuration_not_historical_article"
+        return data
+
+    def _runtime_result(self, config, status, http_status=None):
+        if config is not self._config:
+            return
+        state = self._runtime
+        if status == "ok" and state["blocked_until_tick"] > monotonic():
+            return
+        observed_at = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+        if state["blocked_until_tick"] > monotonic() and http_status != 402:
+            state["last_error"] = {"status": status, "http_status": http_status, "observed_at": observed_at}
+            state["error_count"] += 1
+            return
+        state.update(status=status, http_status=http_status, observed_at=observed_at)
+        if status == "ok":
+            # An already in-flight success cannot erase a concurrently observed 402.
+            if state["blocked_until_tick"] > monotonic():
+                return
+            state.update(blocked_until_tick=0.0, circuit_open_until=None)
+        else:
+            state["error_count"] += 1
+        if http_status == 402:
+            seconds = settings.AI_PAYMENT_COOLDOWN_SEC
+            state.update(status="payment_required", blocked_until_tick=monotonic() + seconds,
+                         circuit_open_until=(datetime.now(ZoneInfo("Asia/Shanghai"))
+                                             + timedelta(seconds=seconds)).isoformat())
 
     async def configure(self, update: AIConfigurationUpdate):
         async with self._config_lock:
@@ -87,6 +130,7 @@ class AIProvider:
             "ready": self.enabled and (bool(oauth.get("connected") and oauth.get("chat_available", False)) if self.auth_mode == "openai_oauth" else bool(self.api_key)),
             "active_model": (self.oauth_model or "账号默认模型") if self.auth_mode == "openai_oauth" else self.model,
             "scope": "全局 AI（新闻情感、事件和摘要等共用）",
+            "runtime": self.runtime_status(),
         })
         return result
 
@@ -156,21 +200,41 @@ class AIProvider:
                 url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
                 headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
             async with self._semaphore:
-                resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            if config.api_format == "openai":
-                content = data.get("choices", [{}])[0].get("message", {}).get("content")
-                return content if isinstance(content, str) and content else None
-            return "\n".join(
-                block["text"] for block in data.get("content", [])
-                if block.get("type") == "text" and isinstance(block.get("text"), str)
-            ) or None
+                state = self._runtime if config is self._config else None
+                # Recheck AFTER queueing: one 402 stops the remaining queued calls.
+                if state is not None and (monotonic() < state["blocked_until_tick"] or state["probe_running"]):
+                    return None
+                probe = bool(state and state["blocked_until_tick"])
+                if probe:
+                    state["probe_running"] = True
+                try:
+                    resp = await client.post(url, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if config.api_format == "openai":
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                        content = content if isinstance(content, str) and content else None
+                    else:
+                        content = "\n".join(
+                            block["text"] for block in data.get("content", [])
+                            if block.get("type") == "text" and isinstance(block.get("text"), str)
+                        ) or None
+                    self._runtime_result(config, "ok" if content else "invalid_response")
+                    return content
+                except httpx.HTTPStatusError as exc:
+                    self._runtime_result(config, "http_error", exc.response.status_code)
+                    # No body, headers, endpoint or secret in logs/diagnostics.
+                    logger.warning("AI API HTTP 错误: {}", exc.response.status_code)
+                    return None
+                finally:
+                    if probe:
+                        state["probe_running"] = False
         except httpx.HTTPStatusError as exc:
             # 不记录响应正文：代理可能在错误消息中回显密钥。
             logger.warning("AI API HTTP 错误: {}", exc.response.status_code)
             return None
         except Exception:
+            self._runtime_result(config, "request_failed")
             logger.warning("AI API 请求失败（网络、协议或响应异常）")
             return None
 

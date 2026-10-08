@@ -27,6 +27,12 @@ from app.paper.account_policy import account_confirmation_policy
 DOCUMENTED_AMPLITUDE_CAP_PCT = 5.102
 
 
+@pytest.fixture(autouse=True)
+def legacy_high_anchor_comparison(monkeypatch):
+    """锁住旧版数学结论；新VWAP入口由修复回归用例独立验证。"""
+    monkeypatch.setattr(settings, "PAPER_AUTO_ENTRY_ANCHOR", "legacy_high")
+
+
 def _implied_amplitude_cap_pct(drawdown: float, rebound: float) -> float:
     """由两条约束推导的隐含振幅上限（百分数）。"""
     return (1.0 + rebound / 100.0) / (1.0 - drawdown / 100.0) * 100.0 - 100.0
@@ -98,8 +104,8 @@ def test_documentation_names_the_real_parameters():
     source = open(settings_module.__file__, encoding="utf-8").read()
     assert "隐含振幅上限" in source
     assert "5.102%" in source
-    block_start = source.index("=== 2026-09-18 文档化：A 策略必要价格区间的隐含振幅上限 ===")
+    block_start = source.index("legacy_high入口")
     block = source[block_start:block_start + 1800]
     assert "PAPER_INTRADAY_CONFIRM_MAX_PULLBACK_FROM_HIGH_PCT" in block
-    assert "PAPER_AUTO_VALUE_ENTRY_MAX_REBOUND_FROM_LOW_PCT" in block
-    assert "_a_entry_price_band" in block
+    assert "新版A" in block
+    assert "VWAP承接锚" in block

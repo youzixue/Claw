@@ -170,7 +170,7 @@ class FeatureRow:
     code: str
     trade_date: str
     target_board: int
-    label: int
+    label: int | None  # None is retained only by explicit historical research.
     baseline_probability: float
     candidate_route: str
     values: dict[str, Any]

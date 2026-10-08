@@ -534,7 +534,7 @@ async def test_missing_indicative_auction_path_is_a_coverage_block_not_a_signal(
 
 
 @pytest.mark.asyncio
-async def test_complete_auction_path_stays_in_denominator_when_recovery_rule_fails(
+async def test_unverified_auction_prices_report_data_gap_before_recovery_rule(
     shadow_env,
 ):
     SessionLocal = shadow_env
@@ -597,7 +597,9 @@ async def test_complete_auction_path_stays_in_denominator_when_recovery_rule_fai
         )
 
     assert result["confirmed"] == 0
-    assert [item.event_type for item in route_events] == ["structural_pool"]
+    assert {item.event_type for item in route_events} == {
+        "structural_pool", "evidence_blocked", "coverage_blocked",
+    }
 
 
 @pytest.mark.asyncio
@@ -971,6 +973,7 @@ async def _seed_first_board_denominator(session: AsyncSession) -> None:
             fund_flow=5.0,
             change_pct=1.0,
             strength_score=60.0,
+            observed_at=datetime(2026, 9, 4, 9, 30),
         )
     )
     await session.commit()

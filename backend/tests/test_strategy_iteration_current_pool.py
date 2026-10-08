@@ -159,7 +159,7 @@ async def test_live_all_market_entry_exit_and_immutable_evidence(shadow_env, mon
         ))).all())
         for audit in audits:
             members = json.loads(audit.snapshot_json)["prior_structure"]["current_pool"]["members"]
-            assert all(set(m) == {"code", "name", "eligible", "confirmation_frame", "source_quote_at", "reason"}
+            assert all(set(m) == {"code", "name", "eligible", "confirmation_frame", "source_quote_at", "reason", "gate_issues"}
                        for m in members)
         evidence = list((await db.scalars(select(PaperShadowEvent).where(
             PaperShadowEvent.event_type.in_(("confirmed", "eligible", "structural_pool"))

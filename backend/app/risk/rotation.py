@@ -212,19 +212,22 @@ class SectorRotationEngine:
     async def save_strength_ranking(self, session: AsyncSession,
                                      items: list[SectorRankItem],
                                      trade_date: date) -> int:
-        """保存板块强弱排名"""
-        count = 0
-        for item in items:
-            # 使用 merge 避免唯一约束冲突
+        """保存板块强弱排名；批量读取既有身份，保留输入顺序及原提交边界。"""
+        codes = list(dict.fromkeys(item.sector_code for item in items))
+        existing_by_code = {}
+        # Bound bind variables without dropping identities or changing ranking.
+        for offset in range(0, len(codes), 500):
             existing = await session.execute(
                 select(SectorStrength).where(
-                    and_(
-                        SectorStrength.trade_date == trade_date,
-                        SectorStrength.sector_code == item.sector_code,
-                    )
+                    SectorStrength.trade_date == trade_date,
+                    SectorStrength.sector_code.in_(codes[offset:offset + 500]),
                 )
             )
-            row = existing.scalar_one_or_none()
+            existing_by_code.update((row.sector_code, row) for row in existing.scalars().all())
+
+        count = 0
+        for item in items:
+            row = existing_by_code.get(item.sector_code)
             if row:
                 row.rank = item.rank
                 row.rank_change = item.rank_change
@@ -235,7 +238,7 @@ class SectorRotationEngine:
                 row.change_pct = getattr(item, "change_pct", None)
                 row.limit_up_count = getattr(item, "limit_up_count", None)
             else:
-                session.add(SectorStrength(
+                row = SectorStrength(
                     trade_date=trade_date,
                     sector_code=item.sector_code,
                     sector_name=item.sector_name,
@@ -251,7 +254,11 @@ class SectorRotationEngine:
                         (item.fund_flow or 0) > 10
                         or (item.consecutive_days or 0) >= 3
                     ) else 0,
-                ))
+                )
+                session.add(row)
+                # A repeated new identity must update this first row, even when
+                # the caller disables autoflush. Preserve its first name/is_hot.
+                existing_by_code[item.sector_code] = row
             count += 1
 
         await session.commit()

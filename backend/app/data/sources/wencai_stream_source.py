@@ -371,6 +371,51 @@ class WencaiStreamSource:
         )
 
 
+def parse_dated_trading_status(frame: pd.DataFrame, trade_date) -> dict[str, dict]:
+    """Exact dated, per-security evidence; absence/unknown never means resumed."""
+    from datetime import date
+    from app.core.stock_tagger import stock_tagger
+
+    if not isinstance(trade_date, date):
+        raise ValueError("invalid trading-status date")
+    column = f"交易状态[{trade_date:%Y%m%d}]"
+    if (not isinstance(frame, pd.DataFrame) or frame.empty or not frame.columns.is_unique
+            or not {"股票代码", "股票简称", column} <= set(frame.columns)):
+        raise ValueError("missing exact dated trading-status fields")
+    # The real adapter supplies these totals. Truncation cannot certify a batch.
+    for key in ("code_count", "row_count"):
+        count = frame.attrs.get(key)
+        if isinstance(count, bool) or not isinstance(count, (int, float)) or count != len(frame):
+            raise ValueError("unverified trading-status frame coverage")
+    output = {}
+    for _, row in frame.iterrows():
+        raw_code, name, raw_state = row["股票代码"], row["股票简称"], row[column]
+        if not isinstance(raw_code, str):
+            raise ValueError("invalid trading-status identity")
+        code = raw_code.strip().split(".")[0]
+        board = stock_tagger.get_board_type(code)
+        exchange = "SH" if board in {"main_sh", "star"} else "BJ" if board == "bse" else "SZ"
+        name = stock_tagger.clean_name(name)
+        if (board == "unknown" or raw_code.strip().upper() not in {code, code + "." + exchange}
+                or not name or code in output):
+            raise ValueError("invalid or duplicate trading-status identity")
+        raw_state = raw_state.strip() if isinstance(raw_state, str) else ""
+        state = "trading" if raw_state == "交易" else "unknown"
+        halt = re.fullmatch(
+            r"(?:(?:重要公告|重大事项)[，,])?停牌(?:全天|[1-9][0-9]*天|自(?P<since>[0-9]{4}-[0-9]{2}-[0-9]{2})起连续停牌)?",
+            raw_state,
+        )
+        if halt:
+            since = halt.group("since")
+            try:
+                if since is None or date.fromisoformat(since) <= trade_date:
+                    state = "suspended"
+            except ValueError:
+                pass
+        output[code] = {"name": name, "state": state, "raw_state": raw_state}
+    return output
+
+
 def normalize_dated_columns(frame: pd.DataFrame) -> pd.DataFrame:
     """把 `涨停原因[20260916]` 这类带交易日后缀的列名还原为基名。
 

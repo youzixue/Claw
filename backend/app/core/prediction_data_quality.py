@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from math import isfinite
 from bisect import bisect_right
@@ -311,6 +312,17 @@ class PredictionDataQualityAuditor:
                 "requested_trade_date": trade_date_value.isoformat(),
                 "dataset_trade_date": dataset_date.isoformat(),
             }
+            if dataset == "limit_up_pool":
+                from app.data.limit_pool import limit_pool_health
+                pool_health = await limit_pool_health(
+                    db, trade_date=dataset_date, decision_at=decision_at,
+                    require_close=not intraday_context,
+                )
+                if pool_health is not None:
+                    details["source_evidence"] = pool_health
+                    completeness = float(pool_health["coverage"])
+                    status = pool_health["status"]
+                    max_available_at = datetime.fromisoformat(pool_health["observed_at"])
             if dataset == "fund_flow":
                 # Raw daily rows stay intact for research. Only proven clocks can
                 # count toward a route input; one fresh row cannot wash older rows.
@@ -489,26 +501,45 @@ class PredictionDataQualityAuditor:
             ).all()
             if row[0] and row[0].weekday() < 5 and not is_official_closed_day(row[0])
         )
-        records = list(
-            (
-                await db.execute(
-                    select(PromotionPredictionRecord).where(
-                        PromotionPredictionRecord.prediction_trade_date >= start,
-                        PromotionPredictionRecord.outcome_status.in_(["success", "failed"]),
-                        PromotionPredictionRecord.outcome_trade_date.is_not(None),
-                    )
-                )
-            ).scalars().all()
+        # Keep the full audit window, but bound hydration/CPU between yields.
+        # Cancellation closes the cursor and cannot publish a partial audit.
+        records = await db.stream(
+            select(
+                PromotionPredictionRecord.id,
+                PromotionPredictionRecord.code,
+                PromotionPredictionRecord.prediction_trade_date,
+                PromotionPredictionRecord.horizon_days,
+                PromotionPredictionRecord.outcome_trade_date,
+            ).where(
+                PromotionPredictionRecord.prediction_trade_date >= start,
+                PromotionPredictionRecord.outcome_status.in_(["success", "failed"]),
+                PromotionPredictionRecord.outcome_trade_date.is_not(None),
+            ).execution_options(yield_per=256)
         )
-        invalid: list[tuple[PromotionPredictionRecord, date | None]] = []
-        for record in records:
-            index = bisect_right(market_dates, record.prediction_trade_date)
-            horizon = max(int(record.horizon_days or 1), 1)
-            expected_index = index + horizon - 1
-            expected = market_dates[expected_index] if expected_index < len(market_dates) else None
-            if expected and record.outcome_trade_date != expected:
-                invalid.append((record, expected))
-        if not invalid:
+        invalid = []
+        invalid_count = 0
+        try:
+            async for partition in records.partitions(256):
+                for record in partition:
+                    index = bisect_right(market_dates, record.prediction_trade_date)
+                    horizon = max(int(record.horizon_days or 1), 1)
+                    expected_index = index + horizon - 1
+                    expected = market_dates[expected_index] if expected_index < len(market_dates) else None
+                    if expected and record.outcome_trade_date != expected:
+                        invalid_count += 1
+                        if len(invalid) < 20:
+                            invalid.append((record, expected))
+                await asyncio.sleep(0)
+        except BaseException:
+            # Cursor cleanup must not mask the timeout/cancellation or read error.
+            try:
+                await records.close()
+            except BaseException:
+                pass
+            raise
+        else:
+            await records.close()
+        if not invalid_count:
             return []
         examples = [
             {
@@ -526,8 +557,8 @@ class PredictionDataQualityAuditor:
                 dataset="promotion_prediction_record",
                 issue_type="wrong_outcome_trade_date",
                 trade_date=trade_date_value,
-                message=f"发现 {len(invalid)} 条预测结果日不等于官方交易日 horizon",
-                evidence={"invalid_count": len(invalid), "examples": examples},
+                message=f"发现 {invalid_count} 条预测结果日不等于官方交易日 horizon",
+                evidence={"invalid_count": invalid_count, "examples": examples},
             )
         ]
 
@@ -539,20 +570,21 @@ class PredictionDataQualityAuditor:
         lookback_days: int,
     ) -> list[QualityFinding]:
         start = trade_date_value - timedelta(days=max(lookback_days * 2, 60))
-        records = list(
-            (
-                await db.execute(
-                    select(PromotionPredictionRecord).where(
-                        PromotionPredictionRecord.prediction_trade_date >= start,
-                        PromotionPredictionRecord.snapshot_recorded_at.is_not(None),
-                        PromotionPredictionRecord.snapshot_context.in_([
-                            "promotion_1510",
-                            "promotion_2000",
-                            *sorted(PREDICTION_INTRADAY_CONTEXTS),
-                        ]),
-                    )
-                )
-            ).scalars().all()
+        records = await db.stream(
+            # Preserve the full audit denominator and original window predicates.
+            select(
+                PromotionPredictionRecord.id,
+                PromotionPredictionRecord.snapshot_context,
+                PromotionPredictionRecord.snapshot_recorded_at,
+            ).where(
+                PromotionPredictionRecord.prediction_trade_date >= start,
+                PromotionPredictionRecord.snapshot_recorded_at.is_not(None),
+                PromotionPredictionRecord.snapshot_context.in_([
+                    "promotion_1510",
+                    "promotion_2000",
+                    *sorted(PREDICTION_INTRADAY_CONTEXTS),
+                ]),
+            ).execution_options(yield_per=256)
         )
         windows = {
             "promotion_1510": (time(15, 5), time(16, 30)),
@@ -568,12 +600,27 @@ class PredictionDataQualityAuditor:
             "promotion_1430": (time(14, 25), time(14, 45)),
         }
         invalid = []
-        for record in records:
-            lower, upper = windows[record.snapshot_context]
-            recorded_time = record.snapshot_recorded_at.time()
-            if not lower <= recorded_time <= upper:
-                invalid.append(record)
-        if not invalid:
+        invalid_count = 0
+        try:
+            async for partition in records.partitions(256):
+                for record in partition:
+                    lower, upper = windows[record.snapshot_context]
+                    recorded_time = record.snapshot_recorded_at.time()
+                    if not lower <= recorded_time <= upper:
+                        invalid_count += 1
+                        if len(invalid) < 20:
+                            invalid.append(record)
+                await asyncio.sleep(0)
+        except BaseException:
+            # Cursor cleanup must not mask the timeout/cancellation or read error.
+            try:
+                await records.close()
+            except BaseException:
+                pass
+            raise
+        else:
+            await records.close()
+        if not invalid_count:
             return []
         return [
             QualityFinding(
@@ -581,9 +628,9 @@ class PredictionDataQualityAuditor:
                 dataset="promotion_prediction_record",
                 issue_type="snapshot_outside_context_window",
                 trade_date=trade_date_value,
-                message=f"发现 {len(invalid)} 条快照记录时间不在声明阶段窗口内",
+                message=f"发现 {invalid_count} 条快照记录时间不在声明阶段窗口内",
                 evidence={
-                    "invalid_count": len(invalid),
+                    "invalid_count": invalid_count,
                     "examples": [
                         {
                             "id": record.id,

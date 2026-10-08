@@ -18,7 +18,8 @@ DIRECTION_MIN_VALIDATION_DAYS = 30
 
 def evaluate_direction_bundle(bundle: DatasetBundle, *, initial_train_days: int = 25,
                               validation_days: int = 5, step_days: int = 5,
-                              calibration_days: int = 5) -> dict:
+                              calibration_days: int = 5,
+                              train_window_days: int | None = None) -> dict:
     """Use the same features, whole-run guards and time splits, a different label.
 
     Passing a retrospective study is NOT shadow eligibility. The existing manual
@@ -33,6 +34,10 @@ def evaluate_direction_bundle(bundle: DatasetBundle, *, initial_train_days: int 
         "scope": "offline_research_only", "production_unchanged": True,
         "manual_review_eligible": False, "persisted": False,
         "target_precision": DIRECTION_TARGET_PRECISION,
+        "training_config": {"initial_train_days": initial_train_days,
+                            "validation_days": validation_days, "step_days": step_days,
+                            "calibration_days": calibration_days,
+                            "train_window_days": train_window_days},
         "minimum_validation_trade_days": DIRECTION_MIN_VALIDATION_DAYS,
         "historical_first_knowledge_verified": False,
         "notes": ["上涨标签使用封存T+1收盘与前收盘，不用涨停标签或日内最高涨幅",
@@ -51,7 +56,8 @@ def evaluate_direction_bundle(bundle: DatasetBundle, *, initial_train_days: int 
         raise ValueError("direction validation windows must not overlap")
     try:
         evaluation = walk_forward_evaluate(rows, initial_train_days=initial_train_days,
-            validation_days=validation_days, step_days=step_days, calibration_days=calibration_days)
+            validation_days=validation_days, step_days=step_days, calibration_days=calibration_days,
+            train_window_days=train_window_days)
     except ValueError as exc:
         return {**result, "status": "insufficient_evidence", "reason": str(exc),
                 "target_met": None, "walk_forward": None}
@@ -107,11 +113,13 @@ async def research_direction_challenger(db, *, as_of_at: datetime,
                                        start_date=None, end_date=None,
                                        snapshot_context="promotion_2000", model_version=None,
                                        initial_train_days=25, validation_days=5,
-                                       step_days=5, calibration_days=5) -> dict:
+                                       step_days=5, calibration_days=5,
+                                       train_window_days=None) -> dict:
     validate_direction_as_of(as_of_at)
     bundle = await build_ledger_training_dataset(db, target_board=1,
         label_target=DIRECTION_LABEL_VERSION, as_of_at=as_of_at,
         start_date=start_date, end_date=end_date, snapshot_context=snapshot_context,
         model_version=model_version)
     return evaluate_direction_bundle(bundle, initial_train_days=initial_train_days,
-        validation_days=validation_days, step_days=step_days, calibration_days=calibration_days)
+        validation_days=validation_days, step_days=step_days, calibration_days=calibration_days,
+        train_window_days=train_window_days)

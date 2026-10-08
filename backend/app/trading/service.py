@@ -9,12 +9,12 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.config.settings import settings
-from app.paper.experiment import experiment_active, freeze_entry_evidence, sentiment_is_required, sentiment_quality_at
+from app.paper.experiment import experiment_active, freeze_entry_evidence, sentiment_is_required, sentiment_quality_at, LIMIT_QUEUE_EVIDENCE_CONTRACT_VERSION
 from app.models.stock import StockSpot
 from app.core.stock_tagger import stock_tagger
 from app.models.trading import BrokerSyncSnapshot, TradeFill, TradeOrder
@@ -62,6 +62,8 @@ class SubmitOrderCommand:
     # Compatibility input only: every immediate paper fill is checked, even False.
     # Deferred/queue paths retain their separate, non-immediate matching contracts.
     require_immediate_quote: bool = True
+    # Explicit public/manual intent only; no scheduler/strategy implicitly opts in.
+    after_hours_manual_intent: bool = False
 
 
 def _paper_only_guard_reason(cmd: SubmitOrderCommand) -> str:
@@ -74,9 +76,11 @@ def _paper_only_guard_reason(cmd: SubmitOrderCommand) -> str:
     from app.api.v1 import paper
 
     account_name = str(cmd.account_id or "").strip()
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
     reserved_accounts = {
         *paper.PAPER_ALL_ACCOUNTS,
         *paper.PAPER_CHALLENGER_ACCOUNTS,
+        PORTFOLIO_ACCOUNT,
     }
     simulation_strategy = str(cmd.strategy_id or "").strip().lower().startswith(
         "paper-"
@@ -237,12 +241,13 @@ class _PaperRiskAccountUnavailable(ValueError):
     pass
 
 
-async def _paper_account_context(db: AsyncSession, account_name: str = "default") -> tuple[float, float, float, dict, float, dict]:
+async def _paper_account_context(db: AsyncSession, account_name: str = "default", *, allow_create: bool = True) -> tuple[float, float, float, dict, float, dict]:
     from app.api.v1 import paper
     from app.models.paper import PaperAccount
 
     # 五策略并行: 风控基于对应策略账户的持仓/资金 (2026-08-31 修复)
-    if paper_transaction_active(db):
+    from app.paper.portfolio_reservation import reservation_active
+    if paper_transaction_active(db) or reservation_active(db) or not allow_create:
         # Do not recreate a closed/deleted account or trust a pre-lock identity map.
         with db.no_autoflush:
             accounts = (await db.scalars(select(PaperAccount).where(
@@ -267,12 +272,24 @@ async def _paper_account_context(db: AsyncSession, account_name: str = "default"
 
 
 async def _pre_trade_risk_check(db: AsyncSession, cmd: SubmitOrderCommand) -> dict:
-    fresh = paper_transaction_active(db)
+    from app.paper.portfolio_provenance import command_origin, PortfolioIdentityError
+    try:
+        portfolio_origin = await command_origin(db, cmd)
+    except PortfolioIdentityError as exc:
+        return {"final_level": "block", "evaluation_status": "incomplete", "checked_rules": 0,
+                "block_reasons": [{"rule": "paper_portfolio_origin", "message": str(exc)}]}
+    policy_account = (portfolio_origin["origin_account"] if portfolio_origin
+                      else str(cmd.account_id or "default"))
+    from app.paper.portfolio_reservation import reservation_active
+    fresh = paper_transaction_active(db) or reservation_active(db)
     stock_status = (await stock_tagger.load_status(db, cmd.code, fresh=True, at=cmd.decision_at)
                     if fresh else await stock_tagger.load_status(db, cmd.code))
     try:
+        account_options = {"account_name": str(cmd.account_id or "default")}
+        if cmd.order_type == "after_hours_fixed":
+            account_options["allow_create"] = False
         total_assets, cash, position_value, current_positions, current_drawdown, account_status = await _paper_account_context(
-            db, account_name=str(cmd.account_id or "default")
+            db, **account_options
         )
     except _PaperRiskAccountUnavailable as exc:
         return {"final_level": "block", "block_reasons": [{"rule": "paper_account_identity",
@@ -288,7 +305,7 @@ async def _pre_trade_risk_check(db: AsyncSession, cmd: SubmitOrderCommand) -> di
                        if fresh else await sentiment_circuit_breaker.get_current_state(db, today))
     sentiment_quality_status, sentiment_quality_reason = sentiment_quality_at(
         sentiment_state, at=cmd.decision_at or datetime.now(),
-        strict=experiment_active(str(cmd.account_id or "default"), broker=cmd.broker, at=cmd.decision_at or datetime.now()),
+        strict=experiment_active(policy_account, broker=cmd.broker, at=cmd.decision_at or datetime.now()),
     )
     if sentiment_state.trade_date != today:
         sentiment_quality_status = "stale"
@@ -307,9 +324,9 @@ async def _pre_trade_risk_check(db: AsyncSession, cmd: SubmitOrderCommand) -> di
         current_positions=current_positions,
         max_drawdown=current_drawdown if cmd.broker == "paper" else 0,
         is_paper_experiment=experiment_active(
-            str(cmd.account_id or "default"), broker=cmd.broker, at=cmd.decision_at or datetime.now(),
+            policy_account, broker=cmd.broker, at=cmd.decision_at or datetime.now(),
         ),
-        sentiment_required=sentiment_is_required(str(cmd.account_id or "default")),
+        sentiment_required=sentiment_is_required(policy_account),
         is_drawdown_recovery_probe=is_internal_paper_recovery,
         drawdown_recovery_limit_pct=(
             cmd.drawdown_recovery_limit_pct if is_internal_paper_recovery else 0
@@ -334,6 +351,20 @@ async def _pre_trade_risk_check(db: AsyncSession, cmd: SubmitOrderCommand) -> di
     }
     result["stock_status"] = stock_status
     result["account_status"] = account_status
+    if portfolio_origin is not None:
+        result["paper_portfolio_origin"] = portfolio_origin
+        if cmd.side == "buy":
+            from app.paper.portfolio_wallet import validate_command_budget
+            try:
+                result["paper_portfolio_budget"] = await validate_command_budget(db, cmd, portfolio_origin)
+            except (PortfolioIdentityError, KeyError, ValueError, TypeError) as exc:
+                result["final_level"] = "block"
+                result["block_reasons"] = list(result.get("block_reasons") or []) + [{
+                    "rule": "paper_portfolio_budget", "message": str(exc)}]
+        if cmd.side == "buy" and _effective_risk_level(result) != "pass":
+            result["final_level"] = "block"
+            result["block_reasons"] = list(result.get("block_reasons") or []) + [{
+                "rule": "paper_portfolio_risk", "message": "共享组合新入场必须完整通过原策略风控，警告不放行"}]
     # 身份/板块/人工封禁是成交硬边界，不能靠关闭可配置规则绕过。
     suspended_exit = cmd.side == "sell" and (
         stock_status.get("is_suspended") is True or stock_status.get("board_tag") == "suspended")
@@ -392,7 +423,7 @@ async def _locked_paper_risk_evidence(db, order, cmd, execution, *, block_warn, 
     # metadata back into its own receipt (also prevents recursive diagnostic trees).
     fields = ("code", "action", "final_level", "decisions", "block_reasons", "warnings",
               "suggestions", "total_rules", "checked_rules", "evaluation_status", "evaluation_errors",
-              "observed_sentiment", "stock_status", "account_status")
+              "observed_sentiment", "stock_status", "account_status", "paper_portfolio_budget")
     result = (_json_loads_dict(_json_dumps({k: result[k] for k in fields if k in result}))
               if isinstance(result, dict) else {"final_level": "block"})
     completed = paper._public_order_clock()
@@ -710,11 +741,117 @@ async def _dispatch_for_service(*args, **kwargs):
 
 
 async def submit_order(db: AsyncSession, cmd: SubmitOrderCommand) -> dict:
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+    if cmd.order_type == "after_hours_fixed" and cmd.account_id == PORTFOLIO_ACCOUNT:
+        raise HTTPException(403, "共享组合不接受人工盘后意图，禁止先进入组合预留事务")
+    if (cmd.account_id == PORTFOLIO_ACCOUNT and isinstance(cmd.side, str)
+            and cmd.side.lower().strip() == "buy"):
+        from app.paper.portfolio_reservation import shared_order_reservation
+        async with shared_order_reservation(db):
+            return await _submit_order(db, cmd)
+    try:
+        return await _submit_order(db, cmd)
+    except IntegrityError:
+        if cmd.order_type != "after_hours_fixed" or not cmd.idempotency_key:
+            raise
+        # A concurrent registration won the unique key. Never insert a second intent
+        # or reset priority; no broker/ledger was invoked by this mode.
+        await db.rollback()
+        existing = await _existing_order_result(db, cmd.idempotency_key)
+        if existing is None:
+            raise
+        _assert_order_replay_identity(existing, cmd)
+        return existing
+
+
+def _assert_order_replay_identity(existing, cmd):
+    if any(existing["order"][key] != getattr(cmd, key) for key in (
+            "code", "side", "broker", "account_id", "order_type", "price", "quantity")):
+        raise HTTPException(409, "幂等键对应另一模式/身份/价量，不允许复用或重置优先级")
+
+
+async def _register_paper_after_hours_intent(db, order, cmd, initial_risk):
+    from app.api.v1 import paper
+    from app.trading.paper_after_hours_execution import intent_evidence, clock_valid
+    risk = dict(initial_risk)
+    # Drop the uncommitted preflight row BEFORE waiting for the process lock.
+    # Otherwise checkpoint-first would leave a naked pending order after cancellation.
+    values = {column.name: getattr(order, column.name) for column in TradeOrder.__table__.columns
+              if column.name != "id"}
+    await db.rollback()
+    # No broker dispatch: this scope protects registration/revalidation, not a fill.
+    async with _paper_order_transaction(db):
+        existing = await _existing_order_result(db, str(cmd.idempotency_key or ""))
+        if existing is not None:
+            _assert_order_replay_identity(existing, cmd)
+            return existing
+        accepted = paper._public_order_clock()
+        if not isinstance(accepted, datetime) or accepted.tzinfo is not None:
+            raise HTTPException(409, "盘后登记缺少可靠本地时钟")
+        values.update(created_at=accepted, updated_at=accepted)
+        order = TradeOrder(**values)
+        db.add(order)
+        await db.flush()
+        locked_risk = await _pre_trade_risk_check(db, replace(cmd, decision_at=accepted))
+        risk["paper_after_hours_locked_risk"] = locked_risk
+        initial_account = initial_risk.get("account_status", {}).get("id")
+        current_account = locked_risk.get("account_status", {}).get("id")
+        if (_effective_risk_level(locked_risk) == "block" or initial_account is None
+                or initial_account != current_account):
+            order.status, order.risk_level = "risk_blocked", "block"
+            order.error_message = "盘后意图锁后风控未通过；未生成任何成交"
+        else:
+            evidence = await intent_evidence(db, cmd, accepted_at=accepted,
+                                            validated_at=paper._public_order_clock())
+            # T+1 is checked at intent registration too, not only a hypothetical future fill.
+            if cmd.side == "sell" and evidence["status"] == "waiting":
+                from app.models.paper import PaperAccount, PaperPosition
+                account = await db.scalar(select(PaperAccount).where(
+                    PaperAccount.account_name == cmd.account_id, PaperAccount.status == "active"))
+                position = await db.scalar(select(PaperPosition).where(
+                    PaperPosition.account_id == account.id, PaperPosition.code == cmd.code,
+                    PaperPosition.is_closed.is_(False))) if account else None
+                available = await paper._available_sell_amount(db, position, accepted.date()) if position else 0
+                evidence["sellable_quantity_at_registration"] = available
+                if cmd.quantity > available:
+                    evidence.update(status="rejected", reason="T_plus_1_or_insufficient_sellable_quantity")
+            terminal_at = paper._public_order_clock()
+            validated_at = datetime.fromisoformat(evidence["validated_at"])
+            if not isinstance(terminal_at, datetime) or terminal_at.tzinfo is not None:
+                raise HTTPException(409, "盘后登记终验时钟不可用")
+            if (not clock_valid(terminal_at) or not cmd.decision_at <= accepted <= validated_at <= terminal_at
+                    or terminal_at.date() != accepted.date() or cmd.decision_at.date() != accepted.date()):
+                evidence.update(status="rejected", reason="registration_crossed_session_end_or_clock_rollback")
+            evidence.update(order_id=order.order_id, acceptance_sequence=order.id,
+                            requested_at=cmd.decision_at.isoformat(),
+                            numeric_account_id=initial_account,
+                            terminal_validated_at=terminal_at.isoformat())
+            risk["paper_after_hours_intent"] = evidence
+            if evidence["status"] == "rejected":
+                order.status = "rejected"
+                order.error_message = evidence["reason"]
+            else:
+                order.status = "submitted" if cmd.execute else "accepted"
+                order.external_order_id = "paper-after-hours-" + order.order_id if cmd.execute else None
+                order.error_message = ("等待独立对手与队列证据；非五档撮合，未冻结现金/持仓且未成交"
+                                       if cmd.execute else "dry_run: 专用模式意图校验，未登记可撮合委托")
+        order.risk_json = _json_dumps(risk)
+    await db.refresh(order)
+    return {"order": _order_payload(order), "risk": risk, "fills": []}
+
+
+async def _submit_order(db: AsyncSession, cmd: SubmitOrderCommand) -> dict:
     side = cmd.side.lower().strip() if isinstance(cmd.side, str) else ""
     if side not in {"buy", "sell"}:
         raise HTTPException(status_code=400, detail="side 仅支持 buy/sell")
     # 所有后续风控/实验门禁/撮合使用同一方向；不能只规范化落库字段。
     cmd.side = side
+    if cmd.order_type == "after_hours_fixed":
+        from app.trading.paper_after_hours_execution import original_declaration_parameters
+        try:
+            original_declaration_parameters(cmd.code, side, cmd.price, cmd.quantity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise HTTPException(400, "盘后原委托参数不在支持的2026申报子集内: " + str(exc)) from None
     try:
         price = validated_order_price(cmd.price)
         validate_order_notional(price, cmd.quantity)
@@ -723,13 +860,42 @@ async def submit_order(db: AsyncSession, cmd: SubmitOrderCommand) -> dict:
     except (TypeError, ValueError, OverflowError):
         raise HTTPException(status_code=400, detail="价格/委托金额必须为有限正数，数量必须为可存储的100股整数倍") from None
     cmd.price = price
+    if cmd.order_type not in {"limit", "market", "after_hours_fixed"}:
+        raise HTTPException(400, "未知order_type，不允许退化为普通限价或盘后模式")
+    if cmd.order_type == "after_hours_fixed":
+        if cmd.broker != "paper" or cmd.after_hours_manual_intent is not True:
+            raise HTTPException(403, "盘后专用模式仅接受显式人工paper意图，自动/实盘未授权")
+        if cmd.queue_if_limit_up or cmd.defer_until_next_round or cmd.queue_metadata or cmd.deferred_metadata:
+            raise HTTPException(400, "盘后模式禁止混用普通五档/涨停排队/deferred合同")
+        from app.data.sources.after_hours_source import exchange_of
+        from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+        from app.api.v1 import paper
+        if cmd.account_id not in paper.PAPER_ALL_ACCOUNTS:
+            raise HTTPException(403, "盘后人工意图仅限已有常规paper账户，候选/共享/未知身份不接受")
+        from app.models.paper import PaperAccount
+        with db.no_autoflush:
+            existing_accounts = list((await db.scalars(select(PaperAccount.id).where(
+                PaperAccount.account_name == cmd.account_id, PaperAccount.status == "active"))).all())
+        if len(existing_accounts) != 1:
+            raise HTTPException(403, "盘后意图必须绑定唯一已有活动账户，禁止自动创建/重开账户")
+        try:
+            exchange_of(cmd.code)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        # Never inherit an old Tencent round clock or let a caller backdate this session.
+        cmd.decision_at = paper._public_order_clock()
+        if not isinstance(cmd.decision_at, datetime) or cmd.decision_at.tzinfo is not None:
+            raise HTTPException(409, "盘后人工意图缺少可靠本地请求时钟")
+        cmd.as_of_at = cmd.decision_at
+        cmd.decision_round_id = "after-hours-intent-" + cmd.decision_at.date().isoformat()
+        cmd.strategy_version = cmd.strategy_version or paper._strategy_version(cmd.account_id)
 
     paper_only_reason = _paper_only_guard_reason(cmd)
     if paper_only_reason:
         raise HTTPException(status_code=403, detail=paper_only_reason)
 
     decision_now = cmd.decision_at
-    if cmd.broker == "paper":
+    if cmd.broker == "paper" and cmd.order_type != "after_hours_fixed":
         from app.api.v1 import paper
         from app.data.quote_round import quote_code_version, quote_config_version
 
@@ -760,17 +926,35 @@ async def submit_order(db: AsyncSession, cmd: SubmitOrderCommand) -> dict:
 
     existing = await _existing_order_result(db, str(cmd.idempotency_key or ""))
     if existing is not None:
+        _assert_order_replay_identity(existing, cmd)
         return existing
+
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+    if cmd.account_id == PORTFOLIO_ACCOUNT and side == "buy":
+        from app.paper.portfolio_reservation import bind_reservation_clock
+        await bind_reservation_clock(db, cmd)
+        decision_now = cmd.decision_at
 
     broker = get_broker_adapter(cmd.broker)
     order_id = f"ord-{decision_now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
     risk = await _pre_trade_risk_check(db, cmd)
-    if cmd.side == "buy" and experiment_active(cmd.account_id, broker=cmd.broker, at=decision_now):
+    portfolio_origin = risk.get("paper_portfolio_origin")
+    policy_account = portfolio_origin["origin_account"] if portfolio_origin else cmd.account_id
+    if cmd.side == "buy" and (portfolio_origin or experiment_active(policy_account, broker=cmd.broker, at=decision_now)):
         # 根键保留首次下单证据；后续重验只添加fill_risk，不覆盖入场分组。
         risk["experiment_entry"] = await freeze_entry_evidence(
-            db, cmd.account_id, at=decision_now,
+            db, policy_account, at=decision_now,
             sentiment=dict(risk.get("observed_sentiment") or {}),
         )
+        if portfolio_origin:
+            risk["experiment_entry"].update(
+                strategy_version=cmd.strategy_version,
+                origin_account=policy_account,
+                origin_strategy_version=portfolio_origin["origin_version"],
+                portfolio_version=portfolio_origin["portfolio_version"],
+                exit_parameters=portfolio_origin["entry_policy"]["exit_parameters"],
+                exit_mode=portfolio_origin["entry_policy"]["exit_mode"],
+            )
     if cmd.strategy_version:
         risk["strategy_version"] = cmd.strategy_version
     if cmd.decision_round_id:
@@ -814,6 +998,9 @@ async def submit_order(db: AsyncSession, cmd: SubmitOrderCommand) -> dict:
         await db.refresh(order)
         return {"order": _order_payload(order), "risk": risk, "fills": []}
 
+    if cmd.order_type == "after_hours_fixed":
+        return await _register_paper_after_hours_intent(db, order, cmd, risk)
+
     if not cmd.execute:
         order.status = "accepted"
         order.error_message = "dry_run: 已通过风控，未发送委托"
@@ -849,14 +1036,29 @@ async def submit_order(db: AsyncSession, cmd: SubmitOrderCommand) -> dict:
                 await db.refresh(order)
                 return {"order": _order_payload(order), "risk": risk, "fills": []}
 
+            # Unknown original queue evidence is not a zero-length queue or
+            # a zero session-volume baseline. Preserve legitimate numeric zero.
+            original_hands = [
+                _to_float(getattr(spot, key, None)) for key in ("volume", "bid1_volume")
+            ]
+            if any(value is None or value < 0 or not value.is_integer()
+                   for value in original_hands):
+                order.status = "rejected"
+                order.error_message = "queue_evidence_invalid：原排队累计量/买一数量缺失或非法，禁止补造零基线"
+                await db.commit()
+                await db.refresh(order)
+                return {"order": _order_payload(order), "risk": risk, "fills": []}
+            baseline_volume, queue_ahead = (int(value) for value in original_hands)
             queue = dict(cmd.queue_metadata or {})
             queue.update({
                 "queued_at": decision_now.isoformat(sep=" "),
                 "decision_round_id": cmd.decision_round_id,
                 "as_of_at": cmd.as_of_at,
                 "limit_up_price": limit_up,
-                "baseline_volume_hands": int(getattr(spot, "volume", 0) or 0),
-                "queue_ahead_hands": max(0, int(getattr(spot, "bid1_volume", 0) or 0)),
+                "queue_evidence_contract": LIMIT_QUEUE_EVIDENCE_CONTRACT_VERSION,
+                "baseline_volume_hands": baseline_volume,
+                "queue_ahead_hands": queue_ahead,
+                "last_volume_hands": baseline_volume,
                 "order_hands": max(1, (int(cmd.quantity) + 99) // 100),
                 "quote_updated_at": getattr(spot, "updated_at", None),
                 "strategy_version": cmd.strategy_version,
@@ -1073,6 +1275,28 @@ async def _freeze_pending_buy_validity(db, cmd, metadata, *, decision_at):
     from app.paper.account_policy import ROUTE_ACCOUNT_NAMES, challenger_execution_policy
     from app.paper.strategy_iteration_challenger import _route_shadow_version, _signal_token
     from app.models.paper import PaperShadowEvent
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+    if cmd.account_id == PORTFOLIO_ACCOUNT:
+        from app.paper.portfolio_provenance import validated_entry_origin, PortfolioIdentityError
+        try:
+            origin = await validated_entry_origin(db, cmd, metadata, at=decision_at)
+        except PortfolioIdentityError as exc:
+            metadata["buy_validity"] = {"schema": "pending_buy_validity_v1",
+                                       "status": "invalid", "reason": str(exc)}
+            return
+        # Reuse the exact original source validator, then bind its result to the
+        # shared wallet and composite entry version. Neither clock is refreshed.
+        source_cmd = replace(cmd, account_id=origin["origin_account"],
+                             strategy_version=origin["origin_version"])
+        metadata["candidate"] = origin["candidate"]
+        metadata["confirmed_at"] = origin["confirmed_at"]
+        await _freeze_pending_buy_validity(db, source_cmd, metadata, decision_at=decision_at)
+        metadata["buy_validity"].update(
+            account_name=cmd.account_id, strategy_version=cmd.strategy_version,
+            origin_account=origin["origin_account"], origin_version=origin["origin_version"],
+            portfolio_signal_key=origin["portfolio_signal_key"],
+        )
+        return
 
     candidate = metadata.get("candidate")
     candidate = candidate if isinstance(candidate, dict) else {}
@@ -1178,10 +1402,19 @@ async def _pending_buy_current_status(db, order, metadata, spot, *, now):
     from app.api.v1 import paper
     from app.models.paper import PaperShadowEvent
     from app.paper.strategy_iteration_challenger import (
-        _route_shadow_version, _live_route_confirmation_valid,
+        _route_shadow_version, _live_route_confirmation_valid, _confirmed_path_valid,
     )
 
     contract = metadata["buy_validity"]
+    policy_account = str(order.account_id)
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+    if policy_account == PORTFOLIO_ACCOUNT:
+        from app.paper.portfolio_provenance import validated_entry_origin, PortfolioIdentityError
+        try:
+            origin = await validated_entry_origin(db, order, metadata, at=now)
+        except PortfolioIdentityError as exc:
+            return "canceled", str(exc)
+        policy_account = origin["origin_account"]
     if order.strategy_id == "paper-auto-t":
         return await paper._pending_t_buyback_confirmation(
             db, order=order, contract=contract, spot=spot, now=now)
@@ -1197,12 +1430,18 @@ async def _pending_buy_current_status(db, order, metadata, spot, *, now):
                 or hashlib.sha256(str(event.snapshot_json).encode()).hexdigest()
                 != contract.get("event_snapshot_sha256")):
             return "canceled", "buy_route_invalid：原路线版本或不可变确认事件已失效"
+        audit = {}
+        path_valid, path_reason = await _confirmed_path_valid(db, event, now=now, audit=audit)
+        if not path_valid:
+            metadata["execution_confirmation_audit"] = audit
+            return "canceled", path_reason
         valid, reason = _live_route_confirmation_valid(
-            event, _json_loads_dict(event.snapshot_json), spot)
+            event, _json_loads_dict(event.snapshot_json), spot, audit=audit)
+        metadata["execution_confirmation_audit"] = audit
         return ("valid", "") if valid else (
-            "waiting" if reason.startswith("暂缺") else "canceled", reason)
+            "waiting" if audit.get("execution_confirmation_recoverable") is True else "canceled", reason)
     return await paper._pending_primary_buy_confirmation(
-        db, account_name=str(order.account_id), source=str(order.source),
+        db, account_name=policy_account, source=str(order.source),
         candidate=metadata.get("candidate") or {}, spot=spot,
         limit_price=float(order.price), now=now,
     )
@@ -1253,6 +1492,14 @@ async def _pending_order_version_reason(db, order, metadata, *, now: datetime) -
     from app.api.v1 import paper
     from app.models.paper import PaperAccount, PaperPosition
 
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+    if order.account_id == PORTFOLIO_ACCOUNT and order.side == "buy":
+        from app.paper.portfolio_provenance import validated_entry_origin, PortfolioIdentityError
+        try:
+            await validated_entry_origin(db, order, metadata, at=now)
+        except PortfolioIdentityError as exc:
+            return str(exc)
+        return ""
     current_version = paper._strategy_version(str(order.account_id or "default"))
     if order.strategy_version and str(order.strategy_version) == current_version:
         return ""
@@ -1354,6 +1601,7 @@ async def reconcile_paper_deferred_orders(
                     TradeOrder.broker == "paper",
                     TradeOrder.account_id == str(account_id or "default"),
                     TradeOrder.status.in_(("submitted", "partial")),
+                    TradeOrder.order_type != "after_hours_fixed",
                 )
                 .order_by(TradeOrder.created_at, TradeOrder.id)
             )
@@ -1521,6 +1769,9 @@ async def reconcile_paper_deferred_orders(
             code_version=str(order.code_version or ""),
             entry_sector_code=deferred.get("entry_sector_code"),
             entry_sector_name=deferred.get("entry_sector_name"),
+            deferred_metadata=deferred,
+            stop_loss_price=deferred.get("stop_loss_price") if order.account_id == "shared_50k" else None,
+            idempotency_key=str(order.idempotency_key or ""),
         )
         fill_risk = await _pre_trade_risk_check(db, fill_cmd)
         block_warn = bool(
@@ -1771,6 +2022,7 @@ async def reconcile_paper_limit_up_orders(
                 TradeOrder.account_id == str(account_id or "default"),
                 TradeOrder.side == "buy",
                 TradeOrder.status == "submitted",
+                TradeOrder.order_type != "after_hours_fixed",
             )
             .order_by(TradeOrder.created_at, TradeOrder.id)
         )
@@ -1798,15 +2050,23 @@ async def reconcile_paper_limit_up_orders(
         current_strategy_version = paper._strategy_version(
             str(order.account_id or "default")
         )
+        from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+        portfolio_version_reason = ""
+        if order.account_id == PORTFOLIO_ACCOUNT:
+            portfolio_version_reason = await _pending_order_version_reason(db, order, queue, now=now)
+            if not portfolio_version_reason:
+                current_strategy_version = str(order.strategy_version or "")
         if (
             not queued_strategy_version
             or queued_strategy_version != current_strategy_version
+            or portfolio_version_reason
         ):
             order.status = "risk_blocked"
             order.error_message = (
                 "排队委托策略版本已变化或缺失："
                 f"queued={queued_strategy_version or 'legacy_unversioned'}，"
                 f"current={current_strategy_version}；禁止跨版本成交"
+                + (f"；{portfolio_version_reason}" if portfolio_version_reason else "")
             )
             queue["current_strategy_version"] = current_strategy_version
             risk_payload["paper_limit_up_queue"] = queue
@@ -1853,6 +2113,23 @@ async def reconcile_paper_limit_up_orders(
                 db, order, risk_payload, queue, queued=True, status="canceled",
                 reason=time_reason, now=now, round_id=current_round_id))
             continue
+        # Validate frozen evidence before any new quote can conceal or repair it.
+        original_hands = [
+            _to_float(queue.get(key)) for key in (
+                "baseline_volume_hands", "queue_ahead_hands", "order_hands", "last_volume_hands")
+        ]
+        if (queue.get("queue_evidence_contract") != LIMIT_QUEUE_EVIDENCE_CONTRACT_VERSION
+                or any(value is None or value < 0 or not value.is_integer()
+                       for value in original_hands)
+                or original_hands[2] != max(1, (int(order.quantity) + 99) // 100)
+                or original_hands[3] < original_hands[0]):
+            outcomes.append(await _pending_buy_outcome(
+                db, order, risk_payload, queue, queued=True, status="canceled",
+                reason="queue_evidence_invalid：原队列证据合同缺失或非法，撤销余量，不回填基线",
+                now=now, round_id=current_round_id))
+            continue
+        baseline_volume, queue_ahead, order_hands, last_volume = (
+            int(value) for value in original_hands)
         if (expire_only
                 or (_requires_pending_buy_validity(order) and not current_round_id)
                 or (current_round_id and round_context.get("quality_status") != "ok")):
@@ -1884,6 +2161,20 @@ async def reconcile_paper_limit_up_orders(
             })
             continue
 
+        # A known volume regression is terminal even if another route leaf is
+        # unknown. Record healthy cumulative observations without refreshing TTL.
+        current_volume = _to_float(getattr(spot, "volume", None))
+        current_volume_valid = (
+            current_volume is not None and current_volume >= 0 and current_volume.is_integer())
+        if current_volume_valid:
+            current_volume = int(current_volume)
+            if current_volume < last_volume:
+                outcomes.append(await _pending_buy_outcome(
+                    db, order, risk_payload, queue, queued=True, status="canceled",
+                    reason="queue_volume_regressed：累计量早于原基线或已观测量，禁止重置后补成交",
+                    now=now, round_id=current_round_id))
+                continue
+            queue["last_volume_hands"] = current_volume
         validity, validity_reason = await _pending_buy_current_status(db, order, queue, spot, now=now)
         if validity != "valid":
             outcomes.append(await _pending_buy_outcome(
@@ -1915,11 +2206,13 @@ async def reconcile_paper_limit_up_orders(
             })
             continue
 
-        baseline_volume = max(0, int(queue.get("baseline_volume_hands") or 0))
-        current_volume = max(0, int(getattr(spot, "volume", 0) or 0))
-        traded_after_queue = max(0, current_volume - baseline_volume)
-        queue_ahead = max(0, int(queue.get("queue_ahead_hands") or 0))
-        order_hands = max(1, int(queue.get("order_hands") or ((order.quantity + 99) // 100)))
+        if not current_volume_valid:
+            outcomes.append(await _pending_buy_outcome(
+                db, order, risk_payload, queue, queued=True, status="waiting",
+                reason="queue_volume_unknown：本帧累计量缺失或非法，等待有效证据，原确认不续期",
+                now=now, round_id=current_round_id))
+            continue
+        traded_after_queue = current_volume - baseline_volume
         cover_ratio = max(
             1.0,
             float(getattr(settings, "PAPER_HIGHBOARD_QUEUE_VOLUME_COVER_RATIO", 1.0) or 1.0),
@@ -1995,6 +2288,8 @@ async def reconcile_paper_limit_up_orders(
             execute=True,
             entry_sector_code=queue.get("entry_sector_code"),
             entry_sector_name=queue.get("entry_sector_name"),
+            queue_metadata=queue,
+            idempotency_key=str(order.idempotency_key or ""),
             decision_round_id=str(
                 order.decision_round_id or queue.get("decision_round_id") or ""
             ),
@@ -2185,12 +2480,607 @@ async def reconcile_paper_limit_up_orders(
     return outcomes
 
 
+async def cancel_reduction_for_protective_exit(
+    db: AsyncSession, *, account_name: str, position, quantity: int,
+    candidate: dict, decision_at: datetime, decision_round_id: str,
+    strategy_id: str, source: str,
+) -> dict:
+    """Cancel only the remainder of one bound T reduction; never reprice/fill it.
+
+    This internal coordination is not an order endpoint or execution permission.
+    The caller must submit the replacement through submit_order and its original
+    risk/quote/T+1 chain. Cancellation and replacement are deliberately distinct
+    facts: a failed new submission does not undo or invent a prior fill.
+    """
+    from app.api.v1 import paper
+    from app.models.paper import PaperAccount, PaperPosition
+    from app.paper.experiment import EXPERIMENT_ACCOUNTS, EXIT_UPGRADE_CONTRACT_VERSION
+    from app.paper.account_policy import ROUTE_ACCOUNT_NAMES
+
+    # Both existing internal exit producers may protect the same bound holding.
+    # Do not recreate the former challenger/watchdog source-label deadlock.
+    origins = {("paper-auto-short", "position")}
+    origins.update(("paper-challenger-forward", route)
+                   for route, name in ROUTE_ACCOUNT_NAMES.items() if name == account_name)
+
+    def blocked(code):
+        return {"status": "blocked", "reason_code": code}
+
+    reason = str(candidate.get("exit_trigger_reason") or "")
+    if (account_name not in EXPERIMENT_ACCOUNTS
+            or not paper._is_full_exit_reason(reason)
+            or type(quantity) is not int or quantity < 100 or quantity % 100
+            or not decision_round_id):
+        return blocked("not_full_protective_exit")
+    query = select(TradeOrder).where(
+        TradeOrder.broker == "paper", TradeOrder.account_id == account_name,
+        TradeOrder.code == position.code, TradeOrder.side == "sell",
+        TradeOrder.status.in_(("pending", "submitted", "partial")),
+    )
+    orders = list((await db.scalars(query)).all())
+    if len(orders) != 1:
+        return blocked("ambiguous_active_sells")
+    order = orders[0]
+    # Freeze only decision-relevant position leaves before waiting for the fill lock.
+    fields = ("id", "account_id", "code", "buy_amount", "buy_price", "buy_time",
+              "strategy_version", "stop_loss_price", "is_closed")
+    expected_position = tuple(getattr(position, key) for key in fields)
+    async with _paper_order_transaction(db, order=order):
+        peers = list((await db.scalars(query.with_only_columns(TradeOrder.id))).all())
+        await db.refresh(position)
+        if peers != [order.id] or tuple(getattr(position, key) for key in fields) != expected_position:
+            return blocked("position_or_orders_changed")
+        accounts = list((await db.scalars(select(PaperAccount.id).where(
+            PaperAccount.account_name == account_name, PaperAccount.status == "active"))).all())
+        positions = list((await db.scalars(select(PaperPosition.id).where(
+            PaperPosition.account_id == position.account_id,
+            PaperPosition.code == position.code, PaperPosition.is_closed.is_(False)))).all())
+        if accounts != [position.account_id] or positions != [position.id]:
+            return blocked("position_account_identity")
+        now = paper._public_order_clock()
+        old_at = _pending_buy_clock(order.decision_at)
+        created_at = _pending_buy_clock(order.created_at)
+        buy_at = _pending_buy_clock(position.buy_time)
+        if (not isinstance(now, datetime) or now.tzinfo is not None
+                or not isinstance(decision_at, datetime) or decision_at.tzinfo is not None
+                or old_at is None or created_at is None or buy_at is None
+                or not old_at <= created_at < decision_at <= now
+                or order.trade_date != decision_at.date() or now.date() != order.trade_date
+                or buy_at.date() >= now.date()
+                or decision_round_id == order.decision_round_id):
+            return blocked("exit_upgrade_clock_invalid")
+        context = paper._quote_round_context()
+        spot = await _paper_execution_spot(db, position.code)
+        quote_ok, _ = paper._execution_quote_status(spot, now.date(), now=now)
+        if (context.get("round_id") != decision_round_id or context.get("quality_status") != "ok"
+                or not quote_ok or paper._conservative_execution_price(spot, "sell") is None):
+            return blocked("exit_upgrade_quote_invalid")
+        risk = _json_loads_dict(order.risk_json)
+        deferred = risk.get("paper_deferred_order")
+        old_candidate = deferred.get("candidate") if isinstance(deferred, dict) else None
+        policy = candidate.get("exit_policy")
+        parameters = candidate.get("exit_parameters")
+        if (order.status not in {"submitted", "partial"} or order.order_type != "limit"
+                or (order.status == "submitted"
+                    and order.external_order_id != f"paper-deferred-{order.order_id}")
+                or (order.strategy_id, order.source) not in origins
+                or (strategy_id, source) not in origins
+                or not position.strategy_version or order.strategy_version != position.strategy_version
+                or not isinstance(old_candidate, dict)
+                or deferred.get("position_id") != position.id
+                or deferred.get("strategy_version") != order.strategy_version
+                or deferred.get("decision_round_id") != order.decision_round_id
+                or _pending_buy_clock(deferred.get("decision_at")) != old_at
+                or not str(deferred.get("exit_decision_strategy_version") or "")
+                or not isinstance(policy, dict)
+                or policy.get("position_strategy_version") != position.strategy_version
+                or old_candidate.get("exit_policy") != policy
+                or not isinstance(parameters, dict) or not parameters
+                or old_candidate.get("exit_parameters") != parameters
+                or not str(old_candidate.get("exit_trigger_reason") or "")
+                or paper._is_full_exit_reason(str(old_candidate.get("exit_trigger_reason") or ""))
+                or not str(order.reason or "").startswith(f"T减仓{order.quantity}股：")):
+            return blocked("not_bound_partial_reduction")
+        available = await paper._available_sell_amount(db, position, now.date())
+        original_available = old_candidate.get("available_sell_amount")
+        filled = order.filled_quantity
+        if (type(filled) is not int or filled < 0 or filled % 100
+                or type(order.quantity) is not int or order.quantity % 100
+                or type(original_available) is not int or order.quantity >= original_available
+                or (order.status == "submitted" and filled != 0)
+                or (order.status == "partial" and filled == 0)
+                or not 100 <= order.quantity - filled < quantity
+                or available != quantity or candidate.get("available_sell_amount") != available):
+            return blocked("reduction_or_available_quantity_changed")
+        # Both directions of ledger/receipt identity must agree before releasing
+        # a pending remainder. This original read-only checker runs under the lock.
+        integrity = await account_execution_integrity_evidence(
+            db, order, {"quote_round_id": decision_round_id})
+        receipts = (await db.execute(select(
+            TradeFill.quantity, TradeFill.external_order_id, TradeFill.fill_id, TradeFill.fill_round_id,
+        ).where(TradeFill.order_id == order.order_id))).all()
+        if (integrity.get("status") != "validated"
+                or any(type(r.quantity) is not int or r.quantity < 100 or r.quantity % 100 for r in receipts)
+                or sum(r.quantity for r in receipts) != filled):
+            return blocked("exit_upgrade_receipt_integrity")
+        if order.status == "partial":
+            # The real producer replaces paper-deferred-* with its last booked
+            # paper-pf-* ID. Verify that exact receipt, not an arbitrary prefix.
+            latest = [r for r in receipts if r.fill_round_id == order.last_fill_round_id]
+            if (len(latest) != 1 or not order.last_fill_round_id
+                    or latest[0].external_order_id != order.external_order_id
+                    or order.external_order_id != "paper-" + str(latest[0].fill_id).removeprefix("fill-")):
+                return blocked("exit_upgrade_last_fill_identity")
+        completed_at = paper._public_order_clock()
+        if (not isinstance(completed_at, datetime) or completed_at.tzinfo is not None
+                or completed_at < now or completed_at.date() != now.date()
+                or not paper._execution_quote_status(spot, now.date(), now=completed_at)[0]):
+            return blocked("exit_upgrade_quote_expired_under_lock")
+        proof = {
+            "contract_version": EXIT_UPGRADE_CONTRACT_VERSION, "status": "canceled",
+            "old_order_id": order.order_id, "position_id": position.id,
+            "original_quantity": order.quantity, "filled_quantity": filled,
+            "canceled_remaining_quantity": order.quantity - filled,
+            "decision_round_id": decision_round_id, "decision_at": decision_at.isoformat(),
+            "canceled_at": completed_at.isoformat(), "trigger_reason": reason,
+            "replacement_quantity": quantity, "replacement_status": "requires_new_submission",
+            "exit_decision_strategy_version": paper._strategy_version(account_name),
+            "account_execution_integrity": integrity,
+        }
+        risk["paper_exit_upgrade"] = proof
+        order.status = "canceled"
+        order.error_message = "旧T减仓未成交余量已撤销；新保护性退出仍须独立风控及真实后续报价"
+        order.risk_json = _json_dumps(risk)
+    return proof
+
+
+async def _cancel_paper_after_hours_intent(db, order, *, reason_kind):
+    """Cancel only verified remainder in the SAME lock/transaction as matching.
+
+    No broker, quote refresh, fee-policy check or resource release. Historical
+    fills require the whole actual partial root, never a projection/JSON label.
+    """
+    from app.api.v1 import paper
+    from app.trading import paper_after_hours_resources as resources
+    from app.trading import paper_after_hours_allocation as allocator
+    from app.trading.paper_after_hours_execution import MODE, fifo_key
+    if reason_kind not in {"user_cancel", "session_end"}:
+        raise HTTPException(409, "盘后撤单原因不合法")
+    if db.new or db.dirty or db.deleted:
+        raise HTTPException(409, "盘后撤单要求独立干净事务")
+    # No order checkpoint before waiting: cancellation deliberately rereads the
+    # latest remaining quantity UNDER the lock (a matching task may finish first).
+    async with _paper_order_transaction(db):
+        await db.refresh(order)
+        if order.order_type != MODE or order.broker != "paper":
+            raise HTTPException(409, "盘后撤单模式不匹配")
+        if order.status in {"filled", "canceled", "risk_blocked", "rejected", "accepted"}:
+            return {"order": _order_payload(order), "status": "unchanged", "reason": "当前状态不可撤单"}
+        try:
+            fifo_key(order)
+            risk = resources._object(order.risk_json, reject_duplicate_keys=True)
+            intent = risk["paper_after_hours_intent"]
+            now = allocator._clock(paper._public_order_clock())
+            end = datetime.combine(order.trade_date, time(15, 30))
+            floor = allocator._clock(intent["terminal_validated_at"])
+            filled = allocator._integer(order.filled_quantity, zero=True)
+            if (allocator._integer(order.quantity) % 100 or filled % 100
+                    or not filled < order.quantity
+                    or order.status != ("partial" if filled else "submitted")):
+                raise ValueError("cancel_original_state_or_quantity_conflict")
+            if now < floor:
+                raise ValueError("cancel_clock_rollback")
+            if reason_kind == "session_end" and now < end:
+                return {"order": _order_payload(order), "status": "unchanged", "reason": "会话尚未结束"}
+            actual_count = await db.scalar(select(func.count(TradeFill.id)).where(
+                TradeFill.order_id == order.order_id))
+            durable_count = await db.scalar(select(func.count()).select_from(resources.Receipt).where(
+                resources.Receipt.order_id == order.order_id))
+            receipt_refs = []
+            if filled:
+                # Retrospective frozen fees / source clocks, not current policy
+                # or NEW-fill TTL; closing a session cannot erase old consumption.
+                roots = await resources._verified_partial_receipt_bindings(db,
+                    account_numeric_id=intent["numeric_account_id"], code=order.code,
+                    trade_date=order.trade_date, cutoff=now)
+                bindings = [value for value in roots.values() if value["order_id"] == order.order_id]
+                if (not bindings or len(bindings) != actual_count or durable_count != actual_count
+                        or sum(value["quantity"] for value in bindings) != filled):
+                    raise ValueError("cancel_partial_receipts_or_projection_conflict")
+                floor = max(floor, allocator._clock(order.updated_at),
+                    allocator._clock(risk["paper_after_hours_consumption"]["terminal_checked_at"]),
+                    *(value["filled_at"] for value in bindings))
+                if now < floor:
+                    raise ValueError("cancel_clock_before_previous_service_terminal")
+                receipt_refs = sorted(value["fill_id"] for value in bindings)
+            elif actual_count or durable_count:
+                raise ValueError("cancel_zero_intent_has_unverified_fills_or_consumption")
+            # Recheck after all asynchronous reads; never backdate the cancellation.
+            checked = allocator._clock(paper._public_order_clock())
+            if checked < max(now, floor):
+                raise ValueError("cancel_clock_rollback_after_history")
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError, OverflowError) as exc:
+            raise HTTPException(409, "盘后原意图、经济回报或撤单时钟未核验，禁止覆盖") from exc
+        frozen = {key: getattr(order, key) for key in PAPER_ORDER_CHECKPOINT_FIELDS}
+        external_id, updated_at = order.external_order_id, order.updated_at
+        effective_reason = "session_end" if checked >= end else "user_cancel"
+        risk["paper_after_hours_cancel"] = {
+            "contract_version": allocator.PARTIAL_CANCEL_OBSERVATION_PROTOCOL,
+            "order_id": order.order_id, "original_quantity": order.quantity,
+            "reason": effective_reason, "canceled_at": checked.isoformat(),
+            "original_session_end_at": end.isoformat(),
+            "unfilled_quantity": order.quantity - filled, "filled_quantity_preserved": filled,
+            "verified_fill_ids": receipt_refs,
+            "simulation_only": True, "exchange_cancel_receipt": None,
+        }
+        message = ("盘后固定价格会话结束，未成交余量失效" if effective_reason == "session_end"
+                   else "用户撤销盘后固定价格未成交余量")
+        table = TradeOrder.__table__
+        result = await db.execute(table.update().where(*(
+            table.c[key] == value for key, value in frozen.items()
+        ), table.c.external_order_id == external_id, table.c.updated_at == updated_at).values(
+            status="canceled", error_message=message, risk_json=_json_dumps(risk), updated_at=checked))
+        if result.rowcount != 1:
+            raise HTTPException(409, "撤单竞争导致委托已变化，禁止覆盖")
+        await db.refresh(order)
+        try:
+            terminal = allocator._clock(paper._public_order_clock())
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(409, "盘后撤单CAS后时钟非法，禁止提交") from exc
+        if terminal < checked:
+            raise HTTPException(409, "盘后撤单CAS后时钟回退，禁止提交")
+        answer = {"order": _order_payload(order), "status": "canceled", "reason": message}
+    # The original transaction owns COMMIT; a lost ACK remains uncertain, not an
+    # invented rejection/undo. physical_commit_at is deliberately not asserted.
+    return answer
+
+
+async def _after_hours_partial_context(db, order, priors, *, now):
+    """Whole original-order DB context; missing receipts never become zero history."""
+    from sqlalchemy import func
+    from app.trading import paper_after_hours_resources as resources
+    from app.trading import paper_after_hours_allocation as allocator
+    from app.trading.paper_after_hours_execution import MODE
+    ids = list((await db.scalars(select(TradeOrder.id).where(
+        TradeOrder.account_id == order.account_id, TradeOrder.code == order.code,
+        TradeOrder.trade_date == order.trade_date, TradeOrder.order_type == MODE)
+        .order_by(TradeOrder.id).limit(allocator.MAX_LOCAL_ORDERS + 1))).all())
+    if not 1 <= len(ids) <= allocator.MAX_LOCAL_ORDERS:
+        raise HTTPException(409, "分片完整原委托队列超出读取预算")
+    quantities, counts, context, read_bytes = {}, {}, [], 0
+    for prior in priors:
+        name = prior["order_id"]
+        quantities[name] = quantities.get(name, 0) + prior["quantity"]
+        counts[name] = counts.get(name, 0) + 1
+    for identifier in ids:
+        peer = await resources._book_row(db, TradeOrder, TradeOrder.id == identifier,
+            max_text_bytes=resources.MAX_READ_BYTES - read_bytes)
+        if peer is None:
+            raise HTTPException(409, "分片完整原委托队列已变化")
+        read_bytes += peer._read_text_bytes
+        # A prior service CAS/consumption terminal is a stronger clock floor
+        # than its earlier book timestamp or resource-entry watermark.
+        if peer.filled_quantity:
+            updated_leaf, invalid_updated = resources._bounded_leaf(TradeOrder.updated_at)
+            updated = (await db.execute(select(updated_leaf, invalid_updated).where(
+                TradeOrder.id == identifier))).one()
+            proof = resources._object(peer.risk_json, reject_duplicate_keys=True)
+            previous = proof.get("paper_after_hours_consumption")
+            if (updated[1] or updated[0] is None or allocator._clock(updated[0]) > now
+                    or not isinstance(previous, dict)
+                    or allocator._clock(previous["terminal_checked_at"]) > now):
+                raise HTTPException(409, "下一分片时钟早于原委托已存CAS或资源终验时钟")
+            read_bytes += len(updated[0].isoformat().encode())
+            if read_bytes > resources.MAX_READ_BYTES:
+                raise HTTPException(409, "分片完整原委托时钟读取超出预算")
+        receipts = await db.scalar(select(func.count()).select_from(resources.Receipt).where(
+            resources.Receipt.order_id == peer.order_id))
+        fills = await db.scalar(select(func.count()).select_from(TradeFill).where(
+            TradeFill.order_id == peer.order_id))
+        if (peer.broker != "paper" or receipts != counts.get(peer.order_id, 0)
+                or fills != receipts or peer.filled_quantity != quantities.get(peer.order_id, 0)):
+            raise HTTPException(409, "分片原委托存在缺失、额外或跨协议的经济回报")
+        context.append(order if peer.id == order.id else peer)
+    if set(quantities) - {peer.order_id for peer in context}:
+        raise HTTPException(409, "分片回报缺少原委托，禁止忽略历史")
+    return context
+
+
+async def _execute_paper_after_hours_partial_order(db, order_id, *, feed):
+    """Private next-fragment attempt, NOT a public retry/automatic execution API."""
+    return await _execute_paper_after_hours_order(db, order_id, feed=feed, partial=True)
+
+
+async def _execute_paper_after_hours_order(db, order_id, *, feed, partial=False):
+    """Internal future-adapter boundary; NOT an API, scheduler or client certificate.
+
+    Catalog-verified order-level input only. Current production catalog always
+    waits. Default remains full quantity once; the explicit private partial entry
+    freezes all originals and actual history for ONE fragment. No new accounts,
+    five-depth, public matcher or automatic strategy execution.
+    The original service scope spans real broker/book AND receipt/resource CAS.
+    """
+    from sqlalchemy import and_, update
+    from app.api.v1 import paper
+    from app.models.paper import PaperAccount
+    from app.models.governance import TradeCalendarModel
+    from app.trading import paper_after_hours_allocation as allocator
+    from app.trading import paper_after_hours_resources as resources
+    from app.trading.paper_after_hours_execution import (
+        MODE, fifo_key, _freeze_fill_candidate, _freeze_partial_fill_candidate,
+        _bounded_candidate_json, _partial_fee_parameters_match)
+    from app.trading.paper_authorization import (_paper_execution_scope,
+        _paper_partial_execution_scope, paper_order_checkpoint)
+
+    if type(partial) is not bool:
+        raise HTTPException(403, "盘后分片模式必须由私有服务显式选择")
+    if db.new or db.dirty or db.deleted:
+        raise HTTPException(409, "盘后撮合入口不得携带未归属的数据库变更")
+    order = await db.scalar(select(TradeOrder).where(TradeOrder.order_id == order_id)
+                            .execution_options(populate_existing=True))
+    if order is None:
+        raise HTTPException(404, "委托不存在")
+    if (order.broker != "paper" or order.order_type != MODE
+            or order.account_id not in paper.PAPER_ALL_ACCOUNTS
+            or order.strategy_id or order.source not in {"", "manual"}):
+        raise HTTPException(403, "盘后全笔核仅限已有常规账户的显式人工委托")
+    fifo_key(order)
+    now = allocator._clock(paper._public_order_clock())
+    if order.status == "filled":
+        roots = await resources._verified_receipt_bindings(db,
+            account_numeric_id=json.loads(order.risk_json)["paper_after_hours_intent"]["numeric_account_id"],
+            code=order.code, trade_date=order.trade_date, cutoff=now, partial=partial)
+        if not any(binding["order_id"] == order.order_id for binding in roots.values()):
+            raise HTTPException(409, "盘后终态回报不完整，禁止再次成交")
+        return {"order": _order_payload(order), "fills": [_fill_payload(f) for f in await _order_fills(db, order_id)],
+                "idempotent_replay": True}
+    if partial:
+        if (type(order.filled_quantity) is not int or order.filled_quantity % 100
+                or not 0 <= order.filled_quantity < order.quantity
+                or order.status != ("submitted" if order.filled_quantity == 0 else "partial")):
+            raise HTTPException(409, "分片原委托状态或累计经济事实不一致")
+    elif order.status != "submitted" or order.filled_quantity != 0:
+        raise HTTPException(409, "盘后全笔v1不处理终态、部分成交或异常经济事实")
+    # Freeze the frame before awaits; no caller can alter it while the lock waits.
+    frozen_feed = json.loads(_bounded_candidate_json(feed))
+    try:
+        allocator._verify(frozen_feed, now=now)
+    except allocator.EvidenceUnavailable as exc:
+        return {"order": _order_payload(order), "status": "waiting",
+                "reason": str(exc), "fills": [], "automatic_execution": False}
+
+    fill_rows = []
+    async with _paper_order_transaction(db, order=order):
+        now = allocator._clock(paper._public_order_clock())
+        snapshot = allocator._verify(frozen_feed, now=now)
+        calendar = await db.get(TradeCalendarModel, order.trade_date, populate_existing=True)
+        if (calendar is None or calendar.is_trade_day is not True or calendar.session_type != "full"
+                or order.trade_date != now.date() or order.code != snapshot.code):
+            raise HTTPException(409, "盘后撮合缺少当日完整交易会话资格")
+        fifo_key(order)
+        if not partial:
+            heads = list((await db.scalars(select(TradeOrder.id).where(
+                TradeOrder.account_id == order.account_id, TradeOrder.code == order.code,
+                TradeOrder.trade_date == order.trade_date, TradeOrder.side == order.side,
+                TradeOrder.broker == "paper", TradeOrder.order_type == MODE,
+                TradeOrder.status.in_(("pending", "submitted", "partial")),
+            ).order_by(TradeOrder.id).limit(allocator.MAX_LOCAL_ORDERS + 1))).all())
+            if len(heads) > allocator.MAX_LOCAL_ORDERS:
+                raise HTTPException(409, "本地盘后队列超出完整读取预算，禁止跳过前排")
+            local_bytes = 0
+            for head_id in heads:
+                if head_id == order.id:
+                    break
+                # Only a fully checked, price-incompatible earlier intent is not a
+                # legal queue entry. Unknown/corrupt/partial or underfunded heads block.
+                earlier = await resources._book_row(db, TradeOrder, TradeOrder.id == head_id,
+                    max_text_bytes=allocator.MAX_LOCAL_PROOF_BYTES - local_bytes)
+                if earlier is None:
+                    raise HTTPException(409, "本地盘后前排委托缺失，禁止跳过")
+                local_bytes += earlier._read_text_bytes
+                check = allocator.propose_allocations(frozen_feed, [earlier], now=now,
+                    scenario_account=order.account_id)
+                if (check["status"] != "waiting" or len(check["waiting"]) != 1
+                        or check["waiting"][0]["reason"] != "original_limit_incompatible_with_official_close"):
+                    return {"order": _order_payload(order), "status": "waiting",
+                            "reason": "earlier_local_full_fill_intent", "fills": []}
+            else:
+                raise HTTPException(409, "本地盘后队列缺少原委托，禁止成交")
+        accounts = list((await db.scalars(select(PaperAccount).where(
+            PaperAccount.account_name == order.account_id, PaperAccount.status == "active")
+            .limit(2).execution_options(populate_existing=True))).all())
+        intent = json.loads(order.risk_json)["paper_after_hours_intent"]
+        if (len(accounts) != 1 or type(intent.get("numeric_account_id")) is not int
+                or accounts[0].id != intent["numeric_account_id"]):
+            raise HTTPException(409, "盘后原活动账户身份已变化，禁止新建或重开账户")
+        account = accounts[0]
+        await resources._verify_sqlite_guards(db)
+        key, _ = resources._scope_values(snapshot, account)
+        state = await resources._book_row(db, resources.State, and_(
+            resources.State.account_numeric_id == account.id,
+            resources.State.code == order.code, resources.State.trade_date == order.trade_date))
+        if state is not None:
+            if state.scope_key != key:
+                raise HTTPException(409, "盘后来源或session不能切换建立新资源池")
+            await resources._verified_receipt_bindings(db, account_numeric_id=account.id,
+                code=order.code, trade_date=order.trade_date, cutoff=now, partial=partial)
+        priors = await resources._durable_priors(db, key, account, cutoff=now, partial=partial)
+        if state is None and priors:
+            raise HTTPException(409, "盘后历史消耗缺少根，禁止重建为零")
+        context = await _after_hours_partial_context(db, order, priors, now=now) if partial else [order]
+        propose = allocator.propose_partial_allocations if partial else allocator.propose_allocations
+        planned = propose(frozen_feed, context, now=now,
+            scenario_account=order.account_id, prior_proposals=priors)
+        if partial and planned["proposals"]:
+            first = next((p for p in planned["proposals"] if p["side"] == order.side), None)
+            if first is None or first["order_id"] != order.order_id:
+                return {"order": _order_payload(order), "status": "waiting",
+                        "reason": "earlier_local_partial_intent", "fills": []}
+        if not planned["proposals"]:
+            return {"order": _order_payload(order), "status": planned["status"],
+                    "reason": planned.get("reason"), "waiting": planned["waiting"], "fills": []}
+
+        round_id = "after-hours-" + hashlib.sha256(
+            _json_dumps([snapshot.source, snapshot.version, snapshot.session_id, snapshot.frame_id]).encode()).hexdigest()[:32]
+        freeze = _freeze_partial_fill_candidate if partial else _freeze_fill_candidate
+        options = {"local_orders": context} if partial else {}
+        preview = freeze(frozen_feed, order, account_numeric_id=account.id,
+            quote_round_id=round_id, dispatch_at=now, prior_proposals=priors, **options)
+        execution = json.loads(preview.contract_json)
+        risk = _json_loads_dict(order.risk_json)
+        if not await _record_paper_account_integrity(db, order, execution, risk):
+            if partial:
+                raise HTTPException(409, "分片已有经济事实须保留，账务对账未通过")
+            return {"order": _order_payload(order), "risk": risk, "fills": []}
+        cmd = SubmitOrderCommand(code=order.code, side=order.side, price=order.price,
+            quantity=order.quantity, account_id=order.account_id, order_type=MODE,
+            strategy_version=order.strategy_version, signal_id=order.signal_id or "",
+            source=order.source or "", reason=order.reason or "", decision_at=order.decision_at,
+            decision_round_id=order.decision_round_id, after_hours_manual_intent=True)
+        # Risk consumes the actual fragment quantity, not the whole original.
+        # This adapter is risk-only; it never relabels the typed partial contract.
+        risk_execution = ({**execution, "filled_quantity": execution["fragment_quantity"]}
+                          if partial else execution)
+        locked = await _locked_paper_risk_evidence(db, order, cmd, risk_execution,
+            block_warn=True, initial_risk=risk)
+        risk["paper_after_hours_fill_risk"] = locked
+        order.risk_json = _json_dumps(risk)
+        if locked["status"] != "validated":
+            if partial:
+                raise HTTPException(409, "分片锁后风控未通过，回滚本次而不覆盖既有部分成交")
+            return {"order": _order_payload(order), "risk": risk, "fills": []}
+        # Original account proof is rechecked by both locked risk and the book.
+        dispatch = allocator._clock(paper._public_order_clock())
+        if dispatch < allocator._clock(locked["completed_at"]):
+            raise HTTPException(409, "盘后dispatch时钟早于锁后风控完成时钟")
+        candidate = freeze(frozen_feed, order, account_numeric_id=account.id,
+            quote_round_id=round_id, dispatch_at=dispatch, prior_proposals=priors, **options)
+        contract = resources._partial_resource_contract(candidate) if partial else json.loads(candidate.contract_json)
+        quantity = contract["fragment_quantity"] if partial else order.quantity
+        req = BrokerOrderRequest(order_id=contract["request_id"], code=order.code, side=order.side,
+            price=contract["fill_price"], quantity=quantity, order_type=MODE,
+            account_name=order.account_id, strategy_version=order.strategy_version,
+            signal_id=order.signal_id or order.order_id, source=order.source or "", reason=order.reason or "",
+            decision_round_id=order.decision_round_id, fill_round_id=round_id, filled_at=dispatch)
+        await db.flush()
+        ready = dict(paper_order_checkpoint(order))
+        # Do NOT use _dispatch_for_service: it closes the scope before receipt, and
+        # wrapping finalize/CAS failures as broker rejection would corrupt recovery.
+        broker = get_broker_adapter("paper")
+        scope = (_paper_partial_execution_scope(db, req, candidate=candidate) if partial else
+                 _paper_execution_scope(db, req, immediate_evidence_json=candidate.contract_json,
+                                        fixed_candidate=candidate))
+        with scope:
+            result = await broker.place_order(db, req)
+            if (result.accepted is not True or result.status != "filled" or len(result.fills) != 1):
+                raise HTTPException(409, "盘后book没有唯一真实全笔回报；原事务必须回滚")
+            actual = result.fills[0]
+            row = TradeFill(fill_id=actual.fill_id, order_id=order.order_id, broker="paper",
+                external_order_id=result.external_order_id, code=order.code, side=order.side,
+                price=actual.price, quantity=actual.quantity, commission=actual.commission,
+                tax=actual.tax, realized_pnl=actual.realized_pnl, broker_trade_id=actual.broker_trade_id,
+                raw_json=_json_dumps({**actual.raw, "after_hours_fixed_execution": contract}),
+                decision_round_id=order.decision_round_id, fill_round_id=round_id,
+                trade_date=order.trade_date, filled_at=actual.filled_at)
+            db.add(row)
+            await db.flush()
+            finalize_options = {"partial_candidate": candidate} if partial else {}
+            consumption = await resources._persist_fill_resources(db,
+                order_id=order.order_id, fill_id=row.fill_id, feed=frozen_feed, **finalize_options)
+            risk["paper_after_hours_consumption"] = consumption
+            terminal = allocator._clock(consumption["terminal_checked_at"])
+            cas_at = allocator._clock(paper._public_order_clock())
+            if cas_at < terminal:
+                raise HTTPException(409, "盘后委托CAS时钟早于资源终验时钟")
+            allocator._verify(frozen_feed, now=cas_at)
+            cumulative = ready["filled_quantity"] + actual.quantity if partial else actual.quantity
+            if partial and cumulative != contract["cumulative_after"]:
+                raise HTTPException(409, "分片实际成交与原委托累计坐标不一致")
+            changed = await db.execute(update(TradeOrder).where(*(
+                getattr(TradeOrder, name) == value for name, value in ready.items()
+            )).values(status="filled" if cumulative == order.quantity else "partial",
+                filled_quantity=cumulative, avg_fill_price=actual.price,
+                last_fill_round_id=round_id, external_order_id=result.external_order_id,
+                error_message=None, risk_json=_json_dumps(risk), updated_at=cas_at)
+                .execution_options(synchronize_session=False))
+            if changed.rowcount != 1:
+                raise HTTPException(409, "盘后委托终态CAS冲突，禁止保留局部成交或释放消耗")
+            await db.refresh(order)
+            completed = allocator._clock(paper._public_order_clock())
+            if completed < cas_at:
+                raise HTTPException(409, "盘后服务终验时钟早于委托CAS时钟")
+            allocator._verify(frozen_feed, now=completed)
+            # Replaying a large frame is synchronous but still consumes real time.
+            # Sample AFTER that last replay; no await/replay follows this terminal check.
+            terminal = allocator._clock(paper._public_order_clock())
+            if (terminal < completed or terminal >= snapshot.expires_at
+                    or partial and not _partial_fee_parameters_match(contract["fee_preview"])):
+                raise HTTPException(409, "盘后服务同步终验后时钟回退、费用漂移或原来源/会话已到期")
+            fill_rows.append(row)
+    await db.refresh(order)
+    for row in fill_rows:
+        await db.refresh(row)
+    return {"order": _order_payload(order), "risk": risk,
+            "fills": [_fill_payload(row) for row in fill_rows], "automatic_execution": False}
+
+
+async def reconcile_paper_after_hours_intents(db, *, limit=500):
+    """Expire verified zero/partial remainders; no broker, scan or resource release."""
+    from app.api.v1 import paper
+    from app.trading.paper_after_hours_execution import MODE, waiting_plan
+    now = paper._public_order_clock()
+    if type(limit) is not int or not 1 <= limit <= 500:
+        raise ValueError("fixed-price expiry limit must be 1..500")
+    # Freeze scalars: one failed cancellation rolls back/EXPIRES every ORM object.
+    rows = list((await db.execute(select(TradeOrder.id, TradeOrder.order_id, TradeOrder.trade_date).where(
+        TradeOrder.order_type == MODE, TradeOrder.broker == "paper",
+        TradeOrder.status.in_(("submitted", "partial")), TradeOrder.trade_date <= now.date(),
+    ).order_by(TradeOrder.trade_date, TradeOrder.id).limit(limit + 1))).all())
+    canceled, errors, active_ids = [], [], []
+    for identifier, order_id, trade_day in rows[:limit]:
+        if now >= datetime.combine(trade_day, time(15, 30)):
+            try:
+                order = await db.get(TradeOrder, identifier, populate_existing=True)
+                if order is None:
+                    continue
+                result = await _cancel_paper_after_hours_intent(db, order, reason_kind="session_end")
+                if result["status"] == "canceled":
+                    canceled.append(order_id)
+            except HTTPException as exc:
+                errors.append({"order_id": order_id, "http_status": exc.status_code})
+        else:
+            active_ids.append(identifier)
+    active = list((await db.scalars(select(TradeOrder).where(
+        TradeOrder.id.in_(active_ids), TradeOrder.status.in_(("submitted", "partial"))
+    ).execution_options(populate_existing=True))).all()) if active_ids else []
+    from app.trading.paper_after_hours_execution import fifo_key
+    validated_active = []
+    for order in active:
+        try:
+            fifo_key(order)
+            from app.trading.paper_after_hours_allocation import _integer
+            filled = _integer(order.filled_quantity, zero=True)
+            if (_integer(order.quantity) % 100 or filled % 100 or not filled < order.quantity
+                    or order.status != ("partial" if filled else "submitted")):
+                raise ValueError("invalid_active_remainder")
+            validated_active.append(order)
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError, OverflowError):
+            errors.append({"order_id": order.order_id, "http_status": 409})
+    from app.trading.paper_after_hours_allocation import matching_capabilities
+    return {"status": "partial" if errors else "observed", "canceled": canceled, "errors": errors,
+            "waiting": waiting_plan(validated_active), "truncated": len(rows) > limit, "fills": [],
+            "matching_capability": "aggregate_only", "source_capabilities": matching_capabilities(),
+            "automatic_execution": False}
+
+
 async def cancel_order(db: AsyncSession, order_id: str) -> dict:
     order = (
         await db.execute(select(TradeOrder).where(TradeOrder.order_id == order_id))
     ).scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="委托不存在")
+    if order.order_type == "after_hours_fixed":
+        return await _cancel_paper_after_hours_intent(db, order, reason_kind="user_cancel")
     if order.status in {"filled", "canceled", "risk_blocked", "rejected"}:
         return {"order": _order_payload(order), "status": "unchanged", "reason": "当前状态不可撤单"}
 

@@ -1,0 +1,328 @@
+// Surface a stable error code in the existing hover tooltip, not a new popup.
+// Legacy Host errors without a code keep their original readable message.
+function optimizerResponseError(value, fallback = "优化失败，原文已保留，请重试") {
+  const message = typeof value?.message === "string" ? value.message : fallback;
+  const code = typeof value?.code === "string" && /^[A-Z][A-Z_]{1,47}$/.test(value.code) ? value.code : undefined;
+  return Object.assign(new Error(code ? `[${code}] ${message}` : message), { code });
+}
+
+// Consume progress immediately, but accept text only after a complete terminal record
+// and EOF. Older Host modules may still reply with JSON during a client-only refresh.
+export async function readOptimizerResponse(response, signal, onProgress = () => {}) {
+  if (response.status === 401 || response.status === 403) throw new Error("连接验证失败，请刷新 DSH 后重试，原文已保留");
+  if (!response.ok || !response.headers.get("content-type")?.includes("application/x-ndjson")) {
+    const result = await response.json().catch(() => null);
+    signal?.throwIfAborted();
+    if (!response.ok) throw optimizerResponseError(result?.error);
+    return result;
+  }
+  const invalid = () => new Error("优化响应中断或格式异常，原文已保留，请重试");
+  if (!response.body) throw invalid();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let buffer = "", received = 0, result;
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  function record(line) {
+    if (!line.trim()) return;
+    if (result) throw invalid();
+    let value;
+    try { value = JSON.parse(line); } catch { throw invalid(); }
+    if (value?.type === "progress") {
+      if (!["preparing", "waiting", "generating"].includes(value.phase)
+        || !Number.isSafeInteger(value.outputChars) || value.outputChars < 0 || value.outputChars > 32000) throw invalid();
+      onProgress({ phase: value.phase, outputChars: value.outputChars });
+    } else if (value?.type === "result") {
+      if (typeof value.text !== "string" || !value.text.trim() || value.text.length > 32000) throw invalid();
+      result = value;
+    } else if (value?.type === "error") {
+      throw optimizerResponseError(value.error, "优化失败，原文已保留");
+    } else throw invalid();
+  }
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) { buffer += decoder.decode(); break; }
+      received += value.byteLength;
+      if (received > 524288) throw invalid();
+      buffer += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        record(line);
+      }
+    }
+    if (buffer) record(buffer);
+    if (!result) throw invalid();
+    return result;
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+export function createClientPlugin(React) {
+  const h = React.createElement;
+  // Visual language copied from DSH's own composer controls and menus so the plugin
+  // reads as first-party chrome: geometry from Menu.module.css / SegmentedControl /
+  // PermissionSelect, and only alias tokens (no literals), so DSH themes both modes.
+  const css = `
+.dsh-prompt-tools{display:inline-flex;align-items:center;justify-content:center;order:100;position:relative;flex:none;height:28px;vertical-align:middle;line-height:1}
+
+/* Trigger silhouette of DSH's own composer selects: 28px tall, radius-sm, flat
+   until hover, focus shown by the ring the segmented controls use. */
+.dsh-prompt-control{box-sizing:border-box;display:inline-flex;align-items:center;flex:none;height:28px;padding:0 2px 0 6px;border:0;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary);transition:background .12s ease,color .12s ease}
+.dsh-prompt-control:hover,.dsh-prompt-control:focus-within,.dsh-prompt-control[data-open=true]{background:var(--dsw-alias-interactive-bg-hover,rgba(38,49,72,.06))}
+.dsh-prompt-button{appearance:none;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;height:28px;margin:0;padding:0;border:0;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:inherit;cursor:pointer;flex:none;font:inherit;line-height:1;transition:color .12s ease}
+.dsh-prompt-button:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-2px}
+.dsh-prompt-button:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
+.dsh-prompt-button:disabled{color:var(--dsw-alias-label-dimmed,var(--dsw-alias-label-secondary));cursor:default}
+.dsh-prompt-main{width:22px}
+.dsh-prompt-main svg,.dsh-prompt-glyph svg{display:block;width:16px;height:16px;flex:none;overflow:visible}
+.dsh-prompt-more{width:18px;color:var(--dsw-alias-label-caption)}
+.dsh-prompt-more svg{display:block;width:12px;height:12px;flex:none;overflow:visible;transition:transform .12s ease}
+.dsh-prompt-more[aria-expanded=true] svg{transform:rotate(180deg)}
+
+/* One fixed glyph box keeps every state on the same optical center, so state
+   changes never shift the row. */
+.dsh-prompt-glyph{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;animation:dsh-prompt-enter .16s ease-out both}
+.dsh-prompt-control[data-state=loading],.dsh-prompt-control[data-state=undo]{color:var(--dsw-alias-state-business-primary)}
+.dsh-prompt-control[data-state=success]{color:var(--dsw-alias-state-success-primary)}
+.dsh-prompt-control[data-state=error]{color:var(--dsw-alias-state-error-primary)}
+.dsh-prompt-loader{position:relative;display:grid;place-items:center;width:16px;height:16px}
+.dsh-prompt-loader svg{grid-area:1/1;width:16px;height:16px}
+.dsh-prompt-track{opacity:.28;transition:opacity .12s ease}
+.dsh-prompt-loader[data-generating=true] .dsh-prompt-track{opacity:.65}
+.dsh-prompt-spin{transform-origin:50% 50%;animation:dsh-prompt-spin .8s linear infinite;transition:opacity .12s ease}
+.dsh-prompt-stop{opacity:.65;transition:opacity .12s ease}
+.dsh-prompt-main:hover .dsh-prompt-stop,.dsh-prompt-main:focus-visible .dsh-prompt-stop{opacity:1}
+.dsh-prompt-main:hover .dsh-prompt-spin{opacity:.5}
+.dsh-prompt-check path{stroke-dasharray:24;stroke-dashoffset:24;animation:dsh-prompt-check .26s ease-out forwards}
+.dsh-prompt-undo svg{animation:dsh-prompt-undo .38s cubic-bezier(.2,.8,.2,1) both;transform-origin:center}
+@keyframes dsh-prompt-spin{to{transform:rotate(360deg)}}
+@keyframes dsh-prompt-enter{from{opacity:0;transform:scale(.86)}to{opacity:1;transform:scale(1)}}
+@keyframes dsh-prompt-check{to{stroke-dashoffset:0}}
+@keyframes dsh-prompt-undo{0%{opacity:.4;transform:rotate(28deg) scale(.86)}65%{opacity:1;transform:rotate(-7deg) scale(1)}100%{opacity:1;transform:rotate(0) scale(1)}}
+
+/* DSH menu card (Menu.module.css): 4px pad, radius-lg, translucent material,
+   prominent elevation whose .5px stroke rides the shadow. */
+.dsh-prompt-menu{box-sizing:border-box;position:absolute;right:0;bottom:calc(100% + 4px);z-index:100;display:flex;flex-direction:column;width:max-content;min-width:156px;max-width:min(360px,calc(100vw - 32px));padding:4px;border:0;border-radius:var(--dsw-radius-lg,16px);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);background:var(--dsw-menu-surface-fill,rgba(248,249,250,.58));backdrop-filter:var(--dsw-menu-backdrop-filter,none);-webkit-backdrop-filter:var(--dsw-menu-backdrop-filter,none);box-shadow:var(--dsw-elevation-prominent,0 0 0 .5px rgba(0,0,0,.04),0 3px 8px rgba(0,0,0,.04),0 0 20px rgba(0,0,0,.05));color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;white-space:normal;animation:dsh-prompt-enter .14s ease-out both;transform-origin:bottom right}
+.dsh-prompt-menu button{appearance:none;display:flex;align-items:center;gap:6px;width:100%;min-height:34px;margin:0;padding:6px 8px;border:0;border-radius:var(--dsw-radius-md,12px);background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;text-align:left;font:inherit;font-size:13px;line-height:20px}
+/* Fill IS the focus indication for arrow-key navigation, exactly as in Menu.module.css. */
+.dsh-prompt-menu button:hover:not(:disabled),.dsh-prompt-menu button:focus-visible:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(38,49,72,.06));outline:none}
+.dsh-prompt-menu button:disabled{opacity:.4;cursor:not-allowed}
+.dsh-prompt-menu .dsh-prompt-menu-icon{display:inline-flex;align-items:center;justify-content:center;flex:none;width:14px;height:14px;color:var(--dsw-alias-menu-icon,var(--dsw-alias-label-secondary))}
+.dsh-prompt-menu .dsh-prompt-menu-icon svg{display:block;width:14px;height:14px;overflow:visible}
+.dsh-prompt-menu-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsh-prompt-menu-count{flex:none;margin-inline-start:auto;color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}
+
+/* Destructive-undo confirmation: DSH dialog surface on the secondary layer,
+   with the footer's compact ghost buttons. */
+.dsh-prompt-notice{box-sizing:border-box;position:absolute;right:0;bottom:calc(100% + 8px);z-index:101;display:flex;flex-direction:column;gap:12px;width:min(288px,calc(100vw - 32px));padding:14px 16px 12px;border:0;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-alias-bg-overlay);box-shadow:var(--dsw-elevation-prominent,0 0 0 .5px rgba(0,0,0,.04),0 3px 8px rgba(0,0,0,.04),0 0 20px rgba(0,0,0,.05));color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;white-space:normal;animation:dsh-prompt-enter .14s ease-out both;transform-origin:bottom right}
+.dsh-prompt-notice p{margin:0}
+.dsh-prompt-notice-actions{display:flex;justify-content:flex-end;gap:8px}
+.dsh-prompt-notice-actions button{box-sizing:border-box;height:28px;padding:0 10px;border:0;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;font:inherit;font-size:12px;line-height:18px}
+.dsh-prompt-notice-actions button:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(38,49,72,.06))}
+.dsh-prompt-notice-actions button:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-2px}
+.dsh-prompt-notice-actions button[data-destructive=true]{color:var(--dsw-alias-state-error-primary)}
+.dsh-prompt-notice-actions button[data-destructive=true]:hover{background:var(--dsw-alias-interactive-bg-hover-danger,rgba(236,19,19,.05))}
+@media(prefers-reduced-motion:reduce){.dsh-prompt-tools *{animation:none!important;transition:none!important}.dsh-prompt-check path{stroke-dashoffset:0}}
+`;
+  const paths = {
+    wand: ["m4 16 11-11 4 4L8 20Z", "m13 7 4 4", "M5 3v4M3 5h4M19 3v4M17 5h4M20 17v4M18 19h4"],
+    undo: ["m9 5-5 5 5 5", "M4 10h10a6 6 0 0 1 0 12"],
+    check: ["m5 12 4 4L19 6"],
+    error: ["M12 4v10", "M12 19h.01"],
+    more: ["m6 9 6 6 6-6"],
+  };
+  function icon(name) {
+    return h("svg", { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": true, focusable: false, className: name === "check" ? "dsh-prompt-check" : undefined },
+      ...paths[name].map((d, index) => h("path", { d, key: index })));
+  }
+  function loader(generating) {
+    const props = { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, "aria-hidden": true, focusable: false };
+    return h("span", { className: "dsh-prompt-loader", "data-generating": generating },
+      h("svg", props, h("circle", { className: "dsh-prompt-track", cx: 12, cy: 12, r: 9 })),
+      h("svg", { ...props, className: "dsh-prompt-spin" }, h("path", { d: "M12 3a9 9 0 0 1 9 9", strokeLinecap: "round" })),
+      h("svg", { ...props, className: "dsh-prompt-stop" }, h("rect", { x: 9, y: 9, width: 6, height: 6, rx: 1.4, fill: "currentColor", stroke: "none" })));
+  }
+  return {
+    name: "local-prompt-optimizer-client",
+    inject: ["slots"],
+    apply(ctx) {
+      const controllers = new Map();
+      ctx.effect(() => {
+        const style = document.createElement("style");
+        style.dataset.promptOptimizer = "true";
+        style.textContent = css;
+        document.head.append(style);
+        return () => {
+          style.remove();
+          for (const { controller } of controllers.values()) controller.dispose();
+          controllers.clear();
+        };
+      }, "prompt-optimizer: styles and session history");
+      async function request(payload, signal, onProgress) {
+        let response;
+        try {
+          response = await fetch("api/prompt-optimizer", {
+            method: "POST", credentials: "same-origin", signal,
+            headers: { "content-type": "application/json", accept: "application/x-ndjson" }, body: JSON.stringify(payload),
+          });
+        } catch (error) {
+          if (signal.aborted) throw error;
+          throw new Error("网络连接失败，原文已保留，请重试");
+        }
+        return readOptimizerResponse(response, signal, onProgress);
+      }
+      function PromptTools({ sessionId, useInput, useProjection, inputActions }) {
+        const input = useInput(value => value);
+        const modelState = useProjection("modelSelection");
+        const model = modelState?.next ?? modelState?.lastUsed;
+        const latest = React.useRef({ input, model, inputActions });
+        latest.current = { input, model, inputActions };
+        let entry = controllers.get(sessionId);
+        if (!entry) {
+          entry = { latest };
+          entry.controller = createOptimizerController({
+            readInput: () => entry.latest.current.input,
+            readModel: () => entry.latest.current.model,
+            replace: (text, span) => entry.latest.current.inputActions.insertText(text, span),
+            request,
+          });
+          controllers.set(sessionId, entry);
+        }
+        entry.latest = latest;
+        const controller = entry.controller;
+        const state = React.useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
+        React.useEffect(() => { controller.observe(input); }, [controller, input.draft, input.draftRev]);
+        const [menuOpen, setMenuOpen] = React.useState(false);
+        const [feedback, setFeedback] = React.useState(null);
+        const rootRef = React.useRef(null);
+        const menuRef = React.useRef(null);
+        const moreRef = React.useRef(null);
+        const dialogRef = React.useRef(null);
+        const generation = React.useRef(0);
+        const menuId = React.useId();
+        const reason = disabledReason(input, model, false);
+        const canUndo = state.count > 0 && !state.busy && editable(input);
+        const menuDisabled = state.busy || (!!reason && !canUndo);
+        React.useEffect(() => {
+          setMenuOpen(false);
+          setFeedback(null);
+          return () => { generation.current++; controller.cancel(false); };
+        }, [controller]);
+        React.useEffect(() => {
+          if (!feedback) return;
+          const timer = setTimeout(() => setFeedback(null), 650);
+          return () => clearTimeout(timer);
+        }, [feedback]);
+        React.useEffect(() => {
+          if (input.draft === "") { generation.current++; setFeedback(null); }
+          if (menuDisabled) setMenuOpen(false);
+        }, [input.draft, menuDisabled]);
+        React.useEffect(() => {
+          if (!menuOpen && !state.confirmUndo) return;
+          if (menuOpen) menuRef.current?.querySelector("button:not(:disabled)")?.focus();
+          if (state.confirmUndo) dialogRef.current?.querySelector("button")?.focus();
+          const outside = event => { if (!rootRef.current?.contains(event.target)) setMenuOpen(false); };
+          const escape = event => {
+            if (event.key !== "Escape") return;
+            event.preventDefault();
+            event.stopPropagation();
+            setMenuOpen(false);
+            if (state.confirmUndo) controller.dismiss();
+            moreRef.current?.focus();
+          };
+          document.addEventListener("pointerdown", outside);
+          document.addEventListener("keydown", escape, true);
+          return () => {
+            document.removeEventListener("pointerdown", outside);
+            document.removeEventListener("keydown", escape, true);
+          };
+        }, [menuOpen, state.confirmUndo, controller]);
+        function closeMenu() {
+          setMenuOpen(false);
+          moreRef.current?.focus();
+        }
+        async function optimize() {
+          const version = ++generation.current;
+          setFeedback(null);
+          setMenuOpen(false);
+          const completed = await controller.optimize();
+          // Completion also includes a valid unchanged result, not just an edit.
+          // Cancel/session switch/clear must not resurrect a late success animation.
+          if (completed && version === generation.current) setFeedback({ kind: "success", id: version });
+        }
+        function cancel() {
+          generation.current++;
+          setFeedback(null);
+          controller.cancel();
+        }
+        function undo(force = false) {
+          generation.current++;
+          setMenuOpen(false);
+          if (controller.undo(force)) setFeedback({ kind: "undo", id: generation.current });
+        }
+        function menuKeyDown(event) {
+          const items = [...menuRef.current.querySelectorAll("button:not(:disabled)")];
+          const index = items.indexOf(document.activeElement);
+          let next;
+          if (event.key === "ArrowDown") next = (index + 1) % items.length;
+          if (event.key === "ArrowUp") next = (index - 1 + items.length) % items.length;
+          if (event.key === "Home") next = 0;
+          if (event.key === "End") next = items.length - 1;
+          if (next !== undefined && items.length) { event.preventDefault(); items[next].focus(); }
+          if (event.key === "Tab") setMenuOpen(false);
+        }
+        function openWithKeyboard(event) {
+          if ((event.key === "ArrowDown" || event.key === "ArrowUp") && !menuDisabled) {
+            event.preventDefault();
+            setMenuOpen(true);
+          }
+        }
+        const visual = state.busy ? "loading" : state.error ? "error" : feedback?.kind || "idle";
+        const glyph = state.error ? "error" : feedback?.kind === "success" ? "check" : feedback?.kind === "undo" ? "undo" : "wand";
+        const title = state.busy ? (state.phase === "generating" ? "正在生成，已收到 " + state.outputChars + " 字符" : state.phase === "waiting" ? "模型已开始处理，等待正文" : "正在准备优化请求") + "；点击取消（原文保留）"
+          : reason || (state.error ? state.message + "；点击重试"
+            : (state.message ? state.message + "；" : "") + (state.count ? "再次优化提示词；右侧菜单可撤回（剩余 " + state.count + " 次）"
+              : "使用当前模型优化提示词（不会发送消息）"));
+        const preserveSelection = event => event.preventDefault();
+        return h("div", { ref: rootRef, className: "dsh-prompt-tools", "data-prompt-optimizer": true },
+          h("div", { className: "dsh-prompt-control", role: "group", "aria-label": "提示词优化工具", "data-state": visual, "data-open": menuOpen },
+            h("button", {
+              type: "button", className: "dsh-prompt-button dsh-prompt-main", "aria-label": state.busy ? "取消提示词优化" : "优化提示词",
+              title, disabled: !state.busy && !!reason, "aria-busy": state.busy,
+              onMouseDown: preserveSelection, onClick: state.busy ? cancel : () => { void optimize(); }, onKeyDown: openWithKeyboard,
+            }, state.busy ? loader(state.phase === "generating") : h("span", { key: feedback?.id ?? glyph, className: "dsh-prompt-glyph" + (glyph === "undo" ? " dsh-prompt-undo" : "") }, icon(glyph))),
+            h("button", {
+              ref: moreRef, type: "button", className: "dsh-prompt-button dsh-prompt-more", "aria-label": "提示词优化操作",
+              title: state.busy ? "优化中，可点击左侧取消" : state.count ? "更多操作：继续优化或撤回（剩余 " + state.count + " 次）" : "更多提示词优化操作",
+              disabled: menuDisabled, "aria-haspopup": "menu", "aria-expanded": menuOpen, "aria-controls": menuOpen ? menuId : undefined,
+              onMouseDown: preserveSelection, onClick: () => setMenuOpen(value => !value), onKeyDown: openWithKeyboard,
+            }, icon("more"))),
+          menuOpen && h("div", { ref: menuRef, id: menuId, className: "dsh-prompt-menu", role: "menu", "aria-label": "提示词优化操作菜单", "data-menu-material": true, onKeyDown: menuKeyDown },
+            h("button", { type: "button", role: "menuitem", disabled: !!reason, title: reason || "使用当前模型优化，不自动发送",
+              onMouseDown: preserveSelection, onClick: () => { closeMenu(); void optimize(); } },
+              h("span", { className: "dsh-prompt-menu-icon" }, icon("wand")), h("span", { className: "dsh-prompt-menu-label" }, state.count ? "继续优化提示词" : "优化提示词")),
+            h("button", { type: "button", role: "menuitem", disabled: !canUndo,
+              title: canUndo ? "逐次恢复上一版提示词" : "暂无可撤回的优化",
+              onMouseDown: preserveSelection, onClick: () => { closeMenu(); undo(); } },
+              h("span", { className: "dsh-prompt-menu-icon" }, icon("undo")), h("span", { className: "dsh-prompt-menu-label" }, "撤回上一次优化"), h("span", { className: "dsh-prompt-menu-count" }, state.count + " 次"))),
+          // No routine status popup; only an explicitly requested destructive undo needs confirmation.
+          state.confirmUndo && h("div", { ref: dialogRef, className: "dsh-prompt-notice", role: "dialog", "aria-label": "确认撤回优化" },
+            h("p", null, state.message),
+            h("div", { className: "dsh-prompt-notice-actions" },
+              h("button", { type: "button", onClick: () => { controller.dismiss(); moreRef.current?.focus(); } }, "保留当前编辑"),
+              h("button", { type: "button", "data-destructive": true, onClick: () => { undo(true); moreRef.current?.focus(); } }, "确认撤回"))));
+      }
+      ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
+        name: "conversation.input.right", id: "local-prompt-optimizer", order: 100, label: "提示词优化",
+      }, PromptTools));
+    },
+  };
+}

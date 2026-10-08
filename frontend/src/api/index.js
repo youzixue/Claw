@@ -179,6 +179,7 @@ export const getFactorEval = () => api.get('/performance/factor-eval')
 export const getSignalAttribution = (id) => api.get(`/performance/attribution/${id}`)
 
 // ===== 模拟盘（六个基准策略并行；B/C/D/F 另有隔离候选子账户） =====
+export const getPaperPortfolio = (params = {}) => api.get('/paper/portfolio', { params, silent: true })
 export const getPaperAccount = (accountName = 'default') => api.get('/paper/account', { params: { account_name: accountName } })
 export const getPaperPositions = (accountName = 'default') => api.get('/paper/positions', { params: { account_name: accountName } })
 export const paperBuy = (data, accountName = 'default') => api.post('/paper/buy', data, { params: { account_name: accountName } })
@@ -188,6 +189,9 @@ export const getPaperTrades = (params, accountName = 'default') => api.get('/pap
 export const getPaperAutoStatus = (accountName = 'default') => api.get('/paper/auto/status', { params: { account_name: accountName } })
 export const getPaperAutoLogs = (params, accountName = 'default') => api.get('/paper/auto/logs', { params: { ...params, account_name: accountName } })
 export const getPaperAutoEvaluation = (accountName = 'default') => api.get('/paper/auto/evaluation', { params: { account_name: accountName } })
+// Read-only same-batch candidate research; never starts collection or trading.
+export const getPaperCandidateShadow = (params = {}, signal) => api.get('/paper/research/candidate-shadow', { params, signal, silent: true })
+export const getPaperC3Records = (params = {}, signal) => api.get('/paper/research/c3/events', { params, signal, silent: true })
 export const getPaperChallengerComparison = (params = {}) => api.get('/paper/challengers/comparison', { params })
 export const getPaperExperimentReport = (accountName) => api.get('/paper/experiment/report', {
   params: accountName ? { account_name: accountName } : {},

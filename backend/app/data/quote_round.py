@@ -35,6 +35,8 @@ _COMPACT_COLUMNS = (
     "volume",
     "amount",
     "avg_price",  # 来源明确的当日累计VWAP；不可用缺失量额反算伪造
+    "limit_up",   # 前向归档真实限价；旧档缺列不回填
+    "limit_down",
     "source_quote_at",
     "received_at",
     "updated_at",
@@ -63,6 +65,9 @@ def quote_config_version() -> str:
         "quote_max_age_sec": settings.PAPER_EXECUTION_QUOTE_MAX_AGE_SEC,
         "source_quality_policy": "fresh_coverage_with_per_stock_clock_guard_v1",
         "main_fund_policy": "tencent_quote_not_a_main_fund_source_v1",
+        "limit_pool_policy": "tencent_limit_state_v1+wencai_dated_limit_details_v1",
+        "limit_pool_max_age_sec": settings.LIMIT_POOL_SOURCE_MAX_AGE_SEC,
+        "limit_pool_detail_max_age_sec": settings.LIMIT_POOL_WENCAI_INTERVAL_SEC,
         "slippage_pct": settings.PAPER_EXECUTION_SLIPPAGE_PCT,
         "commission_rate": settings.PAPER_COMMISSION_RATE,
         "minimum_commission": settings.PAPER_MIN_COMMISSION,

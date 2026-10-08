@@ -1,0 +1,79 @@
+async def rebuild(db, trade_date, observed_at, route_versions, c3_history_sec):
+    prior_confirmation_events = list(
+        (
+            await db.execute(
+                select(
+                    PaperShadowEvent.id,
+                    PaperShadowEvent.route_id,
+                    PaperShadowEvent.route_version,
+                    PaperShadowEvent.code,
+                    PaperShadowEvent.event_type,
+                    PaperShadowEvent.observed_at,
+                    PaperShadowEvent.snapshot_json,
+                ).where(
+                    PaperShadowEvent.trade_date == trade_date,
+                    or_(*(and_(
+                        PaperShadowEvent.route_id == route_id,
+                        PaperShadowEvent.route_version == version,
+                    ) for route_id, version in route_versions.items())),
+                    PaperShadowEvent.observed_at <= observed_at,
+                    or_(
+                        PaperShadowEvent.route_id != ROUTE_C3,
+                        and_(
+                            PaperShadowEvent.route_version == route_versions[ROUTE_C3],
+                            PaperShadowEvent.observed_at >= observed_at - timedelta(seconds=c3_history_sec),
+                        ),
+                    ),
+                    PaperShadowEvent.event_type.in_(
+                        ("confirmation_sample", "confirmation_reset", "confirmed")
+                    ),
+                ).order_by(PaperShadowEvent.observed_at, PaperShadowEvent.id)
+            )
+        ).all()
+    )
+    confirmation_samples: dict[tuple[str, str], list[datetime]] = defaultdict(list)
+    confirmation_avg_prices: dict[
+        tuple[str, str], dict[datetime, float]
+    ] = defaultdict(dict)
+    confirmation_sources: dict[tuple[str, str], dict[datetime, datetime]] = defaultdict(dict)
+    latest_sources: dict[tuple[str, str], datetime] = {}
+    confirmed_route_codes: set[tuple[str, str]] = {
+        (ROUTE_C3, str(code)) for code in (await db.scalars(
+            select(PaperShadowEvent.code).where(
+                PaperShadowEvent.route_id == ROUTE_C3,
+                PaperShadowEvent.route_version == route_versions[ROUTE_C3],
+                PaperShadowEvent.trade_date == trade_date,
+                PaperShadowEvent.observed_at <= observed_at,
+                PaperShadowEvent.event_type == "confirmed",
+            )
+        )).all()
+    }
+    for event_row in prior_confirmation_events:
+        route_code = (str(event_row.route_id), str(event_row.code))
+        if event_row.event_type == "confirmation_reset":
+            confirmation_samples[route_code].clear()
+            confirmation_avg_prices[route_code].clear()
+            confirmation_sources[route_code].clear()
+            boundary = local_clock(_parse_datetime(
+                _json_dict(_json_dict(event_row.snapshot_json).get("prior_structure")).get("source_boundary_at")
+            ))
+            if boundary is not None:
+                latest_sources[route_code] = max(boundary, latest_sources.get(route_code, boundary))
+        elif event_row.event_type == "confirmation_sample":
+            confirmation_samples[route_code].append(event_row.observed_at)
+            snapshot = _json_dict(event_row.snapshot_json)
+            quote_leaf = (
+                snapshot.get("quote")
+                if isinstance(snapshot.get("quote"), dict)
+                else {}
+            )
+            source_at = local_clock(_parse_datetime(quote_leaf.get("source_quote_at")))
+            if source_at is not None:
+                confirmation_sources[route_code][event_row.observed_at] = source_at
+                latest_sources[route_code] = max(source_at, latest_sources.get(route_code, source_at))
+            average = _safe_float(quote_leaf.get("avg_price"))
+            if average is not None and average > 0:
+                confirmation_avg_prices[route_code][event_row.observed_at] = average
+        elif event_row.event_type == "confirmed":
+            confirmed_route_codes.add(route_code)
+    return confirmation_samples, confirmation_avg_prices, confirmation_sources, latest_sources, confirmed_route_codes

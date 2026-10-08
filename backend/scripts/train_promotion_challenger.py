@@ -39,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-days", type=int, default=10)
     parser.add_argument("--step-days", type=int, default=10)
     parser.add_argument("--calibration-days", type=int, default=10)
+    parser.add_argument("--train-window-days", type=int, default=None,
+                        help="滚动训练交易日数（包含校准尾窗）；不传则保持扩展训练，不改变生产模型")
     parser.add_argument("--persist", action="store_true", help="保存训练记录和模型产物；仍不激活生产")
     parser.add_argument("--output", type=Path, help="额外写出完整 JSON 报告")
     args = parser.parse_args()
@@ -75,7 +77,8 @@ async def _run(args: argparse.Namespace) -> dict:
                         start_date=args.start_date, end_date=args.end_date,
                         snapshot_context=args.snapshot_context,
                         initial_train_days=args.initial_train_days, validation_days=args.validation_days,
-                        step_days=args.step_days, calibration_days=args.calibration_days)
+                        step_days=args.step_days, calibration_days=args.calibration_days,
+                        train_window_days=getattr(args, "train_window_days", None))
         finally:
             await engine.dispose()
     async with async_session() as session:
@@ -92,6 +95,7 @@ async def _run(args: argparse.Namespace) -> dict:
             validation_days=args.validation_days,
             step_days=args.step_days,
             calibration_days=args.calibration_days,
+            train_window_days=getattr(args, "train_window_days", None),
             persist=args.persist,
         )
 
@@ -110,6 +114,11 @@ def main() -> int:
     evaluation = result.get("walk_forward") or {}
     challenger = evaluation.get("challenger_metrics", {})
     champion = evaluation.get("champion_metrics") or evaluation.get("direction_reference_metrics", {})
+    if evaluation.get("research_only"):
+        print("metrics_scope=observed_outcomes_only_not_complete_cohort")
+        print(f"unknown_outcome_count={challenger.get('unknown_count')}")
+        challenger = challenger.get("observed_metrics", {})
+        champion = champion.get("observed_metrics", {})
     if args.objective == "next_day_close_up":
         print(f"direction_research_status={result.get('status')}")
         print(f"target_met={result.get('target_met')}")

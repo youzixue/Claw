@@ -1,0 +1,3 @@
+- insert:
+    - id: claw-trading-schedule
+      name: 'file:///Users/youzix/WorkBuddy/Claw/.dsh/plugins/claw-trading-schedule/runtime.mjs'

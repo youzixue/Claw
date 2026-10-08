@@ -215,7 +215,18 @@ async def _ensure_close_quality_columns(conn):
             "source_version": "VARCHAR(40)",
             "observed_at": "DATETIME",
         },
+        # 037：仅新增前向来源证据，不为历史补造时钟或字段质量。
+        "limit_up_pool": {
+            "source_version": "VARCHAR(40)", "source_quote_at": "DATETIME",
+            "observed_at": "DATETIME", "evidence_json": "TEXT",
+        },
+        "limit_down_pool": {
+            "source_version": "VARCHAR(40)", "source_quote_at": "DATETIME",
+            "observed_at": "DATETIME", "evidence_json": "TEXT",
+        },
         "broken_limit_pool": {
+            "source_version": "VARCHAR(40)", "source_quote_at": "DATETIME",
+            "observed_at": "DATETIME", "evidence_json": "TEXT",
             "limit_up_price": "FLOAT",
             "close_price": "FLOAT",
             "close_at_limit": "BOOLEAN",

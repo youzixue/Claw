@@ -313,6 +313,70 @@ async def test_confirmed_event_executes_once_in_isolated_challenger_account(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy,cooldown,entries", [(False, 1800, 1), (True, 1800, 0), (False, 90000, 0)])
+async def test_target_top_up_reuses_no_new_name_slot_and_never_crosses_versions(
+    challenger_env, qualified_challenger_execution, monkeypatch, legacy, cooldown, entries, request,
+):
+    from app.paper import strategy_iteration_challenger as challenger
+    from app.config.settings import PaperChallengerExecutionPolicy
+    now = datetime(2026, 9, 2, 10, 20)
+    # Supply test-only row creation time before INSERT; never mutate cached defaults.
+    from sqlalchemy import event as orm_event
+    def order_clock(_mapper, _connection, target):
+        target.created_at = target.decision_at
+    orm_event.listen(TradeOrder, "before_insert", order_clock)
+    request.addfinalizer(lambda: orm_event.remove(TradeOrder, "before_insert", order_clock))
+    monkeypatch.setattr(settings, "PAPER_ACCOUNT_CHALLENGER_EXECUTION_POLICIES", {
+        "challenger_b": PaperChallengerExecutionPolicy(target_top_up_enabled=True, top_up_cooldown_sec=cooldown),
+    })
+    monkeypatch.setattr(settings, "PAPER_CHALLENGER_B_MAX_DAILY_BUYS", 1)
+    monkeypatch.setattr(settings, "PAPER_CHALLENGER_B_MAX_POSITIONS", 1)
+    monkeypatch.setattr(paper, "_risk_check_for_buy", AsyncMock(return_value={
+        "final_level": "pass", "block_reasons": [], "warnings": [],
+    }))
+    async with challenger_env() as db:
+        account = await paper._get_or_create_account(db, "challenger_b")
+        bought_at = now-timedelta(days=1)
+        original = await _seed_confirmed(db, code="600100", route_id=ROUTE_B, now=bought_at)
+        # 首层以半目标预算真实成交，保留完整订单/回报/账本证据。
+        policy_fn = challenger._entry_policy
+        with monkeypatch.context() as patch:
+            patch.setattr(challenger, "_entry_policy", lambda route: {**policy_fn(route), "position_pct": .10})
+            first = await qualified_challenger_execution(db, now=bought_at)
+            assert first["entries"] == 1
+        pos = await db.scalar(select(PaperPosition).where(PaperPosition.account_id == account.id))
+        original_amount = pos.buy_amount
+        pos.stop_loss_price = 9.9
+        if legacy:
+            pos.strategy_version = "old-version"
+        spot = await db.scalar(select(StockSpot).where(StockSpot.code == "600100"))
+        spot.price, spot.ask1_price, spot.high, spot.updated_at = 10.08, 10.09, 10.12, now
+        db.add(PaperShadowEvent(
+            event_key=f"{ROUTE_B}:{original.route_version}:{now.date().isoformat()}:600100:confirmed", route_id=ROUTE_B,
+            route_version=original.route_version, trade_date=now.date(), observed_at=now,
+            code="600100", name="test", event_type="confirmed", status="confirmed",
+            price=10.08, assumed_fill_price=10.10, created_at=now,
+            snapshot_json=_snapshot("600100", now, price=10.08, ask=10.09),
+        ))
+        await db.commit()
+        result = await qualified_challenger_execution(db, now=now)
+        decision_logs = list((await db.scalars(select(PaperAutoTradeLog).where(
+            PaperAutoTradeLog.account_id == account.id,
+        ))).all())
+        assert result["entries"] == entries, [log.reason for log in decision_logs]
+        await db.refresh(pos)
+        if entries:
+            assert original_amount < pos.buy_amount <= 900
+            assert pos.stop_loss_price >= 9.9
+            assert pos.buy_time == bought_at
+            assert await challenger._today_buy_count(db, account.id, now.date()) == 0
+            repeat = await qualified_challenger_execution(db, now=now)
+            assert repeat["entries"] == 0
+        else:
+            assert pos.buy_amount == original_amount
+
+
+@pytest.mark.asyncio
 async def test_disabled_route_collects_evidence_without_opening_position(
     challenger_env,
     monkeypatch,
@@ -721,8 +785,9 @@ async def test_each_configured_route_writes_only_its_own_isolated_account(
 
 
 @pytest.mark.asyncio
-async def test_limit_up_without_offer_waits_for_new_round_not_fake_fill(
-    challenger_env,
+@pytest.mark.parametrize("price,expected", [(10.05, "wait"), (11.0, "skipped")])
+async def test_no_offer_waits_only_while_route_still_valid(
+    challenger_env, price, expected,
 ):
     SessionLocal = challenger_env
     now = datetime(2026, 9, 1, 10, 5, 0)
@@ -732,7 +797,7 @@ async def test_limit_up_without_offer_waits_for_new_round_not_fake_fill(
             code="600101",
             route_id=ROUTE_C,
             now=now,
-            price=11.0,
+            price=price,
             ask=0.0,
             limit_up=11.0,
         )
@@ -752,8 +817,13 @@ async def test_limit_up_without_offer_waits_for_new_round_not_fake_fill(
     assert result["skipped"] == 1
     assert position_count == 0
     assert log is not None
-    assert log.decision == "wait"
-    assert "不可成交" in log.reason
+    assert log.decision == expected
+    if expected == "wait":
+        assert "不可成交" in log.reason
+    else:
+        # No offer is recoverable, but 10% already exceeds C2's own live band.
+        assert "离开路由确认区间" in log.reason
+        assert log.action == "skip_terminal"
 
 
 @pytest.mark.asyncio

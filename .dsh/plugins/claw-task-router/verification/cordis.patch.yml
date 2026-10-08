@@ -1,0 +1,3 @@
+- insert:
+    - id: claw-task-router-verification
+      name: 'file:///Users/youzix/WorkBuddy/Claw/.dsh/plugins/claw-task-router/verification/confirmed-entry.mjs'

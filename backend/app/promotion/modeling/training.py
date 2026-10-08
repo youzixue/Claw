@@ -71,12 +71,14 @@ def _historical_universe_rank_metrics(evaluation: dict, diagnostics: dict) -> di
             result[str(key)] = {
                 "selected_count": int(item.get("selected_count") or 0),
                 "hit_count": hits,
-                "precision": float(item.get("precision") or 0.0),
-                "candidate_pool_recall": float(item.get("recall") or 0.0),
+                "precision": item.get("precision"),
+                "candidate_pool_recall": item.get("recall"),
                 "full_universe_recall": round(
                     hits / universe_positives if universe_positives else 0.0,
                     6,
-                ),
+                ) if not sum(int(d.get("universe_unknown_count") or 0) for d in daily) else None,
+                **({"selected_unknown_count": item["selected_unknown_count"]}
+                   if "selected_unknown_count" in item else {}),
             }
         return result
 
@@ -87,7 +89,8 @@ def _historical_universe_rank_metrics(evaluation: dict, diagnostics: dict) -> di
         "candidate_prefilter_recall": round(
             candidate_positives / universe_positives if universe_positives else 0.0,
             6,
-        ),
+        ) if not sum(int(d.get("universe_unknown_count") or 0) for d in daily) else None,
+        "universe_unknown_count": sum(int(d.get("universe_unknown_count") or 0) for d in daily),
         "challenger": rank_metrics(evaluation.get("challenger_metrics") or {}),
         "champion_reference": rank_metrics(evaluation.get("champion_metrics") or {}),
         "note": (
@@ -172,6 +175,7 @@ async def train_promotion_challenger(
     persist: bool = False,
     artifact_dir: str | Path | None = None,
     as_of_at: datetime | None = None,
+    train_window_days: int | None = None,
 ) -> dict:
     """Train and evaluate one target lane; never activates it as champion."""
 
@@ -206,6 +210,7 @@ async def train_promotion_challenger(
         "validation_days": validation_days,
         "step_days": step_days,
         "calibration_days": calibration_days,
+        "train_window_days": train_window_days,
         "minimum_samples": minimum_samples,
         "minimum_trade_days": minimum_trade_days,
         "minimum_positives": minimum_positives,
@@ -245,9 +250,9 @@ async def train_promotion_challenger(
                 end_date=end_date,
                 snapshot_context=snapshot_context,
             )
-        sample_count = len(dataset.rows)
-        trade_day_count = len({row.trade_date for row in dataset.rows})
-        positive_count = sum(row.label for row in dataset.rows)
+        sample_count = sum(row.label is not None for row in dataset.rows)
+        trade_day_count = len({row.trade_date for row in dataset.rows if row.label is not None})
+        positive_count = sum(row.label == 1 for row in dataset.rows)
         guard_checks = {
             "minimum_samples": {
                 "actual": sample_count,
@@ -275,6 +280,8 @@ async def train_promotion_challenger(
             step_days=step_days,
             calibration_days=calibration_days,
             allow_unmaterialized_pretraining=dataset_source == "historical_panel",
+            allow_unknown_labels=dataset_source == "historical_panel",
+            train_window_days=train_window_days,
         )
         if dataset_source == "historical_panel":
             evaluation["historical_universe_rank_metrics"] = (
@@ -294,6 +301,8 @@ async def train_promotion_challenger(
         final_model = fit_temporally_calibrated_model(
             dataset.rows, calibration_days=calibration_days,
             allow_unmaterialized_pretraining=dataset_source == "historical_panel",
+            allow_unknown_labels=dataset_source == "historical_panel",
+            train_window_days=train_window_days,
         )
         public_evaluation = _public_walk_forward(evaluation)
         artifact_core = {
@@ -375,7 +384,8 @@ async def train_promotion_challenger(
                 "artifact_uri": str(destination),
                 "params_json": _json(final_model.payload()),
                 "metrics_json": _json(public_evaluation),
-                "training_start_date": dataset.start_date,
+                "training_start_date": (date.fromisoformat(final_model.fit_start_date)
+                                        if train_window_days is not None else dataset.start_date),
                 "training_end_date": date.fromisoformat(final_model.fit_end_date),
                 "validation_start_date": validation_start_date,
                 "validation_end_date": validation_end_date,

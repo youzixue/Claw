@@ -34,7 +34,7 @@ from app.data.main_fund import (
     main_fund_display_evidence, freeze_anomaly_main_fund,
 )
 from app.data.main_fund_window import load_main_fund_window, fund_window_payload
-from app.data.auction_evidence import auction_evidence_status
+from app.data.auction_evidence import auction_evidence_status, auction_latest_order
 from app.core.trade_calendar import trade_calendar
 from app.core.data_date import resolve_latest_trade_date
 from app.news.catalyst import load_direct_stock_catalyst_map
@@ -4528,7 +4528,7 @@ class AnomalyScanner:
         normalized_codes = list(dict.fromkeys(str(code or "") for code in codes if code))
         if not normalized_codes:
             return {}
-        result = await session.execute(
+        result = await session.stream(
             select(
                 StockKline.code,
                 StockKline.trade_date,
@@ -4539,15 +4539,22 @@ class AnomalyScanner:
                 StockKline.code.in_(normalized_codes),
                 StockKline.trade_date <= trade_day,
                 StockKline.trade_date >= trade_day - timedelta(days=190),
-            ).order_by(StockKline.code, StockKline.trade_date)
+            ).order_by(StockKline.code, StockKline.trade_date).execution_options(yield_per=2048)
         )
         grouped: dict[str, list[tuple]] = defaultdict(list)
-        for code, trade_date, close, high, low in result.all():
-            if _safe_float(close) > 0:
-                grouped[str(code)].append((trade_date, _safe_float(close), _safe_float(high), _safe_float(low)))
+        try:
+            async for batch in result.partitions(2048):
+                for code, trade_date, close, high, low in batch:
+                    if _safe_float(close) > 0:
+                        grouped[str(code)].append((trade_date, _safe_float(close), _safe_float(high), _safe_float(low)))
+                await asyncio.sleep(0)
+        finally:
+            await result.close()
 
         features: dict[str, dict] = {}
-        for code, rows in grouped.items():
+        for index, (code, rows) in enumerate(grouped.items()):
+            if index % 64 == 0:
+                await asyncio.sleep(0)
             closes = [row[1] for row in rows]
             highs = [row[2] for row in rows if row[2] > 0]
             lows = [row[3] for row in rows if row[3] > 0]
@@ -4801,6 +4808,7 @@ class AnomalyScanner:
 
         stocks_by_sector: dict[str, list[dict]] = {}
         for sector_code in unique_sector_codes:
+            await asyncio.sleep(0)
             stocks = []
             for code, name in cons_by_sector.get(sector_code, {}).items():
                 spot = spots.get(code)
@@ -4897,7 +4905,7 @@ class AnomalyScanner:
             select(AuctionData).where(
                 AuctionData.code == code,
                 AuctionData.trade_date == today,
-            ).order_by(desc(AuctionData.auction_time)).limit(1)
+            ).order_by(*auction_latest_order()).limit(1)
         )
         auction = result.scalar_one_or_none()
 
@@ -6058,6 +6066,7 @@ class AnomalyScanner:
 
         all_dragons = []
         for sector_code, sector_name in sectors:
+            await asyncio.sleep(0)
             stocks = stocks_by_sector.get(sector_code) or []
             sector_meta = sector_meta_by_code.get(str(sector_code)) or {}
             if str(sector_meta.get("sector_type") or "") == "concept":

@@ -118,14 +118,16 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # 关闭调度器
-    if not scheduler_disabled:
-        from app.data.scheduler import data_scheduler
-        data_scheduler.stop()
-    from app.push.channels import feishu_channel
-    await feishu_channel.close()
-    await ai_provider.close()
-    await engine.dispose()
+    # 影子关闭失败或调用者取消时，仍执行原有资源清理并传播异常。
+    try:
+        if not scheduler_disabled:
+            from app.data.scheduler import data_scheduler
+            await data_scheduler.shutdown()
+    finally:
+        from app.push.channels import feishu_channel
+        await feishu_channel.close()
+        await ai_provider.close()
+        await engine.dispose()
     logger.info("🦅 Claw 关闭")
 
 

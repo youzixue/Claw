@@ -519,10 +519,17 @@ class ObserveOnlyRule(RiskRule):
             return self.pass_decision(ctx)
 
         if ctx.board_tag == "observe_only":
+            # observe_only也可能来自身份冲突或人工限制，不能把主板误称为观察板。
+            # 前缀仅用于说明文案，不覆盖ctx的限制、不产生买入许可。
+            from app.core.stock_tagger import stock_tagger
+            board_label = {"gem": "创业板", "star": "科创板", "bse": "北交所"}.get(
+                stock_tagger.get_board_type(ctx.code)
+            )
+            reason = f"{board_label}准入限制" if board_label else "证券身份待核验或观察限制"
             return self.block_decision(
                 ctx,
-                message=f"{ctx.code} 为观察标的(创业板/科创板/北交所)，不允许买入",
-                suggestion="仅作为观察参考，交易仅限主板股票",
+                message=f"{ctx.code} 当前为仅观察状态（{reason}），不允许买入",
+                suggestion="核查板块准入、证券身份一致性及人工观察限制；不得绕过身份风控",
                 detail={"board_tag": ctx.board_tag},
             )
 

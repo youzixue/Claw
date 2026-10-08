@@ -1,0 +1,16 @@
+{
+  "name": "@local/claw-task-router",
+  "version": "1.0.0",
+  "description": "Conservative first-task preset routing for new Claw DSH sessions; preserves unattended read-only research.",
+  "type": "module",
+  "main": "./runtime.mjs",
+  "exports": {
+    ".": "./runtime.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

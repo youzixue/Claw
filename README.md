@@ -108,8 +108,8 @@ alembic downgrade -1
 启动后端后访问:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
-- 晋级预测接口补充说明: [docs/promotion-api.md](/Users/youzix/WorkBuddy/Claw/docs/promotion-api.md)
-- 每日复盘、影子验收、人工晋级与回滚: [docs/ashare-review-model-governance.md](/Users/youzix/WorkBuddy/Claw/docs/ashare-review-model-governance.md)
+- 晋级预测接口补充说明: [promotion-api.md](<docs/promotion-api.md>)
+- 每日复盘、影子验收、人工晋级与回滚: [ashare-review-model-governance.md](<docs/ashare-review-model-governance.md>)
 
 共 19 组 API 路由 + WebSocket 实时推送
 
@@ -186,6 +186,16 @@ Claw/
 └── README.md
 ```
 
+## GitHub 同步与安全
+
+- 本项目使用 **公开仓库** 供下载；仓库只包含源码、测试、迁移、项目文档与可复用 Skills / 插件，不包含作者的运行数据和私人配置。
+- [配置模板](<backend/.env.example>) 不含真实凭据，新环境默认关闭 AI 与通知；复制后仅在本机填写。
+- **飞书必须使用你自己的机器人**：模板中的 `FEISHU_WEBHOOK_URL` 为空，`PUSH_ENABLED=false`。需要推送时，在本机环境配置中填写自己的 Webhook 并改为 `PUSH_ENABLED=true`；不要提交或分享该配置。
+- [忽略规则](<.gitignore>) 排除实际环境配置及其备份、数据库及 WAL/SHM、登录 profile、日志、运行证据、依赖与插件运行状态。GitHub 源码仓库不是运行数据备份。
+- 已跟踪文件不会因新增忽略规则自动退出版本管理；提交前须核对 `git diff --cached --stat`。
+- 如已安装 Gitleaks，可在项目根目录执行 `gitleaks git . --redact` 检查历史，执行 `gitleaks git . --staged --redact` 检查待提交差异。[检测配置](<.gitleaks.toml>) 保留默认规则，只排除三个已核实的测试 / 页面字段字面量类型。
+- 发现真实凭据进入历史时，应先撤销 / 轮换凭据并清理历史；仅删除当前文件不足以防泄漏。
+
 ## License
 
-Private — 个人量化交易系统
+源码公开供下载；当前未附带开源许可证。

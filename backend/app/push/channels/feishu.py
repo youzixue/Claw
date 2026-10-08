@@ -18,7 +18,7 @@ FEISHU_CARD_BUDGET_BYTES = 18_000
 
 
 def feishu_category_allowed(message: PushMessage) -> bool:
-    return not settings.FEISHU_PAPER_BUY_POINTS_ONLY or message.category == "paper_buy_point"
+    return not settings.FEISHU_PAPER_BUY_POINTS_ONLY or message.category in {"paper_buy_point", "c3_research_signal"}
 
 
 class FeishuChannel(PushChannel):
@@ -55,7 +55,7 @@ class FeishuChannel(PushChannel):
         try:
             # 构建飞书互动卡片
             card = self._build_card(message)
-            if message.category == "paper_buy_point" and len(json.dumps(card, ensure_ascii=False).encode("utf-8")) > FEISHU_CARD_BUDGET_BYTES:
+            if message.category in {"paper_buy_point", "c3_research_signal"} and len(json.dumps(card, ensure_ascii=False).encode("utf-8")) > FEISHU_CARD_BUDGET_BYTES:
                 logger.error("买点卡片超过本地字节预算，拒绝发送，等待通知消费者分批")
                 return False
 
@@ -114,7 +114,7 @@ class FeishuChannel(PushChannel):
 
         # 策略买点复用异动卡片样式，但采用逐股票分区和可读标题。
         # 内部message.title仍供限频去重使用，其他类别不受此展示分支影响。
-        if message.category == "paper_buy_point":
+        if message.category in {"paper_buy_point", "c3_research_signal"}:
             extra = message.extra or {}
             sections = extra.get("feishu_sections")
             if not isinstance(sections, list) or not sections or not all(isinstance(x, str) for x in sections):

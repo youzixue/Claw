@@ -121,19 +121,33 @@ class ExternalFactorCollector:
             try:
                 symbol = ".IXIC" if key == "us_nasdaq" else ".INX"
                 df = ak.index_us_stock_sina(symbol=symbol)
-                if isinstance(df, pd.DataFrame) and len(df) > 0:
-                    row = df.iloc[-1]
-                    close = _safe_float(row.get("close"))
-                    prev_close = _safe_float(row.get("open"))
-                    change_pct = 0.0
-                    if prev_close:
-                        change_pct = round((close - prev_close) / prev_close * 100, 2)
+                if isinstance(df, pd.DataFrame) and {"date", "close"}.issubset(df.columns):
+                    # The endpoint is per-symbol. If a symbol leaf is present,
+                    # never borrow another index's prior close.
+                    if "symbol" in df.columns:
+                        df = df[df["symbol"].astype(str) == symbol]
+                    daily = df[["date", "close"]].copy()
+                    daily["_date"] = pd.to_datetime(daily["date"], errors="coerce").dt.normalize()
+                    daily["_close"] = daily["close"].map(lambda value: _safe_float(value, default=None))
+                    daily = daily.dropna(subset=["_date", "_close"])
+                    daily = daily[daily["_close"] > 0]
+                    # Identical duplicates are harmless; conflicting closes
+                    # for one date have no deterministic truth and are excluded.
+                    valid = daily.groupby("_date", sort=True)["_close"].agg(["first", "nunique"])
+                    valid = valid[valid["nunique"] == 1]
+                    if len(valid) < 2:
+                        continue  # Missing prior close is unavailable, not 0%.
+                    close = float(valid.iloc[-1]["first"])
+                    prev_close = float(valid.iloc[-2]["first"])
+                    change_pct = round((close - prev_close) / prev_close * 100, 2)
+                    if not math.isfinite(change_pct):
+                        continue
                     out.append(ExternalFactorItem(
                         key=key,
                         label=label,
                         price=close,
                         change_pct=change_pct,
-                        trade_time=str(row.get("date")) if row.get("date") is not None else None,
+                        trade_time=valid.index[-1].strftime("%Y-%m-%d"),
                         market="US",
                     ))
             except Exception:

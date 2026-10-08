@@ -201,7 +201,12 @@ def mock_status_fetch(monkeypatch, factory, frames):
     success, failure = AsyncMock(), AsyncMock()
     monkeypatch.setattr(scheduler.data_quality_guard, "record_success", success)
     monkeypatch.setattr(scheduler.data_quality_guard, "record_failure", failure)
-    return scheduler.DataScheduler(), success, failure
+    collector = scheduler.DataScheduler()
+    # These tests isolate the positive merge; dated resumption has separate integration coverage.
+    monkeypatch.setattr(collector, "_refresh_verified_trading_status", AsyncMock(return_value={
+        "status": "not_tested_in_positive_merge_suite", "automatic_clear_count": 0,
+    }))
+    return collector, success, failure
 
 
 def risk_frames():

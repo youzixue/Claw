@@ -267,10 +267,15 @@ async def test_actual_empty_writer_blocks_old_candidates_then_valid_retry_recove
     ("mainline", 1, "mainline_spread_start"),
     ("auction", 1, "auction_surge_start"),
 ])
+@pytest.mark.parametrize("intraday_refresh", [False, True])
 async def test_empty_blocker_respects_account_context_and_signal_date(
     paper_client, monkeypatch, context, attempt_at, blocked_accounts, account, target, route,
+    intraday_refresh,
 ):
     _, maker = paper_client
+    # B can now opt into later intraday contexts. Freeze both configurations
+    # instead of inheriting the deployment setting in this ledger isolation test.
+    monkeypatch.setattr(paper.settings, "PAPER_PROMOTION_INTRADAY_REFRESH_ENABLED", intraday_refresh)
     previous = date(2026, 9, 4)
     monkeypatch.setattr(paper.trade_calendar, "previous_trade_day", AsyncMock(return_value=previous))
     async with maker() as db:
@@ -288,7 +293,10 @@ async def test_empty_blocker_respects_account_context_and_signal_date(
         await persist(db, [], batch=ScheduleBatch(context, attempt_at), dates={})
         selected, notes = await paper._promotion_route_buy_candidates(
             db, limit=10, trade_date=DAY, account_name=account, now=datetime(2026, 9, 7, 10, 5))
-        if account in blocked_accounts:
+        blocked = account in blocked_accounts or (
+            context == "promotion_1000" and account == "promotion" and intraday_refresh
+        )
+        if blocked:
             assert not selected and "禁止回退" in notes[0]
         else:
             assert [row["code"] for row in selected] == ["600001"]

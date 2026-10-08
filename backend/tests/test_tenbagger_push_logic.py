@@ -1469,7 +1469,15 @@ def test_capital_rejects_each_missing_provenance_field(field):
 
 
 @pytest.mark.parametrize("source", ["fund_flow", "eastmoney_main_fund"])
-def test_capital_rejects_expired_source_clock_even_when_stale_flag_is_false(source):
+def test_capital_rejects_expired_source_clock_even_when_stale_flag_is_false(source, monkeypatch):
+    # Source age uses trading time (lunch is paused). This expiry test must run
+    # at a fixed continuous-auction clock, not depend on when pytest is invoked.
+    at = tenbagger_module.datetime(2026, 9, 22, 10, 30)
+    class Clock(tenbagger_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at
+    monkeypatch.setattr(tenbagger_module, "datetime", Clock)
     anomaly = _make_capital_anomaly("000009", "时钟过期股", source=source)
     expired = tenbagger_module.datetime.now() - timedelta(
         seconds=tenbagger_module.settings.FUND_FLOW_SOURCE_MAX_AGE_SEC + 1,

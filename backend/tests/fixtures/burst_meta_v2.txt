@@ -1,0 +1,119 @@
+def _build_burst_pullback_restart_meta(bars: list[dict]) -> dict:
+    """识别爆量点火后缩量深调、再度收复均线的主升浪前兆。"""
+    default_meta = _default_burst_pullback_restart_meta()
+    cleaned_bars = [
+        item
+        for item in (bars or [])
+        if _safe_float(item.get("close")) > 0
+        and _safe_float(item.get("high")) > 0
+        and _safe_float(item.get("low")) > 0
+        and _safe_float(item.get("volume")) > 0
+    ]
+    if len(cleaned_bars) < 18:
+        return default_meta
+
+    latest_bar = cleaned_bars[-1]
+    latest_close = _safe_float(latest_bar.get("close"))
+    latest_volume = _safe_float(latest_bar.get("volume"))
+    closes = [_safe_float(item.get("close")) for item in cleaned_bars]
+    highs = [_safe_float(item.get("high")) for item in cleaned_bars]
+    volumes = [_safe_float(item.get("volume")) for item in cleaned_bars]
+    ma10 = _mean(closes[-10:]) if len(closes) >= 10 else 0.0
+    ma20 = _mean(closes[-20:]) if len(closes) >= 20 else 0.0
+    latest_prev_close = _safe_float(latest_bar.get("prev_close"))
+    if latest_prev_close <= 0 and len(cleaned_bars) >= 2:
+        latest_prev_close = _safe_float(cleaned_bars[-2].get("close"))
+    latest_change_pct = _safe_float(latest_bar.get("change_pct"))
+    if latest_change_pct == 0 and latest_prev_close > 0:
+        latest_change_pct = _safe_percent_change(latest_close, latest_prev_close)
+
+    best_meta = default_meta
+    search_start = max(10, len(cleaned_bars) - 55)
+    search_end = max(search_start, len(cleaned_bars) - 5)
+    for idx in range(search_start, search_end):
+        burst_bar = cleaned_bars[idx]
+        burst_volume = _safe_float(burst_bar.get("volume"))
+        if burst_volume <= 0:
+            continue
+        prev_volumes = volumes[max(0, idx - 20):idx]
+        prev10_avg = _mean(prev_volumes[-10:])
+        prev20_avg = _mean(prev_volumes)
+        if prev10_avg <= 0 and prev20_avg <= 0:
+            continue
+        burst_volume_ratio = max(
+            burst_volume / prev10_avg if prev10_avg > 0 else 0.0,
+            burst_volume / prev20_avg if prev20_avg > 0 else 0.0,
+        )
+        burst_prev_close = _safe_float(burst_bar.get("prev_close"))
+        if burst_prev_close <= 0 and idx > 0:
+            burst_prev_close = _safe_float(cleaned_bars[idx - 1].get("close"))
+        burst_high = _safe_float(burst_bar.get("high"))
+        burst_close = _safe_float(burst_bar.get("close"))
+        burst_change_pct = _safe_float(burst_bar.get("change_pct"))
+        if burst_change_pct == 0 and burst_prev_close > 0:
+            burst_change_pct = _safe_percent_change(burst_close, burst_prev_close)
+        burst_high_pct = _safe_percent_change(burst_high, burst_prev_close) if burst_prev_close > 0 else 0.0
+        if burst_volume_ratio < 3.0 or max(burst_change_pct, burst_high_pct) < 5.0:
+            continue
+
+        after_burst = cleaned_bars[idx + 1:]
+        if len(after_burst) < 4:
+            continue
+        low_rel_idx, low_bar = min(enumerate(after_burst), key=lambda item: _safe_float(item[1].get("low")) or 999999.0)
+        low_idx = idx + 1 + low_rel_idx
+        low_price = _safe_float(low_bar.get("low"))
+        if low_price <= 0:
+            continue
+        pullback_depth_pct = _safe_percent_change(burst_high, low_price)
+        days_since_low = len(cleaned_bars) - low_idx - 1
+        if days_since_low < 1:
+            continue
+        low_window = cleaned_bars[max(idx + 1, low_idx - 1): min(len(cleaned_bars), low_idx + 3)]
+        low_window_volume = _mean([_safe_float(item.get("volume")) for item in low_window if _safe_float(item.get("volume")) > 0])
+        burst_shrink_ratio = low_window_volume / burst_volume if burst_volume > 0 and low_window_volume > 0 else 1.0
+        rebound_pct = _safe_percent_change(latest_close, low_price)
+        burst_high_gap_pct = max(_safe_percent_change(burst_high, latest_close), 0.0)
+        previous_volume = _mean(volumes[-11:-1]) if len(volumes) >= 11 else _mean(volumes[:-1])
+        restart_volume_ratio = latest_volume / previous_volume if previous_volume > 0 else 0.0
+        reclaim_ma = bool(
+            (ma10 > 0 and latest_close >= ma10 * 0.99)
+            or (ma20 > 0 and latest_close >= ma20 * 0.97)
+            or latest_close >= max(closes[max(0, len(closes) - 5):]) * 0.985
+        )
+        score = _clamp_score(
+            46.0
+            + _range_score(burst_volume_ratio, ideal_low=3.2, ideal_high=7.5, min_value=2.0, max_value=13.0) * 0.16
+            + _range_score(pullback_depth_pct, ideal_low=12.0, ideal_high=28.0, min_value=8.0, max_value=38.0) * 0.22
+            + _inverse_score(burst_shrink_ratio, good=0.30, bad=0.66) * 0.20
+            + _range_score(rebound_pct, ideal_low=6.0, ideal_high=22.0, min_value=2.0, max_value=36.0) * 0.16
+            + _inverse_score(burst_high_gap_pct, good=2.8, bad=22.0) * 0.12
+            + _range_score(float(days_since_low), ideal_low=2.0, ideal_high=16.0, min_value=1.0, max_value=30.0) * 0.08
+            + _range_score(restart_volume_ratio, ideal_low=0.75, ideal_high=3.2, min_value=0.25, max_value=5.8) * 0.06
+        )
+        ready = bool(
+            score >= 62.0
+            and 10.0 <= pullback_depth_pct <= 34.0
+            and burst_shrink_ratio <= 0.58
+            and rebound_pct >= 6.0
+            and days_since_low <= 25
+            and burst_high_gap_pct <= 24.0
+            and latest_change_pct <= 9.2
+            and reclaim_ma
+        )
+        if score <= _safe_float(best_meta.get("burst_pullback_score")):
+            continue
+        trade_day = burst_bar.get("trade_date")
+        best_meta = {
+            "burst_pullback_restart_ready": ready,
+            "burst_pullback_score": round(score, 2),
+            "burst_pullback_label": "爆量深调再启动" if ready else "爆量深调观察",
+            "burst_date": trade_day.isoformat() if hasattr(trade_day, "isoformat") else str(trade_day or ""),
+            "burst_volume_ratio": round(burst_volume_ratio, 2),
+            "burst_pullback_depth_pct": round(pullback_depth_pct, 2),
+            "burst_shrink_ratio": round(burst_shrink_ratio, 3),
+            "burst_rebound_pct": round(rebound_pct, 2),
+            "burst_high_gap_pct": round(burst_high_gap_pct, 2),
+            "burst_restart_days": days_since_low,
+            "burst_restart_volume_ratio": round(restart_volume_ratio, 3),
+        }
+    return best_meta

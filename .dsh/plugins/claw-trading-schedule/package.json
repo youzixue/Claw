@@ -1,0 +1,8 @@
+{
+  "name": "@local/claw-trading-schedule",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Claw stored-calendar rolling reminders; no holiday model wakeups or calendar sync.",
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

@@ -1,0 +1,175 @@
+async def _load_recent_limit_up_memory(
+    db: AsyncSession,
+    codes: list[str],
+    trade_date: date,
+    *,
+    lookback_days: int = 120,
+) -> dict[str, dict]:
+    if not codes:
+        return {}
+
+    start_date = trade_date - timedelta(days=lookback_days)
+    kline_result = await db.execute(
+        select(
+            StockKline.code,
+            StockKline.trade_date,
+            StockKline.change_pct,
+            StockKline.prev_close,
+            StockKline.close,
+            StockKline.high,
+        ).where(
+            StockKline.code.in_(codes),
+            StockKline.trade_date <= trade_date,
+            StockKline.trade_date >= start_date,
+        )
+    )
+    kline_map = {
+        (str(code or ""), kline_trade_date): {
+            "change_pct": _safe_float(change_pct),
+            "prev_close": _safe_float(prev_close),
+            "close": _safe_float(close),
+            "high": _safe_float(high_price),
+        }
+        for code, kline_trade_date, change_pct, prev_close, close, high_price in kline_result.all()
+    }
+    kline_coverage_count = {}
+    for code, _kline_trade_date in kline_map.keys():
+        normalized_code = str(code or "")
+        if not normalized_code:
+            continue
+        kline_coverage_count[normalized_code] = kline_coverage_count.get(normalized_code, 0) + 1
+
+    result = await db.execute(
+        select(
+            LimitUpPool.code,
+            LimitUpPool.name,
+            LimitUpPool.trade_date,
+            LimitUpPool.consecutive_days,
+            LimitUpPool.seal_amount,
+            LimitUpPool.break_count,
+        ).where(
+            LimitUpPool.code.in_(codes),
+            LimitUpPool.trade_date <= trade_date,
+            LimitUpPool.trade_date >= start_date,
+        ).order_by(LimitUpPool.code, desc(LimitUpPool.trade_date))
+    )
+
+    grouped: dict[str, list[dict]] = {}
+    for code, name, limit_up_trade_date, consecutive_days, seal_amount, break_count in result.all():
+        grouped.setdefault(str(code or ""), []).append(
+            {
+                "name": str(name or ""),
+                "trade_date": limit_up_trade_date,
+                "consecutive_days": _safe_int(consecutive_days, 1),
+                "seal_amount": _safe_float(seal_amount),
+                "break_count": _safe_int(break_count),
+            }
+        )
+
+    day_gap_cache: dict[date, int] = {}
+    features_by_code: dict[str, dict] = {}
+    for code in codes:
+        raw_entries = grouped.get(code, [])
+        validated_entries: list[dict] = []
+        invalid_hits = 0
+        missing_kline_hits = 0
+        for entry in raw_entries:
+            kline = kline_map.get((code, entry["trade_date"]))
+            if kline is None:
+                if kline_coverage_count.get(code, 0) > 0:
+                    invalid_hits += 1
+                    missing_kline_hits += 1
+                    continue
+                validated_entries.append(entry)
+                continue
+
+            board_type = stock_tagger.get_board_type(code)
+            name = str(entry.get("name") or "")
+            if "ST" in name.upper():
+                threshold = 4.7
+            elif board_type in {"gem", "star"}:
+                threshold = 19.0
+            elif board_type == "bse":
+                threshold = 29.0
+            else:
+                threshold = 9.5
+
+            actual_change_pct = _safe_float(kline.get("change_pct"))
+            if actual_change_pct <= 0 and _safe_float(kline.get("prev_close")) > 0 and _safe_float(kline.get("close")) > 0:
+                actual_change_pct = _safe_percent_change(_safe_float(kline.get("close")), _safe_float(kline.get("prev_close")))
+
+            if actual_change_pct >= threshold:
+                validated_entries.append(entry)
+            else:
+                invalid_hits += 1
+
+        entries = validated_entries
+        if not entries:
+            features_by_code[code] = {
+                "memory_score": 0.0,
+                "memory_max_board_50d": 0,
+                "memory_limit_up_hits_50d": 0,
+                "memory_raw_limit_up_hits_50d": len(raw_entries),
+                "memory_invalid_limit_up_hits_50d": invalid_hits,
+                "memory_missing_kline_limit_up_hits_50d": missing_kline_hits,
+                "memory_days_since_last_limit_up": 999,
+                "memory_last_limit_up_date": None,
+                "memory_last_seal_amount": 0.0,
+                "memory_last_break_count": 0,
+                "memory_last_consecutive_days": 0,
+                "memory_last_limit_up_close": 0.0,
+                "memory_last_limit_up_high": 0.0,
+                "memory_last_limit_up_anchor_price": 0.0,
+                "memory_validation_mode": "stock_kline.change_pct+missing_kline_filter",
+            }
+            continue
+
+        latest_entry = entries[0]
+        latest_date = latest_entry["trade_date"]
+        latest_kline = kline_map.get((code, latest_date), {})
+        if latest_date not in day_gap_cache:
+            day_gap_cache[latest_date] = await _trade_day_gap(db, latest_date, trade_date)
+        days_since_last = day_gap_cache[latest_date]
+        max_board = max(_safe_int(item.get("consecutive_days"), 1) for item in entries)
+        limit_up_hits = len(entries)
+        last_seal_amount = _safe_float(latest_entry.get("seal_amount"))
+        last_break_count = _safe_int(latest_entry.get("break_count"))
+
+        if 6 <= days_since_last <= 25:
+            recency_score = 100.0
+        elif days_since_last < 6:
+            recency_score = 40.0 + max(days_since_last, 0) / 6.0 * 35.0
+        elif days_since_last <= 45:
+            recency_score = 100.0 - (days_since_last - 25) / 20.0 * 65.0
+        else:
+            recency_score = max(10.0, 35.0 - min(days_since_last - 45, 25) * 1.0)
+
+        memory_score = (
+            min(max_board, 4) / 4.0 * 25.0
+            + min(limit_up_hits, 3) / 3.0 * 15.0
+            + recency_score * 0.20
+            + min(last_seal_amount / 3e8, 1.0) * 20.0
+            + max(0.0, 1.0 - min(last_break_count, 3) / 3.0) * 20.0
+        )
+        features_by_code[code] = {
+            "memory_score": _clamp_score(memory_score),
+            "memory_max_board_50d": max_board,
+            "memory_limit_up_hits_50d": limit_up_hits,
+            "memory_raw_limit_up_hits_50d": len(raw_entries),
+            "memory_invalid_limit_up_hits_50d": invalid_hits,
+            "memory_missing_kline_limit_up_hits_50d": missing_kline_hits,
+            "memory_days_since_last_limit_up": days_since_last,
+            "memory_last_limit_up_date": str(latest_date) if latest_date else None,
+            "memory_last_seal_amount": round(last_seal_amount, 2),
+            "memory_last_break_count": last_break_count,
+            "memory_last_consecutive_days": _safe_int(latest_entry.get("consecutive_days"), 1),
+            "memory_last_limit_up_close": round(_safe_float(latest_kline.get("close")), 2),
+            "memory_last_limit_up_high": round(_safe_float(latest_kline.get("high")), 2),
+            "memory_last_limit_up_anchor_price": round(
+                max(_safe_float(latest_kline.get("high")), _safe_float(latest_kline.get("close"))),
+                2,
+            ),
+            "memory_validation_mode": "stock_kline.change_pct+missing_kline_filter",
+        }
+
+    return features_by_code

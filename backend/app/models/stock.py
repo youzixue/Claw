@@ -141,7 +141,11 @@ class LimitUpPool(Base):
     consecutive_days = Column(Integer, default=1)  # 连板天数
     limit_up_reason = Column(Text)             # 涨停原因
     turnover = Column(Float)                   # 换手率%
-    source = Column(String(20))                # eastmoney/pywencai
+    source = Column(String(20))                # tencent；历史来源原样保留
+    source_version = Column(String(40))
+    source_quote_at = Column(DateTime)         # 腾讯状态源时钟，不用接收时间回填
+    observed_at = Column(DateTime)
+    evidence_json = Column(Text)              # 状态/问财字段时点与缺失证据
     # 软隔离：交易日不在权威K线日历的脏记录标记为隔离，质量审计与预测加载不再使用。
     quarantined = Column(Boolean, nullable=False, default=False, server_default="0", index=True)
 
@@ -163,6 +167,10 @@ class LimitDownPool(Base):
     consecutive_days = Column(Integer, default=1)
     reason = Column(Text)
     source = Column(String(20))
+    source_version = Column(String(40))
+    source_quote_at = Column(DateTime)
+    observed_at = Column(DateTime)
+    evidence_json = Column(Text)
 
     __table_args__ = (
         UniqueConstraint("code", "trade_date", name="uq_limit_down_code_date"),
@@ -186,6 +194,10 @@ class BrokenLimitPool(Base):
     close_price = Column(Float)               # 最新/收盘价
     close_at_limit = Column(Boolean)           # 收盘是否重新封住涨停
     final_state = Column(String(24))           # broken/reclosed/unknown
+    source_version = Column(String(40))
+    source_quote_at = Column(DateTime)
+    observed_at = Column(DateTime)
+    evidence_json = Column(Text)
 
     __table_args__ = (
         UniqueConstraint("code", "trade_date", name="uq_broken_limit_code_date"),
@@ -311,8 +323,13 @@ class AuctionData(Base):
     volume_unit = Column(String(16))
     amount_unit = Column(String(16))
 
+    # 036: independent provider frames may share an observation second.
+    # Legacy NULL identities and every original clock remain untouched.
+    source_frame_key = Column(String(64), nullable=True)
+
     __table_args__ = (
-        UniqueConstraint("code", "trade_date", "auction_time", name="uq_auction_code_date_time"),
+        UniqueConstraint("source_frame_key", name="uq_auction_source_frame_key"),
+        Index("ix_auction_date_code_time", "trade_date", "code", "auction_time"),
     )
 
 
@@ -457,6 +474,56 @@ class QuoteRound(Base):
     focus_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
 
+
+# ========== 盘后固定价格研究证据（不可变，非成交授权） ==========
+
+class StockAfterHoursObservation(Base):
+    """Measured session amounts with real local availability, never synthetic fills."""
+    __tablename__ = "stock_after_hours_observation"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False)
+    trade_date = Column(Date, nullable=False)
+    stage = Column(String(24), nullable=False)
+    source = Column(String(32), nullable=False)
+    source_version = Column(String(64), nullable=False)
+    content_hash = Column(String(64), nullable=False)
+    payload_json = Column(Text, nullable=False)
+    source_quote_at = Column(DateTime, nullable=True)
+    received_at = Column(DateTime, nullable=False)
+    recorded_at = Column(DateTime, nullable=False)
+    available_at = Column(DateTime, nullable=False)
+    quality_status = Column(String(24), nullable=False)
+    protocol_version = Column(String(48), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("code", "trade_date", "stage", "source", "source_version",
+                         "content_hash", name="uq_after_hours_content"),
+        Index("ix_after_hours_date_available", "trade_date", "available_at"),
+        Index("ix_after_hours_code_date", "code", "trade_date"),
+    )
+
+
+def _reject_after_hours_mutation(mapper, connection, target):
+    raise ValueError("after-hours evidence is append-only")
+
+
+event.listen(StockAfterHoursObservation, "before_update", _reject_after_hours_mutation)
+event.listen(StockAfterHoursObservation, "before_delete", _reject_after_hours_mutation)
+for _after_hours_action in ("UPDATE", "DELETE"):
+    event.listen(StockAfterHoursObservation.__table__, "after_create", DDL(
+        f"CREATE TRIGGER IF NOT EXISTS after_hours_no_{_after_hours_action.lower()} "
+        f"BEFORE {_after_hours_action} ON stock_after_hours_observation "
+        "BEGIN SELECT RAISE(ABORT, 'after-hours evidence is append-only'); END"
+    ).execute_if(dialect="sqlite"))
+
+
+from app.data.after_hours_schema import (
+    SQLITE_INSERT_GUARD, POSTGRES_GUARD_FUNCTION, POSTGRES_GUARD_TRIGGER,
+)
+event.listen(StockAfterHoursObservation.__table__, "after_create",
+             DDL(SQLITE_INSERT_GUARD).execute_if(dialect="sqlite"))
+for _after_hours_ddl in (POSTGRES_GUARD_FUNCTION, POSTGRES_GUARD_TRIGGER):
+    event.listen(StockAfterHoursObservation.__table__, "after_create",
+                 DDL(_after_hours_ddl).execute_if(dialect="postgresql"))
 
 # ========== 每日基本面快照（前向积累，用于历史复盘） ==========
 

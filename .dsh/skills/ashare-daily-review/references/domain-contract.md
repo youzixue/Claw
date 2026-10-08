@@ -5,7 +5,7 @@
 - `premarket`：只使用目标交易日前一有效交易日收盘数据，以及 `as_of_at` 前发布的消息/竞价。
 - `intraday`：保留盘前原预测，只追加盘中确认；不得使用尚未形成的当日收盘 K 线作为特征。
 - `postmarket`：使用当日收盘前可见数据生成新快照；不得反写盘前或盘中快照。
-- 交易日以本地 `StockKline` 的有效日期为市场时钟，并排除官方休市日。周末规则不能替代春节、国庆等长假日历。
+- 目标交易日须由已存本地交易日历确认；前一交易日不是昨天，也不能只用库内最近 K 线倒退代替。比较 expected_previous 与 actual_kline_date，缺日历/停更明确降级，不在读路径同步日历。周末规则不能替代春节、国庆等长假。
 
 ## 涨跌停真值
 
@@ -19,7 +19,9 @@
 - 每次输出都报告数据版本、快照时点、股票覆盖数、关键源状态和质量告警。
 - 预测快照低于最低候选数时，状态为 `snapshot_incomplete`；实际涨停未出现在残缺快照中不能计为 `not_in_pool`。
 - 当前截面估值或增长字段不能冒充历史基本面。历史不可得时明确写 `unavailable`。
-- 新闻必须满足 `publish_time <= as_of_at`；GPT 不得用训练语料中的旧闻补齐本地缺口。
+- 新闻须使用不可变 content/analysis 版本：publish、received、recorded、content_available、entity_verified 以及实际采用的 analysis_completed/available 均不得晚于截止；采用当时可见修订。无版本旧 FinanceNews 与晚采/晚NLP仅作缺失诊断，不提供情绪事实。
+- 美股 regular、after-hours、股指期货分开；ZoneInfo 的纽约参考时钟不证明交易所开市。冬季北京时间08:00部分盘后尚未结束。未知源时区/session不猜；A50和国内主力连续不能代替美股期货。
+- 日K兼容表价基混合、缺历史首次可用钟；采样分时缺帧保留，5m采样聚合不是交易所完整5m线。GPT 不用训练语料或事后高低价补齐本地缺口。
 
 ## 风格标签
 

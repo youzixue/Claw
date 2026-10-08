@@ -67,9 +67,26 @@ def _shanghai_naive(value: datetime) -> datetime:
     return value.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None) if value.tzinfo else value
 
 
+def news_evidence_statement(*, cutoff: datetime, start_time: datetime | None = None):
+    """Shared visible-revision selection; research pagination never falls back to an old revision."""
+    latest = select(func.max(NewsContentVersion.id).label("id")).where(
+        NewsContentVersion.recorded_at <= cutoff,
+        or_(and_(NewsContentVersion.content_available_at <= cutoff,
+                 NewsContentVersion.received_at <= cutoff,
+                 NewsContentVersion.origin == "observed"),
+            NewsContentVersion.origin == "legacy_unknown"),
+    ).group_by(NewsContentVersion.news_id).subquery()
+    stmt = select(NewsContentVersion).join(latest, NewsContentVersion.id == latest.c.id).where(
+        NewsContentVersion.origin == "observed", NewsContentVersion.publish_time <= cutoff)
+    if start_time is not None:
+        stmt = stmt.where(NewsContentVersion.publish_time >= _shanghai_naive(start_time))
+    return stmt
+
+
 async def load_news_evidence_as_of(
     db: AsyncSession, *, as_of_at: datetime,
     start_time: datetime | None = None, limit: int = 1500,
+    content_version_ids: list[int] | None = None,
 ) -> list[SimpleNamespace]:
     """Shared read-only PIT input for direct/sector consumers.
 
@@ -83,24 +100,10 @@ async def load_news_evidence_as_of(
                  datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None))
     if limit <= 0:
         return []
-    latest = select(func.max(NewsContentVersion.id).label("id")).where(
-        NewsContentVersion.recorded_at <= cutoff,
-        or_(
-            and_(NewsContentVersion.content_available_at <= cutoff,
-                 NewsContentVersion.received_at <= cutoff,
-                 NewsContentVersion.origin == "observed"),
-            # A newly encountered unproven revision invalidates the older
-            # view, but is not itself promoted to time-travel evidence.
-            NewsContentVersion.origin == "legacy_unknown",
-        ),
-    ).group_by(NewsContentVersion.news_id).subquery()
-    stmt = select(NewsContentVersion).join(latest, NewsContentVersion.id == latest.c.id).where(
-        NewsContentVersion.origin == "observed",
-    )
-    # Apply publication window only AFTER selecting the visible revision.
-    if start_time is not None:
-        stmt = stmt.where(NewsContentVersion.publish_time >= _shanghai_naive(start_time))
-    stmt = stmt.where(NewsContentVersion.publish_time <= cutoff).order_by(
+    stmt = news_evidence_statement(cutoff=cutoff, start_time=start_time)
+    if content_version_ids is not None:
+        stmt = stmt.where(NewsContentVersion.id.in_(content_version_ids))
+    stmt = stmt.order_by(
         NewsContentVersion.publish_time.desc(), NewsContentVersion.id.desc(),
     ).limit(limit)
     versions = list((await db.execute(stmt)).scalars().all())

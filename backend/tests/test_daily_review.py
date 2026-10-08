@@ -10,7 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.v1 import daily_review
 from app.db.session import Base, get_db
-from app.models.news import FinanceNews
+from app.models.news import FinanceNews, NewsContentVersion, NewsAnalysisVersion
+from app.news.catalyst import NEWS_EVIDENCE_PROTOCOL
+import hashlib
+import json
 from app.models.promotion import PromotionPredictionRun
 from app.models.review import (
     DailyReviewSnapshot,
@@ -62,6 +65,32 @@ async def review_env(tmp_path: Path):
         yield SessionLocal, client
     app.dependency_overrides.clear()
     await engine.dispose()
+
+
+async def _freeze_fixture_news(session: AsyncSession, news: FinanceNews) -> None:
+    """Explicit observed test clocks; mutable news alone is not PIT evidence."""
+    await session.flush()
+    at = news.publish_time + timedelta(seconds=1)
+    raw = {"source": news.source, "title": news.title, "content": news.content or "",
+           "url": news.url or "", "publish_time": news.publish_time.isoformat()}
+    encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    entities = ([{"code": "000001", "name": "测试政策",
+                  "method": "exact_unique_stock_name_v1"}]
+                if news.source_id == "review-news-1" else [])
+    version = NewsContentVersion(news_id=news.id, source=news.source,
+        publish_time=news.publish_time, content_hash=hashlib.sha256(encoded.encode()).hexdigest(),
+        first_received_at=at, received_at=at, recorded_at=at, content_available_at=at,
+        entity_verified_at=at, origin="observed", protocol_version=NEWS_EVIDENCE_PROTOCOL,
+        payload_json=encoded, entity_evidence_json=json.dumps(entities, ensure_ascii=False))
+    session.add(version)
+    await session.flush()
+    if news.nlp_status == "analyzed":
+        result = json.dumps({"importance": news.importance, "sentiment": "bullish",
+            "confidence": 0.8, "related_sectors": ["测试主线"]}, ensure_ascii=False)
+        session.add(NewsAnalysisVersion(content_version_id=version.id, status="analyzed",
+            analysis_completed_at=at, available_at=at, result_json=result,
+            result_hash=hashlib.sha256(result.encode()).hexdigest(),
+            protocol_version=NEWS_EVIDENCE_PROTOCOL))
 
 
 async def _seed_review_data(session: AsyncSession) -> None:
@@ -166,6 +195,10 @@ async def _seed_review_data(session: AsyncSession) -> None:
                 source="test",
             )
         )
+    await session.commit()
+
+    news = await session.scalar(select(FinanceNews).where(FinanceNews.source_id == "review-news-1"))
+    await _freeze_fixture_news(session, news)
     await session.commit()
 
     candidates = []
@@ -619,6 +652,10 @@ async def test_news_statistics_cover_full_as_of_window_not_only_selected_items(r
                     nlp_status="raw",
                 )
             )
+        await session.flush()
+        for news_row in (await session.scalars(select(FinanceNews).where(
+            FinanceNews.source_id.like("window-news-%")))).all():
+            await _freeze_fixture_news(session, news_row)
         await session.commit()
         dimensions, _presence = await _market_dimensions(
             session,
@@ -633,7 +670,9 @@ async def test_news_statistics_cover_full_as_of_window_not_only_selected_items(r
     assert news["count"] == 146
     assert news["selected_count"] == 100
     assert news["selection_limit"] == 100
-    assert news["selection_basis"] == "importance_then_publish_time"
+    assert news["selection_basis"] == "importance_then_publish_time_within_bounded_pit_page"
+    assert news["coverage"]["count_complete"] is True
+    assert news["count_basis"] == "bounded_pit_window_not_legacy_projection"
     assert len(news["items"]) == 100
     assert news["items"][0]["nlp_status"] == "analyzed"
     assert news["items"][0]["impact_scope"] == "stock_and_sector"

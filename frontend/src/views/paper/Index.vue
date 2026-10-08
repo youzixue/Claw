@@ -10,6 +10,7 @@
         <el-icon><Wallet /></el-icon>
         <span>模拟自动执行 + 手动校验</span>
       </div>
+      <el-button v-if="accountName === 'mainline'" data-testid="open-c3-records" @click="activeTab = 'c3-records'">C3 检测记录 · 只读研究</el-button>
       <div class="hero-chip account-switch">
         <el-radio-group v-model="accountName" size="small" @change="onAccountSwitch">
           <el-radio-button value="default">A·高胜率预案</el-radio-button>
@@ -47,6 +48,9 @@
     </div>
 
     <el-tabs v-model="activeTab" @tab-change="onTabChange">
+      <el-tab-pane v-if="accountName === 'mainline'" label="C3 检测记录" name="c3-records">
+        <C3Records v-if="accountName === 'mainline' && activeTab === 'c3-records'" />
+      </el-tab-pane>
       <el-tab-pane label="账户概览" name="account">
         <div class="metrics-panel paper-metrics-panel">
           <div class="stat-row">
@@ -427,6 +431,8 @@
           title="仅做隔离验证：所有路线都不连接真实券商；标注“只采证”的路线不生成任何模拟买单，有撮合账户的路线仍受卖盘、时效、漂移与风控门禁。"
         />
 
+        <CandidateShadowPanel :account-name="accountName" :active="activeTab === 'challengers'" />
+
         <div v-loading="challengerLoading" class="challenger-content">
           <div v-if="challengerError" class="panel-card challenger-error-state">
             <el-alert :title="challengerError" type="error" :closable="false" show-icon />
@@ -519,7 +525,7 @@
               <el-tag type="warning" size="small">独立模拟买卖链路</el-tag>
               <h3>{{ selectedStrategyCoverage.challenger.strategy_label }}</h3>
               <p>{{ selectedStrategyCoverage.reason }}</p>
-              <small>不是只采证账户；E2使用强势/回封入口，E保留低位入口。两者均保留真实盘口、资金仓位及T+1约束。</small>
+              <small>不是只采证账户；入口以当前后端执行版本为准，持仓退出优先使用建仓时冻结参数。触板排队不等于回封路径认证；两者均保留真实盘口、资金仓位及T+1约束。</small>
               <div class="no-challenger-metrics">
                 <div><span>模拟账户</span><strong>{{ selectedStrategyCoverage.challenger.account_name }}</strong></div>
                 <div><span>自动买入状态</span><strong>{{ selectedStrategyCoverage.challenger_execution_enabled ? '开启' : '未到启动日或维护中' }}</strong></div>
@@ -984,6 +990,8 @@
 <script setup>
 import { defineAsyncComponent, ref, computed, onMounted, onUnmounted } from 'vue'
 const VChart = defineAsyncComponent(() => import('vue-echarts'))
+const C3Records = defineAsyncComponent(() => import('./C3Records.vue'))
+const CandidateShadowPanel = defineAsyncComponent(() => import('./CandidateShadowPanel.vue'))
 import { ensureLineChartsRegistered } from '@/composables/echarts/line'
 import { getPaperAccount, getPaperPositions, paperBuy, paperSell, getPaperNav, getPaperTrades, getPaperAutoStatus, getPaperAutoLogs, getPaperAutoEvaluation, getPaperChallengerComparison, getPaperExperimentReport, runPaperAutoTrade } from '@/api'
 import { formatChange, changeColorClass, formatAmount } from '@/composables/useUtils'
@@ -1430,6 +1438,10 @@ async function loadChallengerComparison() {
 }
 
 function onTabChange(name) {
+  if (name === 'c3-records' && accountName.value !== 'mainline') {
+    activeTab.value = 'account'
+    return
+  }
   if (name === 'experiment' && !experimentLoading.value) loadExperimentReport()
   if (name === 'challengers' && !challengerLoading.value) loadChallengerComparison()
 }

@@ -46,6 +46,55 @@ def test_pending_guard_semantics_rotates_all_accounts(monkeypatch, versioner):
 
 
 @pytest.mark.parametrize("versioner", VERSIONERS)
+def test_live_route_confirmation_semantics_only_rotate_connected_accounts(monkeypatch, versioner):
+    before = versions(versioner)
+    monkeypatch.setattr(experiment, "LIVE_ROUTE_CONFIRMATION_CONTRACT_VERSION", "route-confirm-test")
+    after = versions(versioner)
+    assert {name for name in before if after[name] != before[name]} == set(ROUTE_ACCOUNT_NAMES.values())
+    for name in ACCOUNT_NAMES:
+        identity = experiment.execution_signal_identity(name)
+        assert ("live_route_confirmation_contract" in identity) is (name in ROUTE_ACCOUNT_NAMES.values())
+
+
+@pytest.mark.parametrize("versioner", VERSIONERS)
+def test_primary_confirmation_semantics_only_rotate_seven_primary_accounts(monkeypatch, versioner):
+    primary = set(ACCOUNT_NAMES) - set(ROUTE_ACCOUNT_NAMES.values())
+    assert primary == {"default", "promotion", "mainline", "auction", "tenbagger",
+                       "reversal", "challenger_e"}
+    before = versions(versioner)
+    monkeypatch.setattr(experiment, "PRIMARY_BUY_CONFIRMATION_CONTRACT_VERSION",
+                        "primary-quote-confirm-test")
+    after = versions(versioner)
+    assert {name for name in before if after[name] != before[name]} == primary
+    for name in ACCOUNT_NAMES:
+        identity = experiment.execution_signal_identity(name)
+        assert ("primary_buy_confirmation_contract" in identity) is (name in primary)
+        if name in primary:
+            assert "live_route_confirmation_contract" not in identity
+
+
+@pytest.mark.parametrize("versioner", VERSIONERS)
+@pytest.mark.parametrize("account_name", ("default", "promotion", "mainline", "auction",
+                                          "tenbagger", "reversal", "challenger_e"))
+def test_old_primary_confirmation_identity_cannot_be_reused(versioner, account_name):
+    signal = experiment.execution_signal_identity(account_name)
+    assert signal.pop("primary_buy_confirmation_contract") == "primary_source_quote_v4"
+    if versioner is experiment.standard_execution_version:
+        body = {"base": "fixed-base", "account_name": account_name,
+                "parameters": experiment.account_parameter_snapshot(account_name),
+                "signal_identity": signal}
+        prefix = "fixed-base:execution_v2"
+    else:
+        parameters = experiment.experiment_parameters(account_name)
+        parameters["signal_identity"] = signal
+        protocol = str(settings.PAPER_EXPERIMENT_VERSION)
+        body = {"base": "fixed-base", "protocol": protocol, "parameters": parameters}
+        prefix = f"fixed-base:{protocol[:20]}"
+    old = f"{prefix}:{hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:12]}"
+    assert versioner("fixed-base", account_name) != old
+
+
+@pytest.mark.parametrize("versioner", VERSIONERS)
 def test_global_pending_ttl_only_rotates_accounts_that_consume_it(monkeypatch, versioner):
     before = versions(versioner)
     monkeypatch.setattr(settings, "PAPER_PENDING_BUY_MAX_AGE_SEC",
@@ -99,9 +148,91 @@ def test_deterministic_bounded_owned_identity(versioner):
         experiment.execution_signal_identity("challenger_c"))
 
 
+@pytest.mark.parametrize("versioner", VERSIONERS)
+@pytest.mark.parametrize("constant,affected", [
+    ("PROMOTION_CANDIDATE_CONTRACT_VERSION", {"promotion", "mainline", "auction"}),
+    ("REVERSAL_PENDING_EVIDENCE_CONTRACT_VERSION", {"reversal"}),
+])
+def test_boundary_semantics_rotate_only_consuming_accounts(monkeypatch, versioner, constant, affected):
+    before = versions(versioner)
+    monkeypatch.setattr(experiment, constant, "isolated-new-contract")
+    after = versions(versioner)
+    assert {name for name in before if before[name] != after[name]} == affected
+
+
+@pytest.mark.parametrize("versioner", VERSIONERS)
+def test_decision_hold_clock_rotates_all_twelve_not_parameters(monkeypatch, versioner):
+    before = versions(versioner)
+    parameters = {name: experiment.account_parameter_snapshot(name) for name in ACCOUNT_NAMES}
+    monkeypatch.setattr(experiment, "EXIT_HOLD_CLOCK_CONTRACT_VERSION", "exit-clock-test")
+    after = versions(versioner)
+    assert len(before) == 12 and all(before[name] != after[name] for name in before)
+    assert {name: experiment.account_parameter_snapshot(name) for name in ACCOUNT_NAMES} == parameters
+
+
+@pytest.mark.parametrize("versioner", VERSIONERS)
+def test_opening_weak_gate_scope_rotates_only_seven_short_accounts(monkeypatch, versioner):
+    before = versions(versioner)
+    parameters = {name: experiment.account_parameter_snapshot(name) for name in ACCOUNT_NAMES}
+    affected = {"default", "promotion", "mainline", "auction",
+                "challenger_b", "challenger_c", "challenger_d"}
+    monkeypatch.setattr(experiment, "SHORT_EXIT_WEAK_GATE_CONTRACT_VERSION", "short-gate-test")
+    after = versions(versioner)
+    assert {name for name in before if before[name] != after[name]} == affected
+    assert {name: experiment.account_parameter_snapshot(name) for name in ACCOUNT_NAMES} == parameters
+    for name in ACCOUNT_NAMES:
+        assert ("short_exit_weak_gate_contract" in experiment.execution_signal_identity(name)) == (name in affected)
+
+
+def test_c2_path_contract_rotates_only_c2_signal_version(monkeypatch):
+    before = {route: shadow.route_version_for(route) for route in shadow.ROUTE_IDS}
+    real_rules = shadow._rules
+    def old_rules(route):
+        rules = real_rules(route)
+        rules.pop("confirmed_path_contract", None)
+        return rules
+    monkeypatch.setattr(shadow, "_rules", old_rules)
+    after = {route: shadow.route_version_for(route) for route in shadow.ROUTE_IDS}
+    assert {route for route in before if before[route] != after[route]} == {shadow.ROUTE_C}
+
+
 def test_unknown_account_fails_closed():
     with pytest.raises(KeyError):
         experiment.execution_signal_identity("unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("continuous", (False, True))
+@pytest.mark.parametrize("account_name,contract", [
+    *((name, "primary_buy_confirmation_contract") for name in (
+        "default", "promotion", "mainline", "auction", "tenbagger", "reversal", "challenger_e")),
+    *((name, "promotion_candidate_contract") for name in ("promotion", "mainline", "auction")),
+    ("reversal", "reversal_pending_evidence_contract"),
+])
+async def test_primary_contract_upgrade_rejects_old_buy_in_real_version_gate(
+    monkeypatch, continuous, account_name, contract,
+):
+    from types import SimpleNamespace
+    from app.api.v1 import paper
+    from app.trading import service
+
+    monkeypatch.setattr(settings, "PAPER_CONTINUOUS_EXPERIMENT_ENABLED", continuous)
+    current_identity = experiment.execution_signal_identity
+    def prior_identity(name):
+        identity = current_identity(name)
+        identity.pop(contract, None)
+        return identity
+    with monkeypatch.context() as previous:
+        previous.setattr(experiment, "execution_signal_identity", prior_identity)
+        old_version = paper._strategy_version(account_name)
+    order = SimpleNamespace(account_id=account_name, broker="paper", side="buy",
+                            strategy_version=old_version)
+    reason = await service._pending_order_version_reason(
+        None, order, {}, now=datetime(2026, 9, 21, 10))
+    assert "策略版本已变化" in reason and "非保护性减仓" in reason
+    order.strategy_version = paper._strategy_version(account_name)
+    assert await service._pending_order_version_reason(
+        None, order, {}, now=datetime(2026, 9, 21, 10)) == ""
 
 
 # Existing reusable fixture is isolated by tests/conftest.py before app imports.

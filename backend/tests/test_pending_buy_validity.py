@@ -25,7 +25,7 @@ ACCOUNT = "challenger_c"
 def quote(at, **kwargs):
     return SimpleNamespace(
         **{**dict(code="002988", name="隔离豪美情景", price=30.82, prev_close=30.,
-                  avg_price=30.50, high=30.9, low=30., open=30., limit_up=33.,
+                  avg_price=30.50, high=30.9, low=30., open=30., limit_up=33., limit_down=27.,
                   volume_ratio=2., orderbook_imbalance=.2, ask1_price=30.82,
                   ask1_volume=10, updated_at=at, source_quote_at=at, received_at=at,
                   quote_round_id="fill", change_pct=2.7333), **kwargs})
@@ -237,7 +237,7 @@ async def test_e2_queue_reuses_real_highboard_predicate_and_never_assumes_ask_fi
     monkeypatch.setattr(service, "_pre_trade_risk_check", risk)
     monkeypatch.setattr(service, "get_broker_adapter", lambda _: broker)
     spot = quote(at, code="600001", price=11., prev_close=10., high=11.,
-        low=10.4, open=10.5, avg_price=10.7, change_pct=10., limit_up=11.,
+        low=10.4, open=10.5, avg_price=10.7, change_pct=10., limit_up=11., limit_down=9.,
         bid1_price=11., bid1_volume=100, ask1_price=0., ask1_volume=0., volume=50000,
         quote_round_id="queue-decision")
     monkeypatch.setattr(service, "_paper_execution_spot", AsyncMock(side_effect=lambda *_: spot))
@@ -245,7 +245,10 @@ async def test_e2_queue_reuses_real_highboard_predicate_and_never_assumes_ask_fi
     db.add(LimitUpPool(code="600001", trade_date=prior, consecutive_days=4,
         seal_amount=200_000_000., break_count=0, quarantined=False))
     await db.commit()
-    candidate = {"code":"600001", "_source":"tenbagger_midline", "signal_date":prior.isoformat()}
+    from app.paper.experiment import HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION
+    candidate = {"code":"600001", "_source":"tenbagger_midline", "signal_date":prior.isoformat(),
+                 "entry_mode_contract": HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION,
+                 "entry_variant": "e2_limit_touch"}
     cmd = service.SubmitOrderCommand(code="600001", side="buy", quantity=100, price=11.,
         account_id="challenger_e", strategy_id="paper-auto-short", source="tenbagger_midline",
         strategy_version=paper._strategy_version("challenger_e"), signal_id="auto-queue-test",

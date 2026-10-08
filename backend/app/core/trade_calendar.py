@@ -2,6 +2,7 @@
 
 from datetime import date, datetime, time, timedelta
 from typing import Optional
+import json
 from loguru import logger
 
 import akshare as ak
@@ -9,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import async_session
-from app.models.governance import TradeCalendarModel
+from app.models.governance import TradeCalendarModel, DataWatermarkRevision
 
 
 # A股交易时段定义
@@ -63,9 +64,10 @@ def trading_elapsed_seconds(moment: datetime) -> float:
     return base - (lunch_end - lunch_start)   # 下午与盘后：扣掉午休时长
 
 OFFICIAL_CLOSED_RANGES = (
-    # 2026 年沪深北交易所节假日休市安排
+    # SSE 2025-12-22 official schedule (not government make-up workdays):
+    # https://www.sse.com.cn/disclosure/dealinstruc/closed/c/c_20251222_10802510.shtml
     (date(2026, 1, 1), date(2026, 1, 4)),
-    (date(2026, 2, 14), date(2026, 2, 24)),
+    (date(2026, 2, 14), date(2026, 2, 23)),
     (date(2026, 2, 28), date(2026, 2, 28)),
     (date(2026, 4, 4), date(2026, 4, 6)),
     (date(2026, 5, 1), date(2026, 5, 5)),
@@ -73,7 +75,8 @@ OFFICIAL_CLOSED_RANGES = (
     (date(2026, 6, 19), date(2026, 6, 21)),
     (date(2026, 9, 20), date(2026, 9, 20)),
     (date(2026, 9, 25), date(2026, 9, 27)),
-    (date(2026, 10, 1), date(2026, 10, 10)),
+    (date(2026, 10, 1), date(2026, 10, 7)),
+    (date(2026, 10, 10), date(2026, 10, 10)),
 )
 
 
@@ -93,6 +96,76 @@ def _is_official_closed_day(dt: date) -> bool:
     return is_official_closed_day(dt)
 
 
+async def _persist_known_closed_days(session: AsyncSession, year: int) -> list[date]:
+    """Record only independently known closures, never infer weekday state from absence.
+
+    Existing rows are not rewritten. The append-only receipt is observed NOW,
+    not evidence that this application had recorded the dates in the past.
+    Caller owns commit/rollback; a receipt failure rolls back the inserted days.
+    """
+    # Only the currently verified annual contract may seed missing evidence.
+    # Other years need their own official source review, not this year's template.
+    if year != 2026:
+        return []
+    start, end = date(year, 1, 1), date(year, 12, 31)
+    closed = {}
+    day = start
+    while day <= end:
+        if day.weekday() >= 5 or is_official_closed_day(day):
+            closed[day] = "verified_weekend_v1" if day.weekday() >= 5 else "sse_2026_closure_v1"
+        day += timedelta(days=1)
+    existing = dict((await session.execute(select(
+        TradeCalendarModel.trade_date, TradeCalendarModel.is_trade_day
+    ).where(TradeCalendarModel.trade_date.between(start, end)))).all())
+    conflicts = [day.isoformat() for day in closed if day in existing and existing[day] is not False]
+    if conflicts:
+        raise ValueError("calendar closure conflicts with recorded state: " + ", ".join(conflicts))
+    missing = sorted(set(closed) - set(existing))
+    if not missing:
+        return []
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    elif dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        raise ValueError("unsupported calendar persistence dialect")
+    # Concurrent syncs cannot overwrite evidence or claim each other's inserts.
+    result = await session.execute(insert(TradeCalendarModel).values([
+        {"trade_date": day, "is_trade_day": False, "session_type": "closed", "note": closed[day]}
+        for day in missing
+    ]).on_conflict_do_nothing(index_elements=["trade_date"]).returning(TradeCalendarModel.trade_date))
+    added = sorted(result.scalars().all())
+    observed = datetime.now()
+    if added:
+        session.add(DataWatermarkRevision(
+            dataset="trade_calendar_closed_days", trade_date=start,
+            observed_at=observed, max_available_at=None, replaced_at=observed,
+            replacement_kind="calendar_closed_seed", record_count=len(added),
+            expected_count=len(closed), completeness=len(added) / len(closed),
+            status="partial",
+            details_json=json.dumps({
+                "contract": "verified_closed_calendar_seed_v1",
+                "scope": "missing_known_closures_only", "historical_arrival_certified": False,
+                "sources": [
+                    "https://www.sse.com.cn/disclosure/dealinstruc/closed/c/c_20251222_10802510.shtml",
+                    "https://docs.static.szse.cn/www/lawrules/rule/trade/current/W020260424690713155663.pdf",
+                ],
+                "added_dates": [day.isoformat() for day in added],
+                "notes": {day.isoformat(): closed[day] for day in added},
+                "ordinary_missing_weekdays": "unknown_not_inferred",
+            }, ensure_ascii=False),
+        ))
+        await session.flush()
+    # A conflicting writer must not turn a skipped insert into a false receipt.
+    states = dict((await session.execute(select(
+        TradeCalendarModel.trade_date, TradeCalendarModel.is_trade_day
+    ).where(TradeCalendarModel.trade_date.in_(missing)))).all())
+    if any(states.get(day) is not False for day in missing):
+        raise ValueError("calendar closure changed concurrently")
+    return added
+
+
 class TradeCalendar:
     """交易日历服务"""
 
@@ -109,13 +182,24 @@ class TradeCalendar:
                 )
             )
             rows = result.scalars().all()
-            if len(rows) > 200:  # 一年约250个交易日
+            if sum(row.is_trade_day is True for row in rows) > 200:  # Closures are not open-session coverage.
+                added = await _persist_known_closed_days(session, year)
+                await session.commit()
                 for row in rows:
                     self._cache[row.trade_date] = row.is_trade_day
+                self._cache.update({day: False for day in added})
                 return
 
         # 没有数据，从AkShare获取
         await self._sync_from_source(year)
+
+    async def sync_known_closed_days(self, year: int) -> list[date]:
+        """Idempotent, source-backed calendar repair; no market or prediction writes."""
+        async with async_session() as session:
+            added = await _persist_known_closed_days(session, year)
+            await session.commit()
+        self._cache.update({day: False for day in added})
+        return added
 
     async def _sync_from_source(self, year: int):
         """从AkShare同步交易日历"""
@@ -126,8 +210,14 @@ class TradeCalendar:
                 d = row["trade_date"]
                 if isinstance(d, str):
                     d = datetime.strptime(d, "%Y-%m-%d").date()
+                if isinstance(d, datetime):
+                    d = d.date()
                 if d.year == year:
+                    if d.weekday() >= 5 or is_official_closed_day(d):
+                        raise ValueError(f"calendar source marks known closure open: {d}")
                     trade_dates.add(d)
+            if not trade_dates:
+                raise ValueError(f"calendar source has no open sessions for {year}")
 
             # 写入数据库
             async with async_session() as session:
@@ -139,12 +229,15 @@ class TradeCalendar:
                             is_trade_day=True,
                             session_type="full",
                         ))
-                # 补充非交易日（简化：只标记交易日）
+                await session.flush()
+                await _persist_known_closed_days(session, year)
                 await session.commit()
+                saved_states = dict((await session.execute(select(
+                    TradeCalendarModel.trade_date, TradeCalendarModel.is_trade_day
+                ).where(TradeCalendarModel.trade_date.between(date(year, 1, 1), date(year, 12, 31))))).all())
 
-            # 更新缓存
-            for d in trade_dates:
-                self._cache[d] = True
+            # Only committed states enter the cache; retain explicit existing closures.
+            self._cache.update(saved_states)
 
             logger.info(f"交易日历同步完成: {year}年, {len(trade_dates)}个交易日")
 

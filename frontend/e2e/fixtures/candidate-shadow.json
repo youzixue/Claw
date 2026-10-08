@@ -1,0 +1,223 @@
+{
+  "schema": "candidate_shadow_readonly_v1",
+  "trade_date": "2026-09-24",
+  "route": "A",
+  "status": {
+    "enabled": true,
+    "running": true,
+    "started_at": "2026-09-24T09:29:00",
+    "version": "isolated-fixture"
+  },
+  "rows": [
+    {
+      "route": "A",
+      "frame_id": "frame-repeat",
+      "session_id": "session-test",
+      "code": "000001",
+      "name": "隔离测试样本",
+      "account_name": "default",
+      "stage": "confirmed",
+      "reason": "original_predicate_observed",
+      "source_quote_at": "2026-09-24T09:30:01",
+      "observed_at": "2026-09-24T09:31:03",
+      "predicate_asof": "2026-09-24T09:30:03",
+      "recorded_at": "2026-09-24T09:31:06",
+      "reference_price": 11,
+      "baseline": {
+        "value": true,
+        "status": "observed",
+        "reason": "frozen_original_confirmation"
+      },
+      "candidate": {
+        "value": true,
+        "status": "observed",
+        "reason": "candidate_condition_observed"
+      },
+      "early_observation": {
+        "value": true,
+        "status": "observed",
+        "reason": "early_only"
+      },
+      "label_sampling": {
+        "selected": false,
+        "anchor_frame_id": "frame-first",
+        "policy": "first_state_per_episode_v1"
+      },
+      "future_labels": [
+        {
+          "kind": "future_label",
+          "route": "A",
+          "frame_id": "frame-first",
+          "session_id": "session-test",
+          "horizon_minutes": 5,
+          "anchor_at": "2026-09-24T09:30:03",
+          "target_at": "2026-09-24T09:35:03",
+          "status": "observed",
+          "reason": "sampled_reference_only",
+          "reference_markout_pct": 2.5,
+          "reference_is_fill": false,
+          "net_profit": null
+        },
+        {
+          "kind": "future_label",
+          "route": "A",
+          "frame_id": "frame-first",
+          "session_id": "session-test",
+          "horizon_minutes": 15,
+          "anchor_at": "2026-09-24T09:30:03",
+          "target_at": "2026-09-24T09:45:03",
+          "status": "observed",
+          "reason": "sampled_reference_only",
+          "reference_markout_pct": -1.2,
+          "reference_is_fill": false,
+          "net_profit": null
+        },
+        {
+          "kind": "future_label",
+          "route": "A",
+          "frame_id": "frame-first",
+          "session_id": "session-test",
+          "horizon_minutes": 30,
+          "anchor_at": "2026-09-24T09:30:03",
+          "target_at": "2026-09-24T10:00:03",
+          "status": "observed",
+          "reason": "sampled_reference_only",
+          "reference_markout_pct": 0,
+          "reference_is_fill": false,
+          "net_profit": null
+        }
+      ]
+    },
+    {
+      "route": "A",
+      "frame_id": "frame-first",
+      "session_id": "session-test",
+      "code": "000001",
+      "name": "隔离测试样本",
+      "account_name": "default",
+      "stage": "confirmed",
+      "reason": "original_predicate_observed",
+      "source_quote_at": "2026-09-24T09:30:01",
+      "observed_at": "2026-09-24T09:30:03",
+      "predicate_asof": "2026-09-24T09:30:03",
+      "recorded_at": "2026-09-24T09:30:05.500",
+      "reference_price": 10,
+      "baseline": {
+        "value": true,
+        "status": "observed",
+        "reason": "frozen_original_confirmation"
+      },
+      "candidate": {
+        "value": true,
+        "status": "observed",
+        "reason": "candidate_condition_observed"
+      },
+      "early_observation": {
+        "value": true,
+        "status": "observed",
+        "reason": "early_only"
+      },
+      "label_sampling": {
+        "selected": true,
+        "anchor_frame_id": "frame-first",
+        "policy": "first_state_per_episode_v1"
+      },
+      "future_labels": [
+        {
+          "kind": "future_label",
+          "route": "A",
+          "frame_id": "frame-first",
+          "session_id": "session-test",
+          "horizon_minutes": 5,
+          "anchor_at": "2026-09-24T09:30:03",
+          "target_at": "2026-09-24T09:35:03",
+          "status": "observed",
+          "reason": "sampled_reference_only",
+          "reference_markout_pct": 2.5,
+          "reference_is_fill": false,
+          "net_profit": null
+        },
+        {
+          "kind": "future_label",
+          "route": "A",
+          "frame_id": "frame-first",
+          "session_id": "session-test",
+          "horizon_minutes": 15,
+          "anchor_at": "2026-09-24T09:30:03",
+          "target_at": "2026-09-24T09:45:03",
+          "status": "observed",
+          "reason": "sampled_reference_only",
+          "reference_markout_pct": -1.2,
+          "reference_is_fill": false,
+          "net_profit": null
+        },
+        {
+          "kind": "future_label",
+          "route": "A",
+          "frame_id": "frame-first",
+          "session_id": "session-test",
+          "horizon_minutes": 30,
+          "anchor_at": "2026-09-24T09:30:03",
+          "target_at": "2026-09-24T10:00:03",
+          "status": "observed",
+          "reason": "sampled_reference_only",
+          "reference_markout_pct": 0,
+          "reference_is_fill": false,
+          "net_profit": null
+        }
+      ]
+    },
+    {
+      "route": "A",
+      "frame_id": "frame-unknown",
+      "session_id": "session-test",
+      "code": "000002",
+      "name": "隔离测试样本",
+      "account_name": "default",
+      "stage": "confirmed",
+      "reason": "original_predicate_observed",
+      "source_quote_at": "2026-09-24T09:30:01",
+      "observed_at": "2026-09-24T09:30:03",
+      "predicate_asof": "2026-09-24T09:30:03",
+      "recorded_at": "2026-09-24T09:30:05.500",
+      "reference_price": 10,
+      "baseline": {
+        "value": false,
+        "status": "control",
+        "reason": "original_not_confirmed"
+      },
+      "candidate": {
+        "value": false,
+        "status": "control",
+        "reason": "experiment_filtered"
+      },
+      "early_observation": {
+        "value": null,
+        "status": "unknown",
+        "reason": "source_missing"
+      },
+      "label_sampling": {
+        "selected": true,
+        "anchor_frame_id": "frame-unknown",
+        "policy": "first_state_per_episode_v1"
+      },
+      "future_labels": []
+    }
+  ],
+  "coverage": {
+    "status": "partial",
+    "reason": "bounded_reader_partial",
+    "recent_receipts": []
+  },
+  "errors": [
+    {
+      "error": "budget_exceeded",
+      "file": "fixture-only.json"
+    }
+  ],
+  "warnings": [
+    "限定视图，不代表全日覆盖"
+  ],
+  "truncated": true,
+  "raw_evidence_omitted": true
+}

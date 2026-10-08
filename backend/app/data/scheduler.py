@@ -4,12 +4,14 @@
 """
 
 import asyncio
+import json
 import math
 import sqlite3
 import time as _time
 from collections import Counter, deque
 from datetime import datetime, date, time, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from loguru import logger
@@ -29,7 +31,6 @@ from app.data.pipeline_runtime import JOB_EVENT_MASK, PipelineRuntimeHealth
 from app.data.sector_exclusions import is_excluded_concept
 from app.core.stock_tagger import stock_tagger
 from app.data.sources.akshare_source import AkShareSource
-from app.data.sources.eastmoney_source import EastMoneySource
 from app.data.sources.wencai_stream_source import WencaiStreamError, WencaiStreamSource
 from app.data.fund_flow_clock import evidence_clock, local_clock, verified_fund_clocks
 from app.data.sources.pywencai_source import PyWencaiSource
@@ -632,14 +633,17 @@ async def _stock_status_fail_streak(session: AsyncSession) -> int:
 _UNOBSERVABLE_CODE_PATTERNS = ("4%", "8%", "92%")  # 与 price_limit_rules.board_for_code 的 bse 段一致
 
 
-def _research_universe_filters() -> tuple:
-    """收盘快照判定、腾讯行情采集、盘后K线采集共用的宇宙过滤条件。"""
-    return (
+def _research_universe_filters(*, include_risk_blocked: bool = False) -> tuple:
+    """默认收盘/K线研究范围；腾讯可显式观测风险股，不授予交易资格。"""
+    risk_filters = () if include_risk_blocked else (
         or_(
             StockTag.board_tag.in_(["tradeable", "observe_only"]),
             StockTag.is_st.is_(True),
         ),
         StockTag.is_suspended.is_(False),
+    )
+    return (
+        *risk_filters,
         # 退市股：前缀("退市XX")与后缀("XX退")两种历史命名都要排除
         or_(
             StockTag.name.is_(None),
@@ -672,7 +676,8 @@ def _research_universe_filters() -> tuple:
 # `observed_at` 落在 09:25:00–09:25:30 内，迟到执行只会返回
 # `outside_evidence_window` 并写 0 行 —— 晚跑等于没跑。
 CRITICAL_WINDOW_JOB_IDS = {
-    "auction_evidence_0925": "09:25 双来源竞价证据的唯一采样窗（09:25:00-09:25:30）",
+    "auction_evidence_0925": "09:25 腾讯竞价证据采样窗（09:25:00-09:25:30）",
+    "auction_evidence_eastmoney_0925": "09:25 东财竞价证据采样窗（09:25:00-09:25:30）",
     "auction_collect_0920": "竞价不可撤单阶段证据窗",
     "auction_collect_0924": "竞价最终快照窗",
     "auction_collect_0925": "竞价最终快照窗",
@@ -692,6 +697,8 @@ class DataScheduler:
         self._jobs_initialized = False
         self._pipeline_runtime_health = PipelineRuntimeHealth()
         self._runtime_listener_registered = False
+        self._after_hours_receipt_tasks: set[asyncio.Task] = set()
+        self._after_hours_receipt_health = {"status": "unobserved", "execution_authorized": False}
         # 关键窗口 missed 的内存快照（有界）；同时在 DataSourceHealth 里持久留证。
         self._critical_window_misses: list[dict] = []
         self._pipeline_health_task: asyncio.Task | None = None
@@ -700,6 +707,10 @@ class DataScheduler:
         self._news_raw_refreshing = False
         self._news_ai_refreshing = False
         self._news_weekend_refreshing = False
+        self._news_job_health = {}
+        self._news_recovery_day = None
+        self._news_recovery_attempts = {"raw": 0, "ai": 0}
+        self._news_recovery_last_tick = {"raw": 0.0, "ai": 0.0}
         self._promotion_prediction_refreshing = False
         self._promotion_prediction_epoch = 0
         self._promotion_prediction_pending: dict | None = None
@@ -713,6 +724,8 @@ class DataScheduler:
         self._index_history_runtime: dict = {}
         self._kline_price_chain_health: dict = {"status": "not_observed"}
         self._kline_observation_health: dict = {"status": "not_observed"}
+        self._after_hours_research_lock = asyncio.Lock()
+        self._after_hours_research_health: dict = {"status": "not_observed"}
         self._sentiment_fund_health: dict = {"status": "not_observed"}
         self._promotion_news_last_attempt: float | None = None
         self._promotion_news_last_result: dict = {}
@@ -728,6 +741,8 @@ class DataScheduler:
         self._auction_collect_refreshing = False
         self._paper_auto_trading = False
         self._paper_research_reporting = False
+        self._candidate_shadow_lifecycle_task: asyncio.Task | None = None
+        self._candidate_shadow_start_error: str | None = None
         self._paper_auto_trading_started_at: datetime | None = None
         self._paper_auto_trading_last_run_at: datetime | None = None
         self._paper_auto_loop_task: asyncio.Task | None = None
@@ -740,6 +755,8 @@ class DataScheduler:
         self._process_awake_guard = ProcessAwakeGuard(enabled=settings.SCHEDULER_PREVENT_IDLE_SLEEP)
         self._quote_round_event = asyncio.Event()
         self._quote_round_payload: dict | None = None
+        self._quote_round_published_monotonic: float | None = None
+        self._quote_consumer_health: dict = {"status": "not_run"}
         self._quote_round_loop_task: asyncio.Task | None = None
         self._momentum_quote_inbox: deque[dict] = deque()
         self._momentum_quote_inflight: dict | None = None
@@ -750,13 +767,18 @@ class DataScheduler:
         self._last_healthy_quote_round_at: datetime | None = None
         self._last_quote_round_processed_at: datetime | None = None
         self._last_quote_round_processed_id: str | None = None
+        # A newer partial failure must not borrow the previous successful round's
+        # debounce clock. Keep its identity for deduplication, retry only fresh data.
+        self._paper_dispatch_incomplete = False
         self._paper_position_risk_health: dict = {"status": "not_run", "accounts": []}
         self._anomaly_scan_requested_at: float | None = None
         self._last_anomaly_scan_started_at: float | None = None
         self._last_intraday_limit_up_codes: set[str] | None = None
+        self._limit_detail_refreshing = False
+        self._limit_detail_task = None
+        self._stock_status_refreshing = False
         self._sources = {
             "akshare": AkShareSource(),
-            "eastmoney": EastMoneySource(),
             "pywencai": PyWencaiSource(),
             "shenwan": ShenwanSource(),
             "sina": SinaSource(),
@@ -772,9 +794,9 @@ class DataScheduler:
         if self._jobs_initialized:
             return
 
-        # === 盘前 (8:25) 股票状态更新 ===
+        # 盘前及盘后复核逐股交易状态；页面只读，不在刷新时请求全市场源。
         self.scheduler.add_job(
-            self._update_stock_status, CronTrigger(hour=8, minute=25, day_of_week="mon-fri"),
+            self._update_stock_status, CronTrigger(hour="8,15", minute=25, day_of_week="mon-fri"),
             id="update_stock_status", name="股票状态更新(ST/停牌/退市)",
         )
 
@@ -789,6 +811,13 @@ class DataScheduler:
             self._auction_collect, IntervalTrigger(seconds=30),
             id="auction_collect", name="竞价数据采集",
         )
+        # 腾讯/新浪早中段均读取买卖一档位，最新价/累计量为0不代表无虚拟数据。
+        # 当前任务依次采两源，各用独立session（非并行）；同源钟重复响应不凑帧。
+        self.scheduler.add_job(
+            self._auction_collect_sina_evidence, IntervalTrigger(seconds=30),
+            id="auction_evidence_early", name="早中段竞价证据(腾讯档位+新浪,09:15-09:25)",
+            coalesce=True, max_instances=1,
+        )
         self.scheduler.add_job(
             self._auction_collect_force_0920,
             CronTrigger(hour=9, minute=20, second=6, day_of_week="mon-fri"),
@@ -802,20 +831,33 @@ class DataScheduler:
             self._auction_collect_force_0925,
             CronTrigger(hour=9, minute=25, second=6, day_of_week="mon-fri"),
             id="auction_collect_0925", name="竞价最终快照(09:25:06)",
+            coalesce=True, max_instances=1, misfire_grace_time=5,
         )
 
-        # === 盘中快频 — 每10秒(涨停/跌停/炸板) ===
+        # 状态无独立HTTP轮询；问财字段补充与交易热路径隔离。
         self.scheduler.add_job(
-            self._intraday_fast, IntervalTrigger(seconds=10),
-            id="intraday_fast", name="盘中快频采集(10s)",
+            self._intraday_fast, IntervalTrigger(seconds=settings.LIMIT_POOL_WENCAI_INTERVAL_SEC),
+            id="intraday_fast", name="问财涨停字段补充",
+            coalesce=True, max_instances=1,
         )
 
         # === 盘中慢频 — 每30秒(资金流) ===
         # 竞价证据采样必须在 09:25:00–09:25:30 内多次触发（契约要求三个时钟
         # 都落在该窗口），整分 cron 做不到，故单独按秒注册。
+        # 独立任务/session避免顺序await挤掉另一来源；共享事件循环/数据库仍会竞争。
+        # 9/29腾讯09:25:06已取数、09:25:38写完，不能把整段耗时归为网络重试。
+        self.scheduler.add_job(
+            self._auction_collect_eastmoney_evidence,
+            CronTrigger(hour=9, minute=25, second="4,20", day_of_week="mon-fri"),
+            id="auction_evidence_eastmoney_0925",
+            name="东财竞价证据采样(09:25窗口)",
+            coalesce=True, max_instances=1, misfire_grace_time=5,
+        )
         self.scheduler.add_job(
             self._auction_collect_tencent_evidence,
-            CronTrigger(hour=9, minute=25, second="5,15,25", day_of_week="mon-fri"),
+            # 保留同源重采机会，样本有09:25:00→09:25:27更新，不是每天最多一帧。
+            # 尾轮只有2秒预算；不放宽窗口或max_instances，迟到帧仍拒收。
+            CronTrigger(hour=9, minute=25, second="6,20,28", day_of_week="mon-fri"),
             id="auction_evidence_0925",
             name="腾讯竞价证据采样(09:25窗口)",
             coalesce=True,
@@ -845,6 +887,28 @@ class DataScheduler:
         self.scheduler.add_job(
             self._intraday_sina, IntervalTrigger(minutes=5),
             id="intraday_sina", name="盘中新浪概念行情",
+        )
+
+        # 独立研究作业；不延长普通行情/交易时段，也不调用任何订单入口。
+        self.scheduler.add_job(
+            self._freeze_regular_close_research,
+            CronTrigger(hour=15, minute=1, day_of_week="mon-fri", timezone="Asia/Shanghai"),
+            id="after_hours_regular_baseline", name="15:00常规价格与量研究冻结",
+            coalesce=True, max_instances=1, misfire_grace_time=90,
+        )
+        for hour, minute, suffix in ((15, 35, "1535"), (20, 10, "2010")):
+            self.scheduler.add_job(
+                self._collect_after_hours_research,
+                CronTrigger(hour=hour, minute=minute, day_of_week="mon-fri", timezone="Asia/Shanghai"),
+                id=f"after_hours_research_{suffix}", name="盘后独立量额研究采证",
+                coalesce=True, max_instances=1, misfire_grace_time=120,
+            )
+
+        self.scheduler.add_job(
+            self._expire_after_hours_intents,
+            CronTrigger(hour="8,15,20", minute=31, day_of_week="mon-fri", timezone="Asia/Shanghai"),
+            id="after_hours_intent_expiry", name="盘后未成交人工意图失效（不撮合）",
+            coalesce=True, max_instances=1, misfire_grace_time=3600,
         )
 
         # === 收盘固化 (15:05)：先冻结全市场终值，再允许盘后预测 ===
@@ -933,7 +997,7 @@ class DataScheduler:
                 review_hour, review_minute = _review_schedule_time(configured_time, fallback)
                 self.scheduler.add_job(
                     self._review_snapshot_automation,
-                    CronTrigger(hour=review_hour, minute=review_minute, day_of_week="mon-fri"),
+                    CronTrigger(hour=review_hour, minute=review_minute, day_of_week="mon-fri", timezone="Asia/Shanghai"),
                     id=job_id,
                     name=f"{label}({review_hour:02d}:{review_minute:02d})",
                     kwargs={"phase": phase},
@@ -946,7 +1010,7 @@ class DataScheduler:
             )
             self.scheduler.add_job(
                 self._market_regime_automation,
-                CronTrigger(hour=regime_hour, minute=regime_minute, day_of_week="mon-fri"),
+                CronTrigger(hour=regime_hour, minute=regime_minute, day_of_week="mon-fri", timezone="Asia/Shanghai"),
                 id="market_regime_snapshot",
                 name=f"市场风格快照({regime_hour:02d}:{regime_minute:02d})",
                 coalesce=True,
@@ -958,7 +1022,7 @@ class DataScheduler:
         gpt_hour, gpt_minute = _review_schedule_time("20:40", (20, 40))
         self.scheduler.add_job(
             self._gpt_review_report,
-            CronTrigger(hour=gpt_hour, minute=gpt_minute, day_of_week="mon-fri"),
+            CronTrigger(hour=gpt_hour, minute=gpt_minute, day_of_week="mon-fri", timezone="Asia/Shanghai"),
             id="gpt_review_report",
             name=f"GPT复盘报告({gpt_hour:02d}:{gpt_minute:02d})",
             coalesce=True,
@@ -981,27 +1045,37 @@ class DataScheduler:
         # === 新闻消息面: 盘前/盘中/盘后分批采集，保证晚间和周末催化能进入首板路线 ===
         self.scheduler.add_job(
             self._news_raw_refresh,
-            CronTrigger(hour="7-11,13-14,16,19,20", minute=30, day_of_week="mon-fri"),
+            CronTrigger(hour="7-11,13-14,16,19,20", minute=30, day_of_week="mon-fri", timezone="Asia/Shanghai"),
             id="news_raw_refresh",
             name="新闻原始流刷新(盘前+盘中+盘后)",
+            coalesce=True, max_instances=1, misfire_grace_time=120,
         )
         self.scheduler.add_job(
             self._news_ai_refresh,
-            CronTrigger(hour="7-11,13-14,16,19,20", minute=35, day_of_week="mon-fri"),
+            CronTrigger(hour="7-11,13-14,16,19,20", minute=35, day_of_week="mon-fri", timezone="Asia/Shanghai"),
             id="news_ai_refresh",
             name="新闻AI精洗(盘前+盘中+盘后)",
+            coalesce=True, max_instances=1, misfire_grace_time=600,
         )
         self.scheduler.add_job(
             self._news_weekend_refresh,
-            CronTrigger(hour="9,13,20", minute=40, day_of_week="sat,sun"),
+            CronTrigger(hour="9,13,20", minute=40, day_of_week="sat,sun", timezone="Asia/Shanghai"),
             id="news_weekend_refresh",
             name="周末新闻补爬+精洗",
+            coalesce=True, max_instances=1, misfire_grace_time=300,
         )
         self.scheduler.add_job(
             self._news_weekend_refresh,
-            CronTrigger(hour=7, minute=10, day_of_week="mon"),
+            CronTrigger(hour=7, minute=10, day_of_week="mon", timezone="Asia/Shanghai"),
             id="news_monday_weekend_backfill",
             name="周末新闻周一盘前兜底",
+            coalesce=True, max_instances=1, misfire_grace_time=300,
+        )
+
+        self.scheduler.add_job(
+            self._news_premarket_recovery, IntervalTrigger(seconds=60),
+            id="news_premarket_recovery", name="盘前新闻有界漏跑恢复",
+            coalesce=True, max_instances=1, misfire_grace_time=30,
         )
 
         # === 每周末复校异动追高过滤阈值 (周六 21:00) ===
@@ -1067,7 +1141,7 @@ class DataScheduler:
         for hour, minute, suffix in ((15, 50, "1550"), (20, 45, "2045")):
             self.scheduler.add_job(
                 self._publish_paper_research,
-                CronTrigger(hour=hour, minute=minute, day_of_week="mon-fri"),
+                CronTrigger(hour=hour, minute=minute, day_of_week="mon-fri", timezone="Asia/Shanghai"),
                 id=f"paper_research_{suffix}", name=f"模拟盘只读研究归档({hour:02}:{minute:02})",
                 coalesce=True, max_instances=1, misfire_grace_time=900,
             )
@@ -1106,6 +1180,34 @@ class DataScheduler:
         )
         self._jobs_initialized = True
 
+    async def _recover_paper_notification_ingress(self, session) -> None:
+        """One bounded independent outbox attempt after the owner closed its DB.
+
+        Never commit/rollback business state here. No pending ingress is the normal
+        zero-I/O path; shutdown cancellation leaves the volatile handoff explicit.
+        """
+        if session is None or not isinstance(getattr(session, "info", None), dict):
+            return
+        from app.push.paper_buy_points import retry_failed_buy_points, _FAILED_INGRESS
+        if not session.info.get(_FAILED_INGRESS):
+            return
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            return
+        try:
+            # Do not hold the quote dispatcher indefinitely on notification DB
+            # contention. Reuse one existing notification poll interval as budget.
+            result = await asyncio.wait_for(
+                retry_failed_buy_points(session, session_factory=async_session),
+                timeout=max(0.1, float(settings.PAPER_BUY_POINT_PUSH_INTERVAL_SEC)),
+            )
+            logger.info("模拟买点入口补偿: {}", result)
+        except asyncio.TimeoutError:
+            logger.error("模拟买点入口补偿超时；尚未持久化条数={}",
+                         len(session.info.get(_FAILED_INGRESS, {})))
+        except Exception as exc:
+            logger.error("模拟买点入口补偿失败: error={}", type(exc).__name__)
+
     async def _run_paper_accounts_isolated(
         self,
         *,
@@ -1115,12 +1217,16 @@ class DataScheduler:
         log_all: bool = False,
         quote_payload: dict | None = None,
         include_position_risk: bool = True,
-    ) -> None:
-        """账户并发读取、独立提交；慢账户不再把后续账户拖到下一行情轮次。"""
+    ) -> dict:
+        """账户独立执行；保留逐账户隔离，但不将部分失败报告为整轮成功。"""
         from app.api.v1 import paper
+
+        failures: list[str] = []
+        receipts: dict[str, dict] = {}
 
         async def run_one(account_name: str) -> None:
             token = paper._QUOTE_ROUND_CONTEXT.set(quote_payload or {})
+            session = None
             try:
                 async with async_session() as session:
                     try:
@@ -1136,6 +1242,15 @@ class DataScheduler:
                     except Exception:
                         await session.rollback()
                         raise
+                if not isinstance(result, dict) or not isinstance(result.get("summary"), dict):
+                    raise RuntimeError("主账户缺少完整扫描回执")
+                receipts[account_name] = {
+                    "account_name": account_name, "status": "completed",
+                    "run_id": result.get("run_id"),
+                    "quote_round_id": str((quote_payload or {}).get("round_id") or ""),
+                    "source_scan_status": str(result["summary"].get("source_scan_status") or "unknown"),
+                    "source_scan_issues": result["summary"].get("source_scan_issues") or [],
+                }
                 summary = result.get("summary") or {}
                 if log_all or summary.get("executed") or summary.get("blocked"):
                     logger.info(
@@ -1143,14 +1258,177 @@ class DataScheduler:
                         f"run_id={result.get('run_id')}, account={account_name}, summary={summary}"
                     )
             except Exception:
+                failures.append(account_name)
+                receipts[account_name] = {"account_name": account_name, "status": "failed"}
                 logger.exception(
                     "模拟盘账户执行失败，其他账户继续: "
                     f"account={account_name}, trigger={trigger}, mode={execution_mode}"
                 )
             finally:
                 paper._QUOTE_ROUND_CONTEXT.reset(token)
+                await self._recover_paper_notification_ingress(session)
 
         await asyncio.gather(*(run_one(name) for name in paper.PAPER_SCAN_ACCOUNTS))
+        return {"status": "failed" if failures else "completed", "failed_accounts": failures,
+                "accounts": [receipts[name] for name in paper.PAPER_SCAN_ACCOUNTS if name in receipts]}
+
+    async def _paper_risk_account_names(self) -> tuple[str, ...]:
+        """Keep a created shared wallet under protection even when entry is off."""
+        from app.api.v1 import paper
+        from app.models.paper import PaperAccount
+        from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT, portfolio_active
+
+        names = (*paper.PAPER_ALL_ACCOUNTS, *paper.PAPER_CHALLENGER_ACCOUNTS)
+        if portfolio_active(datetime.now()):
+            return (*names, PORTFOLIO_ACCOUNT)
+        async with async_session() as session:
+            identity = await session.scalar(select(PaperAccount.id).where(
+                PaperAccount.account_name == PORTFOLIO_ACCOUNT,
+                PaperAccount.status == "active",
+            ).limit(1))
+        return (*names, PORTFOLIO_ACCOUNT) if type(identity) is int else names
+
+    async def _run_shared_portfolio_isolated(self, payload, primary, connected) -> dict:
+        """Same owner for event consumer and watchdog; no guessed source receipts."""
+        from app.api.v1 import paper
+        from app.paper.portfolio import run_shared_portfolio
+        from app.paper.portfolio_contract import portfolio_active
+
+        if not portfolio_active(datetime.now()):
+            return {"status": "completed", "allocation_status": "disabled", "allocated": 0}
+        source_receipts = {}
+        for result, field in ((primary, "accounts"), (connected, "challenger_accounts")):
+            if not isinstance(result, dict):
+                continue
+            for row in result.get(field) or []:
+                if isinstance(row, dict) and isinstance(row.get("account_name"), str):
+                    name = row["account_name"]
+                    if name in source_receipts:
+                        source_receipts[name] = {"status": "ambiguous"}
+                    else:
+                        source_receipts[name] = {
+                            "status": row.get("status"),
+                            "quote_round_id": row.get("quote_round_id"),
+                            "source_scan_status": row.get("source_scan_status"),
+                        }
+        dispatch_failures = [
+            {"dispatch": label, "status": result.get("status") if isinstance(result, dict) else "missing"}
+            for label, result in (("primary", primary), ("connected", connected))
+            if not isinstance(result, dict) or result.get("status") != "completed"
+        ]
+        token = paper._QUOTE_ROUND_CONTEXT.set(payload)
+        try:
+            async with async_session() as session:
+                try:
+                    receipt = await run_shared_portfolio(
+                        session, source_receipts=source_receipts,
+                        allow_entries=True, manage_positions=False,
+                    )
+                except BaseException:
+                    await session.rollback()
+                    raise
+            if dispatch_failures:
+                receipt = {**receipt, "status": "degraded", "dispatch_failures": dispatch_failures}
+            logger.info("Shared portfolio dispatch receipt: {}", receipt)
+            return receipt
+        finally:
+            paper._QUOTE_ROUND_CONTEXT.reset(token)
+
+    @staticmethod
+    def _require_paper_dispatch_success(*results) -> None:
+        # A missing/partial receipt is not proof of completion. These internal
+        # trading owners must report success explicitly, even if a nested error
+        # has already been logged and isolated from other accounts.
+        failures = [result for result in results
+                    if not isinstance(result, dict) or result.get("status") != "completed"]
+        if failures:
+            raise RuntimeError("模拟盘派发部分失败，保留下一新鲜轮次复验: " + str(failures))
+
+    @staticmethod
+    def _sqlite_write_busy(exc) -> bool:
+        original = exc.orig if isinstance(exc, OperationalError) else None
+        code = getattr(original, "sqlite_errorcode", None)
+        return isinstance(original, sqlite3.OperationalError) and (
+            (isinstance(code, int) and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
+            or str(original) in ("database is locked", "database table is locked")
+        )
+
+    async def _run_challenger_accounts_isolated(self, payload: dict) -> dict:
+        """Each connected account owns its session and at most one busy retry."""
+        from app.api.v1 import paper
+        from app.paper.strategy_iteration_challenger import run_strategy_iteration_challenger_accounts
+        from app.trading.paper_authorization import paper_execution_requires_reconciliation
+
+        outcomes = []
+        failures = []
+        # Preserve configured account order; within-route candidate ranking stays
+        # in the existing executor. Never fan out concurrent SQLite writers here.
+        for account_name in paper.PAPER_CHALLENGER_ACCOUNT_BY_ROUTE.values():
+            for attempt in (1, 2):
+                session = None
+                uncertain_execution = False
+                cancellation = None
+                token = paper._QUOTE_ROUND_CONTEXT.set(payload)
+                try:
+                    if attempt > 1:
+                        collected = local_clock(payload.get("committed_at"))
+                        retry_at = local_clock(datetime.now())
+                        if (collected is None or retry_at is None
+                                or not 0 <= (retry_at - collected).total_seconds()
+                                <= settings.PAPER_EXECUTION_QUOTE_MAX_AGE_SEC):
+                            raise RuntimeError("次账户故障复验轮次已过期，不刷新决策时钟")
+                    async with async_session() as session:
+                        try:
+                            result = await run_strategy_iteration_challenger_accounts(
+                                session, now=payload["committed_at"], account_name=account_name,
+                            )
+                            if (not isinstance(result, dict)
+                                    or result.get("status") not in {"completed", "skipped"}
+                                    or result.get("failed_accounts")):
+                                raise RuntimeError("次账户缺少有效完成/政策跳过回执")
+                        except BaseException as exc:
+                            # Preserve uncertainty even if rollback/close raises
+                            # a different SQLite error during cleanup.
+                            uncertain_execution = paper_execution_requires_reconciliation(exc)
+                            if isinstance(exc, asyncio.CancelledError):
+                                cancellation = exc
+                            await session.rollback()
+                            raise
+                    outcome = {"account_name": account_name, "status": result["status"],
+                               "attempts": attempt, "quote_round_id": str(payload.get("round_id") or "")}
+                    if result["status"] == "skipped":
+                        outcome["reason"] = result.get("reason") or "policy_skip"
+                    outcomes.append(outcome)
+                    logger.info("Challenger account dispatch receipt: {}", outcome)
+                    if result.get("entries") or result.get("sells") or result.get("blocked"):
+                        logger.info("隔离Challenger模拟账户执行: account={} result={}", account_name, result)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if cancellation is not None:
+                        # Cleanup failure must never turn shutdown into a new
+                        # trading attempt, even when the secondary error is busy.
+                        raise cancellation from exc
+                    busy = self._sqlite_write_busy(exc)
+                    uncertain = uncertain_execution or paper_execution_requires_reconciliation(exc)
+                    if busy and not uncertain and attempt == 1:
+                        logger.warning("次账户SQLite争用，已回滚并将更换会话复验一次: account={}", account_name)
+                        continue
+                    failures.append(account_name)
+                    outcome = {"account_name": account_name, "status": "failed", "attempts": attempt,
+                               "error_type": type(exc).__name__, "sqlite_busy": busy,
+                               "execution_requires_reconciliation": uncertain}
+                    outcomes.append(outcome)
+                    logger.exception("次账户执行失败，其他独立账户继续: {}", outcome)
+                    break
+                finally:
+                    paper._QUOTE_ROUND_CONTEXT.reset(token)
+                    if session is not None:
+                        await self._recover_paper_notification_ingress(session)
+        # completed means dispatch acknowledged, NOT that a skipped account traded.
+        return {"status": "failed" if failures else "completed",
+                "failed_accounts": failures, "accounts": outcomes}
 
     async def _latest_healthy_quote_payload(self) -> dict | None:
         """watchdog复用公共不可变轮次加载器，避免API/调度器出现两套口径。"""
@@ -1173,7 +1451,7 @@ class DataScheduler:
         token = paper._QUOTE_ROUND_CONTEXT.set({})
         try:
             # Sequential short transactions avoid twelve concurrent SQLite writers.
-            for account_name in (*paper.PAPER_ALL_ACCOUNTS, *paper.PAPER_CHALLENGER_ACCOUNTS):
+            for account_name in await self._paper_risk_account_names():
                 async with async_session() as session:
                     await paper.expire_pending_paper_buys(
                         session, account_name=account_name, now=now)
@@ -1184,7 +1462,7 @@ class DataScheduler:
         """60秒故障兜底；健康 QuoteRound 正常流动时绝不重复扫描/下单。"""
         logger.debug("模拟盘行情事件 watchdog 触发")
         now = datetime.now()
-        if self._last_quote_round_processed_at:
+        if self._last_quote_round_processed_at and not self._paper_dispatch_incomplete:
             event_age = (now - self._last_quote_round_processed_at).total_seconds()
             if event_age <= max(60, int(settings.PAPER_INTRADAY_AUTO_INTERVAL_SEC) + 5):
                 logger.debug(f"模拟盘watchdog跳过: 行情轮次消费者{event_age:.0f}s前正常完成")
@@ -1192,7 +1470,7 @@ class DataScheduler:
         if self._quote_dispatch_lock.locked():
             logger.debug("模拟盘watchdog跳过: 行情轮次消费者仍在处理")
             return
-        if self._paper_auto_trading_last_run_at:
+        if self._paper_auto_trading_last_run_at and not self._paper_dispatch_incomplete:
             elapsed_since_last = (datetime.now() - self._paper_auto_trading_last_run_at).total_seconds()
             if elapsed_since_last < max(10, settings.PAPER_INTRADAY_AUTO_INTERVAL_SEC - 1):
                 logger.debug(f"模拟盘盘中自动执行跳过: 距上次完成仅{elapsed_since_last:.0f}s")
@@ -1219,7 +1497,7 @@ class DataScheduler:
         self._paper_auto_trading_started_at = datetime.now()
         try:
             async with self._quote_dispatch_lock:
-                if self._last_quote_round_processed_at:
+                if self._last_quote_round_processed_at and not self._paper_dispatch_incomplete:
                     locked_age = (
                         datetime.now() - self._last_quote_round_processed_at
                     ).total_seconds()
@@ -1236,22 +1514,48 @@ class DataScheduler:
                     logger.warning("模拟盘watchdog未找到仍新鲜的完整QuoteRound，仅执行买单过期清理")
                     await self._expire_pending_paper_buys(datetime.now())
                     return
-                await self._run_quote_round_position_risk(quote_payload)
-                await self._run_paper_accounts_isolated(
+                current_round_id = str(quote_payload.get("round_id") or "")
+                if current_round_id and current_round_id == self._last_quote_round_processed_id:
+                    # 时间去抖已过也不能重放同轮交易；A2待提交证据仍可继续。
+                    evidence = await self._drain_momentum_quote_rounds(quote_payload)
+                    self._require_paper_dispatch_success(evidence)
+                    return
+                self._paper_dispatch_incomplete = True
+                try:
+                    await self._run_quote_round_position_risk(quote_payload)
+                except Exception:
+                    # 与主消费者一致：退出风控失败时仅采证，禁止新增开仓。
+                    await self._process_quote_round_shadow(
+                        quote_payload, execute_challengers=False,
+                    )
+                    raise
+                primary_result = await self._run_paper_accounts_isolated(
                     execute=True,
                     trigger="schedule-intraday-watchdog",
                     execution_mode="intraday",
                     quote_payload=quote_payload,
                     include_position_risk=False,
                 )
+                # A2/B2/C2/D2/F2必须同轮经原确认执行入口；E2已在主循环处理。
+                # 完整派发后才标记轮次，避免主消费者去重时跳过次账户。
+                connected_result = await self._process_quote_round_shadow(quote_payload)
+                portfolio_result = await self._run_shared_portfolio_isolated(
+                    quote_payload, primary_result, connected_result)
+                self._require_paper_dispatch_success(primary_result, connected_result, portfolio_result)
+                self._paper_dispatch_incomplete = False
                 completed_at = datetime.now()
                 self._paper_auto_trading_last_run_at = completed_at
                 self._last_quote_round_processed_at = completed_at
                 self._last_quote_round_processed_id = str(
                     quote_payload.get("round_id") or ""
                 ) or None
+                return {"status": "completed", "round_id": self._last_quote_round_processed_id}
         except Exception as e:
+            self._paper_dispatch_incomplete = True
             logger.error(f"模拟盘盘中自动执行失败: {e}")
+            # APScheduler must distinguish a caught business failure from an
+            # executed Python callback; keep the existing alert/grace contract.
+            return {"status": "failed", "error_type": type(e).__name__}
         finally:
             self._paper_auto_trading = False
             self._paper_auto_trading_started_at = None
@@ -1337,95 +1641,141 @@ class DataScheduler:
         except Exception:
             logger.exception("ABC3DF形态挑战者影子结算失败")
 
-    async def _news_raw_refresh(self):
-        """新闻原始流高频入库：覆盖个股、公告、宏观、全球财经和商品快讯."""
+    def _news_budget(self):
+        now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+        seconds = float(settings.NEWS_JOB_TIMEOUT_SEC)
+        if now.hour == 7:
+            end = now.replace(minute=settings.NEWS_PREMARKET_RECOVERY_END_MINUTE, second=0, microsecond=0)
+            seconds = min(seconds, (end - now).total_seconds())
+        return max(0.0, seconds)
+
+    def _news_result(self, phase, **value):
+        result = {**value, "completed_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+                  "receipt_scope": "current_process_handler_result_not_full_source_coverage"}
+        self._news_job_health[phase] = result
+        logger.info("新闻任务结果 [{}]: {}", phase, result)
+        return result
+
+    async def _news_raw_refresh(self, limit_per_source=100):
+        """Single raw owner shared by cron, recovery and weekend; keep true clocks."""
         if self._news_raw_refreshing:
-            logger.debug("新闻原始流刷新跳过: 上一轮仍在运行")
-            return
+            return {"status": "busy"}
+        budget = self._news_budget()
+        if budget <= 0:
+            return {"status": "blocked", "reason": "premarket_cutoff"}
         self._news_raw_refreshing = True
         try:
             from app.news.engine import news_engine
-
-            items = await news_engine.fetch_all(limit_per_source=100)
-            if not items:
-                logger.warning("新闻原始流刷新: 未获取到新闻")
-                return
-            items = sorted(
-                items,
-                key=lambda item: item.publish_time or datetime.min,
-                reverse=True,
-            )
-            async with async_session() as session:
-                saved = await news_engine.cache_raw_items(session, items, reset_dedup=True)
-            logger.info(f"新闻原始流刷新完成: fetched={len(items)} saved={saved}")
+            async with asyncio.timeout(budget):
+                items = await news_engine.fetch_all(limit_per_source=limit_per_source)
+                if not items:
+                    return self._news_result("raw", status="no_data", fetched=0, saved=0)
+                items.sort(key=lambda item: item.publish_time or datetime.min, reverse=True)
+                selected = len(news_engine._exact_items(items))
+                async with async_session() as session:
+                    saved = await news_engine.cache_raw_items(session, items, reset_dedup=True)
+                checks = news_engine.get_fetch_health()
+                healthy = bool(checks) and all(value.get("status") == "ok" for value in checks.values())
+                global_coverage = checks.get("global", {}).get("index_target_observation", {})
+                if global_coverage.get("missing_codes") or global_coverage.get("conflicting_codes") or global_coverage.get("truncated"):
+                    healthy = False
+                return self._news_result("raw", status="saved" if saved == selected and healthy else "partial",
+                                         fetched=len(items), selected=selected, saved=saved,
+                                         source_statuses={key: value.get("status") for key, value in checks.items()})
+        except asyncio.TimeoutError:
+            return self._news_result("raw", status="timeout", committed_raw_preserved=True)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.error(f"新闻原始流刷新失败: {exc}")
+            return self._news_result("raw", status="failed", error_type=type(exc).__name__)
         finally:
             self._news_raw_refreshing = False
 
     async def _news_ai_refresh(self):
-        """新闻AI精洗：覆盖盘前、盘中和盘后较新样本，生成利好利空、事件和影响映射."""
+        """Analyze already committed originals, with truthful NLP denominators."""
         if self._news_ai_refreshing:
-            logger.debug("新闻AI精洗跳过: 上一轮仍在运行")
-            return
+            return {"status": "busy"}
+        budget = self._news_budget()
+        if budget <= 0:
+            return {"status": "blocked", "reason": "premarket_cutoff"}
         self._news_ai_refreshing = True
+        raw_watermark = self._news_job_health.get("raw", {}).get("completed_at", "")
+        raw_running_at_start = self._news_raw_refreshing
         try:
             from app.news.engine import news_engine
-
-            items = await news_engine.fetch_all(limit_per_source=100)
-            items = sorted(
-                items,
-                key=lambda item: item.publish_time or datetime.min,
-                reverse=True,
-            )[:32]
-            if not items:
-                logger.warning("新闻AI精洗: 未获取到可处理新闻")
-                return
-            async with async_session() as session:
-                await news_engine.process_and_store(items, db_session=session, reset_dedup=True, concurrency=5)
-            logger.info(f"新闻AI精洗完成: processed={len(items)}")
+            from app.ai.provider import ai_provider
+            async with asyncio.timeout(budget):
+                async with async_session() as session:
+                    result = await news_engine.analyze_pending(session, limit=settings.NEWS_AI_BATCH_SIZE,
+                                                               concurrency=5)
+                return self._news_result("ai", **result, provider_runtime=ai_provider.runtime_status(),
+                                         consumed_raw_watermark=raw_watermark,
+                                         raw_was_running_at_start=raw_running_at_start)
+        except asyncio.TimeoutError:
+            return self._news_result("ai", status="timeout", committed_raw_preserved=True)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.error(f"新闻AI精洗失败: {exc}")
+            return self._news_result("ai", status="failed", error_type=type(exc).__name__)
         finally:
             self._news_ai_refreshing = False
 
     async def _news_weekend_refresh(self):
-        """周末新闻补爬和精洗，给周一消息催化首板留出提前量."""
         if self._news_weekend_refreshing:
-            logger.debug("周末新闻补爬跳过: 上一轮仍在运行")
-            return
+            return {"status": "busy"}
         self._news_weekend_refreshing = True
         try:
-            from app.news.engine import news_engine
-
-            items = await news_engine.fetch_all(limit_per_source=160)
-            items = sorted(
-                items,
-                key=lambda item: item.publish_time or datetime.min,
-                reverse=True,
-            )
-            if not items:
-                logger.warning("周末新闻补爬: 未获取到新闻")
-                return
-
-            async with async_session() as session:
-                saved = await news_engine.cache_raw_items(session, items, reset_dedup=True)
-
-            process_items = items[:80]
-            async with async_session() as session:
-                processed = await news_engine.process_and_store(
-                    process_items,
-                    db_session=session,
-                    reset_dedup=True,
-                    concurrency=5,
-                )
-            logger.info(
-                f"周末新闻补爬完成: fetched={len(items)} saved={saved} analyzed={len(processed)}"
-            )
-        except Exception as exc:
-            logger.error(f"周末新闻补爬失败: {exc}")
+            raw = await self._news_raw_refresh(limit_per_source=160)
+            ai = await self._news_ai_refresh() if raw.get("status") in {"saved", "partial"} else {"status": "skipped"}
+            return {"status": "analyzed" if ai.get("status") == "analyzed" else "partial",
+                    "raw": raw, "ai": ai}
         finally:
             self._news_weekend_refreshing = False
+
+    async def _news_premarket_recovery(self):
+        """No replay after deadline; attempts/cooldown are explicitly process-local."""
+        if not settings.NEWS_PREMARKET_RECOVERY_ENABLED:
+            return {"status": "disabled"}
+        now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+        end = now.replace(hour=7, minute=settings.NEWS_PREMARKET_RECOVERY_END_MINUTE, second=0, microsecond=0)
+        if not now.replace(hour=7, minute=31, second=0, microsecond=0) <= now < end:
+            return {"status": "outside_window"}
+        async with asyncio.timeout(min(self._news_budget(), 5)):
+            from app.models.governance import TradeCalendarModel
+            async with async_session() as session:
+                open_day = await session.scalar(select(TradeCalendarModel.is_trade_day)
+                                                .where(TradeCalendarModel.trade_date == now.date()))
+        if open_day is not True:
+            return {"status": "blocked", "reason": "non_trading_day_or_calendar_unknown"}
+        if self._news_recovery_day != now.date():
+            self._news_recovery_day = now.date()
+            self._news_recovery_attempts = {"raw": 0, "ai": 0}
+            self._news_recovery_last_tick = {"raw": 0.0, "ai": 0.0}
+        results = {}
+        for phase, method in (("raw", self._news_raw_refresh), ("ai", self._news_ai_refresh)):
+            current = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+            if current.date() != now.date() or current >= end:
+                break
+            if phase == "ai" and current.minute < 35:
+                continue
+            last = self._news_job_health.get(phase, {})
+            succeeded_today = last.get("completed_at", "")[:10] == now.date().isoformat() and last.get("status") in (
+                {"saved"} if phase == "raw" else {"analyzed", "no_pending"})
+            if succeeded_today and (phase == "raw" or (
+                    not last.get("raw_was_running_at_start", False) and last.get("consumed_raw_watermark", "")
+                    == self._news_job_health.get("raw", {}).get("completed_at", ""))):
+                continue
+            tick = _time.monotonic()
+            if (self._news_recovery_attempts[phase] >= settings.NEWS_PREMARKET_RECOVERY_ATTEMPTS
+                    or tick - self._news_recovery_last_tick[phase] < settings.NEWS_PREMARKET_RECOVERY_COOLDOWN_SEC):
+                continue
+            if (self._news_raw_refreshing if phase == "raw" else self._news_ai_refreshing):
+                continue
+            self._news_recovery_attempts[phase] += 1
+            self._news_recovery_last_tick[phase] = tick
+            results[phase] = await method()
+        return {"status": "checked", "results": results,
+                "scope": "current_process_attempts_no_historical_backdating"}
 
     def _record_promotion_runtime_audit(self, kind: str, status: str, **details) -> dict:
         """Bounded runtime view plus durable structured log; never a trading signal."""
@@ -1476,6 +1826,7 @@ class DataScheduler:
             await asyncio.sleep(15)
 
     def _on_scheduler_job_event(self, event) -> None:
+        self._record_after_hours_job_event(event)
         observation = self._pipeline_runtime_health.observe_job(event)
         if observation["status"] in {"error", "missed", "max_instances", "business_degraded"}:
             logger.warning("调度运行异常（不等同业务批次完成）: {}", observation)
@@ -1483,6 +1834,50 @@ class DataScheduler:
         if (observation["status"] == "missed"
                 and observation.get("job_id") in CRITICAL_WINDOW_JOB_IDS):
             self._record_critical_window_miss(observation)
+
+    def _record_after_hours_job_event(self, event) -> None:
+        """Only three research IDs; terminal event recording never launches a job."""
+        from app.data.after_hours import scheduler_event_receipt
+        from app.data.sources.after_hours_source import local_now
+        try:
+            record = scheduler_event_receipt(event, observed_at=local_now())
+            if record is None:
+                return
+            if len(self._after_hours_receipt_tasks) >= 16:
+                self._after_hours_receipt_health = {"status": "dropped", "reason": "pending_receipt_budget",
+                    "execution_authorized": False}
+                return
+            loop = asyncio.get_running_loop()
+        except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            self._after_hours_receipt_health = {"status": "unavailable",
+                "error_type": type(exc).__name__, "execution_authorized": False}
+            return
+        # record contains immutable strings/scalars, not aliases into event.retval.
+        task = loop.create_task(self._persist_after_hours_job_event(record))
+        self._after_hours_receipt_tasks.add(task)
+        task.add_done_callback(self._after_hours_receipt_tasks.discard)
+        self._after_hours_receipt_health = {"status": "pending", "execution_authorized": False}
+
+    async def _persist_after_hours_job_event(self, record) -> None:
+        from app.data.after_hours import append_scheduler_event_receipt
+        async def write():
+            async with async_session() as session:
+                outcome = await append_scheduler_event_receipt(session, record)
+                await session.commit()
+                return outcome
+        try:
+            outcome = await asyncio.wait_for(write(), timeout=5)
+            self._after_hours_receipt_health = {**outcome, "commit_ack_returned": True}
+        except asyncio.CancelledError:
+            self._after_hours_receipt_health = {"status": "unknown", "reason": "receipt_write_canceled",
+                "commit_ack_returned": False, "execution_authorized": False}
+            raise
+        except Exception as exc:
+            # Failure/timeout may be a lost commit ACK. No collection replay, row
+            # delete or retry; existing source observations remain untouched.
+            self._after_hours_receipt_health = {"status": "unknown", "error_type": type(exc).__name__,
+                "commit_ack_returned": False, "execution_authorized": False}
+            logger.warning("盘后调度事件留证未知（不重跑采集）: {}", type(exc).__name__)
 
     def _record_critical_window_miss(self, observation: dict) -> None:
         """把关键窗口的 missed 记进内存快照 + DataSourceHealth（持久）。
@@ -1554,6 +1949,8 @@ class DataScheduler:
                 and not self._promotion_news_refresh_task.done()
             ),
             "news_last_result": dict(self._promotion_news_last_result),
+            "news_scheduled_jobs": {key: dict(value) for key, value in self._news_job_health.items()},
+            "news_recovery_scope": "bounded_current_process_not_persistent_exactly_once",
             "news_source_checks": {
                 code: {
                     **observation,
@@ -1576,6 +1973,8 @@ class DataScheduler:
                 "status_counts": dict(self._sentiment_fund_health.get("status_counts", {})),
             },
             "index_history": dict(self._index_history_runtime),
+            "after_hours_research": dict(self._after_hours_research_health),
+            "after_hours_scheduler_receipt": dict(self._after_hours_receipt_health),
             "kline_observations": {
                 **self._kline_observation_health,
                 "dispositions": dict(self._kline_observation_health.get("dispositions", {})),
@@ -1586,6 +1985,13 @@ class DataScheduler:
             "kline_price_chain": {
                 **self._kline_price_chain_health,
                 "examples": [dict(row) for row in self._kline_price_chain_health.get("examples", [])],
+            },
+            "candidate_shadow": self._candidate_shadow_health(),
+            "quote_consumer": {
+                **self._quote_consumer_health,
+                "stages_ms": dict(self._quote_consumer_health.get("stages_ms", {})),
+                "scope": "latest_event_consumer_attempt_current_process_only",
+                "commit_clock_available": False,
             },
             "paper_position_risk": {
                 **self._paper_position_risk_health,
@@ -1964,6 +2370,130 @@ class DataScheduler:
     # =========================================================================
 
     async def _update_stock_status(self):
+        """Positive risks first; independently verify explicit dated resumption evidence."""
+        if self._stock_status_refreshing:
+            return {"status": "skipped", "reason": "stock_status_in_progress"}
+        self._stock_status_refreshing = True
+        try:
+            result = await self._merge_stock_risks()
+            if result.get("positive_merge_status") == "ok":
+                verified = await self._refresh_verified_trading_status(
+                    blocked_codes=set(result.get("suspended_codes", [])))
+                result["trading_status_verification"] = verified
+                result["automatic_clear_count"] = verified.get("automatic_clear_count", 0)
+                if result["automatic_clear_count"]:
+                    result["removal_policy"] = "explicit_dated_auto_suspension_only"
+            return result
+        finally:
+            self._stock_status_refreshing = False
+
+    async def _refresh_verified_trading_status(self, *, blocked_codes=frozenset()):
+        """No inference from list absence; atomic audited changes after source I/O."""
+        from app.data.sources.wencai_stream_source import parse_dated_trading_status
+        from app.models.governance import DataWatermark, DataWatermarkRevision
+        from app.core.prediction_data_quality import _watermark_revision
+
+        started_at = datetime.now()
+        today = started_at.date()
+        query = f"全部A股 {today:%Y年%m月%d日}交易状态"
+        dataset = "stock_trading_status"
+        try:
+            if await trade_calendar.is_trade_day() is not True:
+                return {"status": "blocked", "reason": "交易日未明确确认"}
+            # Close the read transaction BEFORE network I/O; compare again under writer lock.
+            async with async_session() as session:
+                tags = {t.code: t for t in (await session.scalars(
+                    select(StockTag).where(StockTag.is_suspended.is_(True)))).all()}
+                bans = {b.code: b for b in (await session.scalars(
+                    select(StockBlacklist).where(StockBlacklist.code.in_(tags)))).all()} if tags else {}
+                baseline = {code: stock_tagger.risk_fingerprint(tag, bans.get(code))
+                            for code, tag in tags.items() if tag.is_suspended}
+            timeout = max(1, min(60, float(settings.LIMIT_POOL_WENCAI_WAIT_SEC)))
+            frame = await asyncio.wait_for(
+                WencaiStreamSource().query_async(query, perpage=10000), timeout=timeout,
+            )
+            received_at = datetime.now()
+            states = parse_dated_trading_status(frame, today)
+            if received_at.date() != today or received_at < started_at:
+                raise ValueError("trading-status response crossed date or clock regressed")
+            transitions, held = [], {}
+            async with async_session() as session:
+                try:
+                    if session.bind.dialect.name == "sqlite":
+                        await session.execute(sa_text("BEGIN IMMEDIATE"))
+                    latest = await session.scalar(select(DataWatermark).where(
+                        DataWatermark.dataset == dataset,
+                        DataWatermark.trade_date == today,
+                    ).with_for_update())
+                    if latest is not None and latest.observed_at >= started_at:
+                        raise ValueError("newer trading-status observation already committed")
+                    now = datetime.now()
+                    if (now.date() != today or now < received_at
+                            or (now - started_at).total_seconds() > timeout):
+                        raise ValueError("trading-status commit crossed date, expired or clock regressed")
+                    tags = {t.code: t for t in (await session.scalars(
+                        select(StockTag).where(StockTag.code.in_(baseline)).with_for_update()
+                    )).all()} if baseline else {}
+                    bans = {b.code: b for b in (await session.scalars(
+                        select(StockBlacklist).where(StockBlacklist.code.in_(baseline)).with_for_update()
+                    )).all()} if baseline else {}
+                    for code, before in baseline.items():
+                        if code in blocked_codes:
+                            held[code] = "positive_halt_evidence_in_same_refresh"
+                            continue
+                        tag, ban = tags.get(code), bans.get(code)
+                        if stock_tagger.risk_fingerprint(tag, ban) != before:
+                            held[code] = "risk_changed_during_fetch"
+                            continue
+                        evidence = states.get(code, {})
+                        outcome = await stock_tagger.clear_verified_auto_suspension(
+                            session, tag, ban, evidence=evidence, trade_date=today, observed_at=now)
+                        if outcome == "auto_suspension_cleared":
+                            transitions.append({"code": code, "before": before,
+                                "after": stock_tagger.risk_fingerprint(tag, None), "evidence": evidence})
+                        else:
+                            held[code] = outcome
+                    known = sum(s["state"] != "unknown" for s in states.values())
+                    details = {"version": "explicit_dated_trading_status_v1", "query": query,
+                        "requested_at": started_at.isoformat(), "received_at": received_at.isoformat(),
+                        "provider_timestamp": None, "clock_basis": "local_response_observation",
+                        "effective_at": now.isoformat(), "basis": "current_projection_not_historical_pit",
+                        "evidence": states, "transitions": transitions, "held": held,
+                        "execution_authorized": False}
+                    values = dict(dataset=dataset, trade_date=today, observed_at=received_at,
+                        max_available_at=received_at, record_count=known, expected_count=len(states),
+                        completeness=known / len(states),
+                        status="ok" if known == len(states) else "degraded",
+                        details_json=json.dumps(details, ensure_ascii=False, separators=(",", ":")))
+                    if latest is not None:
+                        session.add(_watermark_revision(latest))
+                        for key, value in values.items():
+                            setattr(latest, key, value)
+                    else:
+                        session.add(DataWatermark(**values))
+                    # Retain this successful transition immediately, including the very first one.
+                    session.add(DataWatermarkRevision(**values, replaced_at=now,
+                                                       replacement_kind="status_observed"))
+                    session.add(DataSourceHealth(
+                        source="pywencai", api_name=dataset, status="up", last_success=now,
+                        fail_streak=0, latency_ms=int((now - started_at).total_seconds() * 1000),
+                        completeness=known / len(states),
+                    ))
+                    await session.commit()
+                except BaseException:
+                    await session.rollback()
+                    raise
+            logger.info(f"逐股交易状态核验 {known}/{len(states)}；解除旧自动停牌{len(transitions)}只")
+            return {"status": values["status"], "record_count": len(states), "known_count": known,
+                    "automatic_clear_count": len(transitions),
+                    "cleared_codes": [t["code"] for t in transitions], "held": held}
+        except Exception as exc:
+            logger.warning(f"逐股交易状态核验失败，保留既有风险: {exc}")
+            async with async_session() as session:
+                await data_quality_guard.record_failure(session, "pywencai", dataset, str(exc))
+            return {"status": "failed", "reason": str(exc), "automatic_clear_count": 0}
+
+    async def _merge_stock_risks(self):
         """只合并问财正向风险；列表缺席不是摘帽/复牌/退市风险解除证据。"""
         if await trade_calendar.is_trade_day() is not True:
             return {"status": "blocked", "reason": "交易日未明确确认"}
@@ -2072,6 +2602,7 @@ class DataScheduler:
                 result = {
                     "status": "degraded", "positive_merge_status": "ok",
                     "record_count": len(all_codes), "empty_queries": empty_queries,
+                    "suspended_codes": sorted(suspended_map),
                     "removal_policy": "positive_only_no_automatic_clear",
                     "coverage_verified": False, "automatic_clear_count": 0,
                     "delisting_evidence": "risk_warning_not_delisted_fact",
@@ -2410,165 +2941,66 @@ class DataScheduler:
             await session.commit()
             logger.info(f"📊 盘前数据准备完成, 耗时{_time.monotonic()-t0:.1f}s")
 
-    async def _intraday_fast(self):
-        """盘中快频 — 东财涨停/跌停/炸板 并行采集+批量写入
-
-        优化: 3个API asyncio.gather并行(从串行6s→并行2s) + 批量upsert
-        频率: 10秒/次, 端到端延时≈3秒
-        """
-        if not await trade_calendar.is_trading_hours():
-            return
-
-        t_total = _time.monotonic()
-        em = self._sources["eastmoney"]
-        today = date.today()
-        today_str = today.strftime("%Y%m%d")
-
-        # ===== 并行采集3个池 =====
-        df_limit_up = pd.DataFrame()
-        df_limit_down = pd.DataFrame()
-        df_broken = pd.DataFrame()
-        limit_structure_changed = False
-        current_limit_up_codes: set[str] | None = None
-
+    async def _intraday_fast(self, *, force: bool = False):
+        """问财低频元数据补充；涨跌停状态由已有腾讯行情轮次负责。"""
+        if not force and not await trade_calendar.is_trading_hours():
+            return {"status": "skipped"}
+        if not await trade_calendar.is_trade_day():
+            return {"status": "skipped", "reason": "non_trade_day"}
+        if self._limit_detail_refreshing:
+            return {"status": "skipped", "reason": "previous_running"}
+        self._limit_detail_refreshing = True
         try:
-            df_limit_up, df_limit_down, df_broken = await asyncio.gather(
-                em.get_limit_up_pool(today_str),
-                em.get_limit_down_pool(today_str),
-                em.get_broken_limit_pool(today_str),
-                return_exceptions=True,
+            # Preserve one underlying SSE/executor request across caller timeout.
+            # No DB transaction is held while the endpoint is running.
+            if self._limit_detail_task is None:
+                async def fetch_details():
+                    requested_at = datetime.now()
+                    day = requested_at.strftime("%Y年%m月%d日")
+                    # “涨停原因”是可选展示字段，问财却将问句中的它解释为
+                    # 存在性筛选：新涨停尚无原因时会整行漏掉，连带丢失已有的
+                    # 连板数并阻断全市场情绪。只查询必需字段；响应附带的原因
+                    # 仍由原解析器保留，未发布原因保持 None，不影响质量门。
+                    frame = await WencaiStreamSource().query_async(
+                        f"{day}涨停 连续涨停天数 首次涨停时间 涨停开板次数 涨停封单额",
+                        perpage=1000,
+                    )
+                    return requested_at, frame, datetime.now()
+                self._limit_detail_task = asyncio.create_task(fetch_details())
+                self._limit_detail_task.add_done_callback(
+                    lambda done: None if done.cancelled() else done.exception())
+            requested_at, frame, observed_at = await asyncio.wait_for(
+                asyncio.shield(self._limit_detail_task), timeout=settings.LIMIT_POOL_WENCAI_WAIT_SEC,
             )
-        except Exception as e:
-            logger.error(f"盘中快频并行采集异常: {e}")
-            return
-
-        fetch_ms = int((_time.monotonic() - t_total) * 1000)
-
-        async with async_session() as session:
-            try:
-                # ---- 1. 涨停池 批量写入 ----
-                # 有效的空 DataFrame 也是一份“当前为空”的完整快照，必须清退旧记录；
-                # 只有采集异常（return_exceptions 返回的 Exception）才保留上一帧。
-                if isinstance(df_limit_up, pd.DataFrame):
-                    limit_up_records = self._parse_limit_up_df(
-                        df_limit_up, today, source="eastmoney"
-                    )
-                    if limit_up_records:
-                        await self._batch_upsert(
-                            session, LimitUpPool, limit_up_records,
-                            unique_cols=["code", "trade_date"],
-                            update_cols=["name", "limit_up_time", "limit_up_price",
-                                         "seal_amount", "break_count", "consecutive_days",
-                                         "limit_up_reason", "turnover", "source"],
-                        )
-
-                    # 东财涨停池是“当前仍封板”快照：凡不在本帧中的东财旧记录均清退。
-                    alive_codes = {r["code"] for r in limit_up_records}
-                    if (
-                        self._last_intraday_limit_up_codes is None
-                        or alive_codes != self._last_intraday_limit_up_codes
-                    ):
-                        limit_structure_changed = True
-                    current_limit_up_codes = alive_codes
-                    stale_result = await session.execute(
-                        select(LimitUpPool.id, LimitUpPool.code).where(
-                            LimitUpPool.trade_date == today,
-                            LimitUpPool.source == "eastmoney",
-                        )
-                    )
-                    deleted_codes = []
-                    for sid, scode in stale_result.all():
-                        if scode not in alive_codes:
-                            await session.execute(
-                                delete(LimitUpPool).where(LimitUpPool.id == sid)
-                            )
-                            deleted_codes.append(scode)
-                    if deleted_codes:
-                        logger.info(f"清退非当前封板股票: {deleted_codes}")
-
-                    await data_quality_guard.record_success(
-                        session, "eastmoney", "limit_up",
-                        latency_ms=fetch_ms, record_count=len(limit_up_records),
-                    )
-
-                # ---- 2. 跌停池 批量写入 ----
-                if isinstance(df_limit_down, pd.DataFrame) and len(df_limit_down) > 0:
-                    records = self._parse_limit_down_df(df_limit_down, today, source="eastmoney")
-                    if records:
-                        await self._batch_upsert(
-                            session, LimitDownPool, records,
-                            unique_cols=["code", "trade_date"],
-                            update_cols=["name", "limit_down_time", "break_count",
-                                         "consecutive_days", "reason", "source"],
-                        )
-                    await data_quality_guard.record_success(
-                        session, "eastmoney", "limit_down",
-                        latency_ms=fetch_ms, record_count=len(records),
-                    )
-
-                # ---- 3. 炸板池 批量写入 ----
-                if isinstance(df_broken, pd.DataFrame):
-                    broken_records = self._parse_broken_limit_df(
-                        df_broken, today, source="eastmoney"
-                    )
-
-                    # 最终状态口径：当前仍在涨停池的股票不能同时出现在炸板池。
-                    # 若本轮涨停池采集失败，则不凭不完整信息清理交集。
-                    if current_limit_up_codes is not None:
-                        broken_records = [
-                            row for row in broken_records
-                            if row["code"] not in current_limit_up_codes
-                        ]
-                        if current_limit_up_codes:
-                            await session.execute(
-                                delete(BrokenLimitPool).where(
-                                    BrokenLimitPool.trade_date == today,
-                                    BrokenLimitPool.code.in_(current_limit_up_codes),
-                                )
-                            )
-
-                    if broken_records:
-                        await self._batch_upsert(
-                            session, BrokenLimitPool, broken_records,
-                            unique_cols=["code", "trade_date"],
-                            update_cols=["name", "limit_up_time", "break_time",
-                                         "seal_duration", "seal_amount", "source",
-                                         "limit_up_price", "close_price",
-                                         "close_at_limit", "final_state"],
-                        )
-
-                    # 炸板池同样是完整当前快照：清退不在本帧内的东财旧记录。
-                    current_broken_codes = {row["code"] for row in broken_records}
-                    stale_broken_result = await session.execute(
-                        select(BrokenLimitPool.id, BrokenLimitPool.code).where(
-                            BrokenLimitPool.trade_date == today,
-                            BrokenLimitPool.source == "eastmoney",
-                        )
-                    )
-                    for broken_id, broken_code in stale_broken_result.all():
-                        if broken_code not in current_broken_codes:
-                            await session.execute(
-                                delete(BrokenLimitPool).where(
-                                    BrokenLimitPool.id == broken_id
-                                )
-                            )
-
-                    await data_quality_guard.record_success(
-                        session, "eastmoney", "broken_limit",
-                        latency_ms=fetch_ms, record_count=len(broken_records),
-                    )
-
+            from app.data.limit_pool_source import parse_wencai_limit_details
+            from app.data.limit_pool import supplement_wencai_limit_details
+            details = parse_wencai_limit_details(frame, requested_at.date())
+            if observed_at.date() != datetime.now().date():
+                raise ValueError("wencai response is not from today")
+            async with async_session() as session:
+                updated = await supplement_wencai_limit_details(
+                    session, details, requested_at=requested_at, observed_at=observed_at,
+                )
+                await data_quality_guard.record_success(
+                    session, "pywencai", "limit_up_details",
+                    record_count=updated, expected_count=len(details),
+                    latency_ms=int((observed_at - requested_at).total_seconds() * 1000),
+                )
                 await session.commit()
-                total_ms = int((_time.monotonic() - t_total) * 1000)
-                logger.debug(f"盘中快频完成: 采集{fetch_ms}ms+写入{total_ms-fetch_ms}ms={total_ms}ms")
-                if current_limit_up_codes is not None:
-                    self._last_intraday_limit_up_codes = current_limit_up_codes
-                if limit_structure_changed:
-                    self._request_anomaly_scan("eastmoney_limit_structure")
-
-            except Exception as e:
-                logger.error(f"盘中快频写入失败: {e}")
-                await session.rollback()
+            return {"status": "ok", "updated": updated, "returned": len(details)}
+        except Exception as exc:
+            # Do not leak upstream auth material through exception text.
+            logger.warning(f"问财涨停字段补充失败: {type(exc).__name__}")
+            async with async_session() as session:
+                await data_quality_guard.record_failure(
+                    session, "pywencai", "limit_up_details", type(exc).__name__,
+                )
+                await session.commit()
+            return {"status": "failed", "error_type": type(exc).__name__}
+        finally:
+            if self._limit_detail_task is not None and self._limit_detail_task.done():
+                self._limit_detail_task = None
+            self._limit_detail_refreshing = False
 
     async def _collect_concept_fund_flow_bounded(self):
         """Keep one legacy AkShare call alive without holding up individual funds.
@@ -3032,7 +3464,8 @@ class DataScheduler:
                 ld_count = len(limit_downs)
                 bl_count = len(broken_limits)
                 seal_rate = round(lu_count / (lu_count + bl_count) * 100, 1) if (lu_count + bl_count) > 0 else 0
-                board_height = max([lu.consecutive_days or 1 for lu in limit_ups], default=0)
+                board_height = (None if any(lu.consecutive_days is None for lu in limit_ups)
+                                else max([lu.consecutive_days for lu in limit_ups], default=0))
                 # No qualified rows means unknown, not a measured market net zero.
                 main_net_inflow = round(sum(main_flows) / 1e8, 2) if main_flows else None
                 if breadth_sample_count >= 500:
@@ -3110,6 +3543,17 @@ class DataScheduler:
                     turnover_total=turnover_total,
                     fund_flow_coverage=fund_flow_coverage,
                 )
+                from app.data.limit_pool import limit_pool_health
+                pool_quality = await limit_pool_health(
+                    session, trade_date=today, decision_at=datetime.now(),
+                    require_close=datetime.now().time() >= time(15, 0),
+                )
+                if pool_quality is not None and not pool_quality["ready"]:
+                    sentiment_state.update(
+                        score=0.0, cycle="divergence", quality_status="degraded",
+                        quality_completeness=0.0,
+                        quality_reason=str(sentiment_state["quality_reason"]) + ";涨跌停状态或问财字段不完整",
+                    )
                 sentiment_cycle = str(sentiment_state["cycle"])
 
                 sentiment_record = {
@@ -3219,11 +3663,11 @@ class DataScheduler:
     async def _auction_collect(self, force: bool = False, auction_time: str | None = None):
         """竞价采集 — 9:15-9:25每30秒采集一次
 
-        使用东财全A快照，失败时切换新浪全A快照，提取竞价信息
+        新浪仅盘前观察；09:25 终场证据走独立腾讯采集，不调用东财
         """
         if self._auction_collect_refreshing:
             logger.debug("竞价采集跳过: 上一轮仍在运行")
-            return
+            return {"status": "degraded", "reason": "previous_running"}
 
         session_type = trade_calendar.get_trade_session()
         if not force and session_type != "pre_auction":
@@ -3232,40 +3676,59 @@ class DataScheduler:
         if not await trade_calendar.is_trade_day():
             return
 
+        # Calendar lookup can suspend: another interval/forced callback may have
+        # entered while we awaited it. No await is allowed between recheck/claim.
+        if self._auction_collect_refreshing:
+            logger.debug("竞价采集跳过: 日历确认期间另一轮已开始")
+            return {"status": "degraded", "reason": "previous_running"}
         self._auction_collect_refreshing = True
-        from app.strategy.auction import auction_scheduler
-        async with async_session() as session:
-            try:
-                result = await auction_scheduler.run_auction_phase(session, date.today(), auction_time=auction_time)
+        cancellation = None
+        try:
+            from app.strategy.auction import auction_scheduler
+            # Include session creation/enter/exit in the owner's finally. An
+            # open failure must not wedge all later critical-window callbacks.
+            async with async_session() as session:
+                try:
+                    result = await auction_scheduler.run_auction_phase(session, date.today(), auction_time=auction_time)
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                    raise
                 if result.get("status") == "no_data":
                     logger.warning("竞价采集无数据: auction_data 未写入，竞价强攻路线本轮无输入")
+                    result = {**result, "status": "degraded", "reason": "no_data"}
                 logger.debug(
                     f"竞价采集: {result.get('status')}, "
                     f"{result.get('saved', 0)}条, {result.get('total_signals', 0)}异动"
                 )
-            except Exception as e:
-                logger.error(f"竞价采集失败: {e}")
-            finally:
-                self._auction_collect_refreshing = False
+                return result
+        except Exception as e:
+            # A failing session close must not convert owner cancellation into
+            # a normal result that lets a cancelled scheduler callback continue.
+            if cancellation is not None:
+                raise cancellation from e
+            logger.error(f"竞价采集失败: {e}")
+            return {"status": "failed", "error_type": type(e).__name__}
+        finally:
+            self._auction_collect_refreshing = False
 
     async def _auction_collect_force(self):
         """竞价最终快照兜底，避免 09:25 会话边界漏采."""
-        await self._auction_collect(force=True)
+        return await self._auction_collect(force=True)
 
     async def _auction_collect_force_0920(self):
         """09:20:06 触发采样；落库时钟由采集器按真实响应时刻确定."""
-        await self._auction_collect(force=True)
+        return await self._auction_collect(force=True)
 
     async def _auction_collect_force_0924(self):
         """09:24 触发终场采样；不得预写未来的09:24:50标签."""
-        await self._auction_collect(force=True)
+        return await self._auction_collect(force=True)
 
     async def _auction_collect_force_0925(self):
         """09:25:06 触发终场采样；延迟响应不得倒填为09:25."""
-        await self._auction_collect(force=True)
+        return await self._auction_collect(force=True)
 
     async def _auction_collect_tencent_evidence(self):
-        """09:25 窗口内的腾讯竞价证据采样（D 路由闸门的唯一可满足路径）。
+        """09:25 窗口内的腾讯竞价证据采样；是否满足 D 闸门由真实帧决定。
 
         为什么需要独立任务：`_intraday_fast` 与 `_intraday_slow` 都以
         `is_trading_hours()` 为前置，而 09:25–09:30 不在任何交易时段内
@@ -3278,24 +3741,21 @@ class DataScheduler:
         这 30 秒里多采几次；供应商时间戳是否在该窗口内推进，只有实测才知道，
         因此每次采样都把本轮的时间戳计入返回，供次日核对。
         """
-        session_type = trade_calendar.get_trade_session()
         if not await trade_calendar.is_trade_day():
             return
         from app.strategy.auction import auction_collector
 
-        # 两个独立来源各采一次：闸门要求每只 >=2 个不同 source_quote_at 的 ok 帧，
-        # 而 09:25–09:30 无成交、单一来源的时间戳可能不推进（腾讯实测如此），
-        # 所以用东财 f124 作为第二个来源。任一来源失败不影响另一个。
+        # 这里只采腾讯，东财独立调度。不同来源不是不同时间帧的替代品，
+        # 同股同source_quote_at跨源只计一次；早中段合格帧也参与D路径。
         results = {}
         for label, collector in (
             ("腾讯", auction_collector.collect_tencent_auction_evidence),
-            ("东财", auction_collector.collect_eastmoney_auction_evidence),
         ):
             try:
                 async with async_session() as session:
                     results[label] = await collector(session, date.today())
-            except Exception as exc:               # noqa: BLE001 — 采样失败不得影响主流程
-                logger.warning(f"{label}竞价证据采样失败: {type(exc).__name__}: {exc}")
+            except Exception as exc:               # 采样失败不得影响另一来源
+                logger.warning(f"{label}竞价证据采样失败: {type(exc).__name__}")
                 results[label] = {"status": "error", "written": 0}
         for label, result in results.items():
             if result.get("status") == "ok":
@@ -3307,6 +3767,78 @@ class DataScheduler:
                 )
             elif result.get("status") not in {"outside_evidence_window"}:
                 logger.warning(f"{label}竞价证据未写入: {result}")
+
+    async def _auction_collect_sina_evidence(self):
+        """09:15–09:25 窗口内的早中段竞价证据采样（依次采腾讯与新浪档位）。
+
+        为什么需要独立任务：原 `_auction_collect`（30 秒轮询）走
+        `ak.stock_zh_a_spot` 行情中心，返回的行**没有 provider 时间戳**，
+        采集器只能把 `source_quote_at` 置空、`price_basis` 标成
+        `spot_open_unverified`，于是 `auction_provenance_v1` 恒判 unknown。
+        后果是 D2 的三段判据里 `verified_early` 与
+        `cancel_phase_positive_samples` 永远为空，每天只发一条 MARKET
+        coverage_blocked（9/28 存下的 1,520 行新浪帧 auction_volume 全为 0）。
+
+        两源的档位数据不能混同于累计成交量。共用同一段证据契约逐行自检；
+        能否产出ok帧及全市场覆盖，由真实响应决定。
+        """
+        if not await trade_calendar.is_trade_day():
+            return
+        from app.strategy.auction import auction_collector
+
+        # 与采集器同一个实时窗口判据（09:15:00–09:25:30 且交易日为当日），
+        # 不走 get_trade_session()：该函数在 09:25 前不返回 pre_auction 以外的
+        # 语义时会误判，这里以"源时钟是否在窗口内"为准。
+        trade_date = date.today()
+        if not auction_collector._is_live_auction_window(trade_date):
+            return
+        for label, collector in (
+            ("腾讯早中段", auction_collector.collect_tencent_auction_early_evidence),
+            ("新浪早中段", auction_collector.collect_sina_auction_evidence),
+        ):
+            try:
+                async with async_session() as session:
+                    result = await collector(session, trade_date)
+            except Exception as exc:               # noqa: BLE001 — 单一来源失败不影响另一个
+                logger.warning(f"{label}竞价证据采样失败: {type(exc).__name__}")
+                continue
+            if result.get("status") == "ok":
+                logger.info(
+                    f"{label}竞价证据写入 {result.get('written')} 条 "
+                    f"(accepted={result.get('accepted')}/{result.get('candidates')}, "
+                    f"frame={result.get('source_frame')}, "
+                    f"distinct_source_quote_at={result.get('distinct_source_quote_at')})"
+                )
+            elif result.get("status") not in {"outside_evidence_window"}:
+                logger.warning(f"{label}竞价证据未写入: {result}")
+
+    async def _auction_collect_eastmoney_evidence(self):
+        """09:25 窗口内的东财 `f124` 竞价证据采样（独立任务，与腾讯并行）。
+
+        独立任务避免被腾讯collector的await顺序阻塞，不保证全市场两帧。
+        f124是上游钟，不能用请求钟替代；跨来源同钟仍只算一个时间点。
+        """
+        if not await trade_calendar.is_trade_day():
+            return
+        from app.strategy.auction import auction_collector
+
+        try:
+            async with async_session() as session:
+                result = await auction_collector.collect_eastmoney_auction_evidence(
+                    session, date.today(),
+                )
+        except Exception as exc:                   # noqa: BLE001 — 单一来源失败不影响其他任务
+            logger.warning(f"东财竞价证据采样失败: {type(exc).__name__}")
+            return
+        if result.get("status") == "ok":
+            logger.info(
+                f"东财竞价证据写入 {result.get('written')} 条 "
+                f"(accepted={result.get('accepted')}/{result.get('candidates')}, "
+                f"frame={result.get('source_frame')}, "
+                f"distinct_source_quote_at={result.get('distinct_source_quote_at')})"
+            )
+        elif result.get("status") not in {"outside_evidence_window"}:
+            logger.warning(f"东财竞价证据未写入: {result}")
 
     async def _after_market(self):
         """盘后补全 — pywencai个股行业映射 + 涨停池补充"""
@@ -3425,58 +3957,10 @@ class DataScheduler:
                     session, "pywencai", "stock_mapping", str(e),
                 )
 
-            # ---- 2. pywencai 涨停池补充 ----
-            # 东财盘中封板时间、连板数优先；问财盘后只补真实涨停原因。
-            # 不能因东财已有记录就丢掉问财原因，否则“所属行业”会被误当涨停逻辑。
-            #
-            # 2026-09-17：`pywencai` 自 8 月下旬起完全失效（上游改 SSE 流），
-            # 本段此前每天抛错，`limit_up_reason` 退回东财「所属行业」口径
-            # —— 即上面注释警告的情形已经发生（8/25 起全是 `家居用品`/`造纸`
-            # 这类行业名）。改用 `WencaiStreamSource` 的**同一问句**。
-            # 该问句在新源下的涨停原因列名为 `涨停原因[YYYYMMDD]`（内容为
-            # `A+B+C` 题材组合），与旧列名 `涨停原因类别[YYYYMMDD]` **内容同构**
-            # —— 已用库内 903 条问财历史记录验证（如 `预重整+BIPV+建筑装饰`）；
-            # `_parse_limit_up_df` 现同时识别两者。
-            try:
-                t1 = _time.monotonic()
-                df = await WencaiStreamSource().query_async(
-                    "涨停 连板数", perpage=1000
-                )
-                if df is not None and len(df) > 0:
-                    records = self._parse_limit_up_df(df, today, source="pywencai")
-                    existing_em = await session.execute(
-                        select(LimitUpPool).where(
-                            LimitUpPool.trade_date == today,
-                            LimitUpPool.source == "eastmoney",
-                        )
-                    )
-                    em_by_code = {item.code: item for item in existing_em.scalars().all()}
-                    reason_updates = 0
-                    supplemental_records = []
-                    for record in records:
-                        existing = em_by_code.get(record["code"])
-                        reason = str(record.get("limit_up_reason") or "").strip()
-                        if existing:
-                            if reason and reason.lower() != "nan":
-                                existing.limit_up_reason = reason
-                                reason_updates += 1
-                            continue
-                        supplemental_records.append(record)
-                    if supplemental_records:
-                        await self._upsert_limit_up(session, supplemental_records)
-                    await data_quality_guard.record_success(
-                        session, "pywencai", "limit_up",
-                        latency_ms=int((_time.monotonic() - t1) * 1000),
-                        record_count=len(supplemental_records) + reason_updates,
-                    )
-                    logger.info(
-                        f"pywencai涨停补全: 新增{len(supplemental_records)}条，"
-                        f"更新东财涨停原因{reason_updates}条"
-                    )
-            except Exception as e:
-                logger.error(f"盘后pywencai涨停失败: {e}")
+            # 状态由腾讯同事务生成；盘后字段也走同一严格日期解析器。
 
             await session.commit()
+        await self._intraday_fast(force=True)
 
     async def _deep_review(self):
         """盘后深度 — 申万个股行业映射 → StockSectorMapping"""
@@ -4068,6 +4552,10 @@ class DataScheduler:
                 self._start_anomaly_push_loop(loop)
                 self._start_paper_buy_point_push_loop(loop)
                 self._start_quote_round_loop(loop)
+                if settings.PAPER_CANDIDATE_SHADOW_ENABLED:
+                    previous_shadow = self._candidate_shadow_lifecycle_task
+                    self._candidate_shadow_lifecycle_task = loop.create_task(
+                        self._candidate_shadow_lifecycle(previous_shadow))
                 loop.create_task(self._restore_intraday_quote_state())
             except RuntimeError:
                 logger.debug("启动预热跳过: 当前无运行中的事件循环")
@@ -4083,6 +4571,9 @@ class DataScheduler:
     def stop(self):
         """停止调度器"""
         self._process_awake_guard.stop()
+        if (self._candidate_shadow_lifecycle_task and not self._candidate_shadow_lifecycle_task.done()
+                and not self._candidate_shadow_lifecycle_task.cancelling()):
+            self._candidate_shadow_lifecycle_task.cancel()
         if self._runtime_listener_registered:
             self.scheduler.remove_listener(self._on_scheduler_job_event)
             self._runtime_listener_registered = False
@@ -4090,7 +4581,7 @@ class DataScheduler:
             self._pipeline_health_task,
             self._promotion_news_refresh_task, self._promotion_prediction_task,
             self._promotion_startup_catchup_task,
-            self._concept_fund_flow_task, self._index_history_task,
+            self._concept_fund_flow_task, self._index_history_task, self._limit_detail_task,
         ):
             if task is not None and not task.done():
                 task.cancel()
@@ -4101,6 +4592,15 @@ class DataScheduler:
         self._paper_buy_point_push_task = None
         from app.news.engine import news_engine
         news_engine.cancel_pending_fetches()
+        receipt_pending = any(not task.done() for task in self._after_hours_receipt_tasks)
+        for task in tuple(self._after_hours_receipt_tasks):
+            if not task.done():
+                task.cancel()
+        self._after_hours_receipt_tasks.clear()
+        if receipt_pending:
+            # A task canceled before its first execution cannot run its except.
+            self._after_hours_receipt_health = {"status": "unknown", "reason": "scheduler_stopping",
+                "commit_ack_returned": False, "execution_authorized": False}
         if not self.scheduler.running:
             logger.info("采集调度器未运行，跳过停止")
             return
@@ -4120,6 +4620,63 @@ class DataScheduler:
         self.scheduler.shutdown()
         logger.info("采集调度器已停止")
 
+    async def shutdown(self, *, shadow_timeout_seconds: float | None = None) -> dict:
+        """Request stop, then await only the owned shadow finalizer before ASGI exits.
+
+        This is not a drain guarantee for all scheduler jobs. Waiting never cancels
+        the owner a second time: its finally may already be publishing a boundary.
+        Caller cancellation is propagated after the same bounded cleanup budget.
+        """
+        import math
+        from app.paper.candidate_shadow import STOP_TIMEOUT_SECONDS, candidate_shadow_status
+
+        budget = STOP_TIMEOUT_SECONDS + 1.0
+        timeout = budget if shadow_timeout_seconds is None else shadow_timeout_seconds
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not math.isfinite(timeout) or not 0 < timeout <= budget:
+            raise ValueError("invalid candidate shadow shutdown timeout")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        owner = self._candidate_shadow_lifecycle_task
+        caller_cancelled = bool(asyncio.current_task().cancelling())
+        self.stop()  # Preserve the synchronous stop contract for existing callers.
+        error = None
+        while owner is not None and not owner.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                error = TimeoutError("candidate shadow lifecycle shutdown timed out; drain incomplete")
+                break
+            try:
+                done, _ = await asyncio.wait({owner}, timeout=remaining)
+                if not done:
+                    error = TimeoutError("candidate shadow lifecycle shutdown timed out; drain incomplete")
+                    break
+            except asyncio.CancelledError:
+                # asyncio.wait does not forward cancellation to the owner. Repeated
+                # caller cancellations do not extend the original absolute deadline.
+                caller_cancelled = True
+        if error is None and owner is not None and not owner.cancelled():
+            try:
+                owner.result()
+            except Exception as exc:
+                error = exc
+        status = candidate_shadow_status()
+        if error is None and (
+            self._candidate_shadow_start_error or status.get("worker_alive")
+            or status.get("stop_timed_out") or status.get("drain_incomplete")
+            or status.get("last_error")
+            or status.get("status") not in {"not_started", "stopped"}
+            or (status.get("status") == "stopped" and status.get("drain_complete") is not True)
+        ):
+            error = RuntimeError("candidate shadow shutdown incomplete or failed")
+        if error is not None:
+            logger.error("候选只观察旁路关闭未验证: {}", type(error).__name__)
+        if caller_cancelled:
+            raise asyncio.CancelledError() from error
+        if error is not None:
+            raise error
+        return {"scope": "candidate_shadow_only", "status": status.get("status"),
+                "complete_job_drain_proven": False}
+
     def _start_paper_auto_loop(self, loop: asyncio.AbstractEventLoop):
         """给模拟盘自动执行增加独立心跳，避免 APScheduler 拥挤时漏跑。"""
         if self._paper_auto_loop_task and not self._paper_auto_loop_task.done():
@@ -4136,8 +4693,6 @@ class DataScheduler:
         is_trade_day = await trade_calendar.is_trade_day(checked_at.date())
         if is_trade_day is not True:
             return {"status": "not_trade_day" if is_trade_day is False else "calendar_unknown"}
-        if context not in {"promotion_1510", "promotion_2000"}:
-            return {"status": "existing_intraday_recovery"}
         from app.api.v1.promotion import (
             PROMOTION_MODEL_IDENTITY, PROMOTION_CANONICAL_CLOSE_CONTEXTS,
             _PROMOTION_OFFICIAL_CONTEXT_WINDOWS,
@@ -4145,6 +4700,8 @@ class DataScheduler:
         from app.core.prediction_data_quality import PREDICTION_ROUTE_REQUIRED_DATASETS
         from app.promotion.batch_diagnostics import load_batch_diagnostics
 
+        if context not in _PROMOTION_OFFICIAL_CONTEXT_WINDOWS:
+            return {"status": "probe_attention", "diagnostic_status": "unknown_context"}
         identity = PROMOTION_MODEL_IDENTITY
         async with async_session() as db:
             diagnostic = await load_batch_diagnostics(
@@ -4264,6 +4821,63 @@ class DataScheduler:
                 logger.error(f"模拟盘盘中心跳执行失败: {exc}")
             await asyncio.sleep(max(10, settings.PAPER_INTRADAY_AUTO_INTERVAL_SEC))
 
+    def _candidate_shadow_health(self) -> dict:
+        try:
+            from app.paper.candidate_shadow import candidate_shadow_status
+            return {**candidate_shadow_status(), "startup_error": self._candidate_shadow_start_error}
+        except Exception as exc:
+            return {"enabled": settings.PAPER_CANDIDATE_SHADOW_ENABLED, "running": False,
+                    "error_type": type(exc).__name__, "orders_created": 0, "pushes_created": 0}
+
+    async def _candidate_shadow_lifecycle(self, previous_task=None) -> None:
+        """Independent read-only bindings + worker; never inside the trade dispatch lock."""
+        try:
+            # An in-process scheduler stop/start must not adopt a worker that its
+            # former owner is still draining. Research waits; original trading does not.
+            if previous_task is not None and not previous_task.done():
+                try:
+                    await asyncio.shield(previous_task)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise
+            self._candidate_shadow_start_error = None
+            from sqlalchemy import event
+            from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+            from app.api.v1.paper import _strategy_version
+            from app.models.paper import PaperAccount
+            from app.paper.intraday_route_research import STRATEGY_CANDIDATE_ACCOUNTS
+            from app.paper.research_reports import _database_path
+            from app.paper.candidate_shadow import start_candidate_shadow, stop_candidate_shadow
+
+            database = _database_path(settings.DATABASE_URL)
+            engine = create_async_engine(f"sqlite+aiosqlite:///{database.as_uri()}?mode=ro&uri=true")
+            @event.listens_for(engine.sync_engine, "connect")
+            def readonly(connection, _):
+                connection.execute("PRAGMA query_only=ON")
+            try:
+                async with async_sessionmaker(engine, autoflush=False)() as session:
+                    rows = (await session.execute(select(
+                        PaperAccount.id, PaperAccount.account_name,
+                    ).where(PaperAccount.account_name.in_(
+                        [name for name in STRATEGY_CANDIDATE_ACCOUNTS.values() if name]
+                    ), PaperAccount.status == "active"))).all()
+                    if len({name for _, name in rows}) != len(rows):
+                        raise ValueError("ambiguous research account binding")
+                    bindings = {name: {"account_id": account_id, "strategy_version": _strategy_version(name)}
+                                for account_id, name in rows}
+            finally:
+                await engine.dispose()
+            await start_candidate_shadow(bindings=bindings)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await stop_candidate_shadow()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._candidate_shadow_start_error = type(exc).__name__
+            logger.warning("候选只观察旁路不可用（原执行不受此错误阻断）：{}", type(exc).__name__)
+
     def _start_quote_round_loop(self, loop: asyncio.AbstractEventLoop):
         if self._quote_round_loop_task and not self._quote_round_loop_task.done():
             return
@@ -4273,7 +4887,15 @@ class DataScheduler:
         """无await发布：交易只取最新轮次，A2证据按原采集顺序保留。"""
         self._enqueue_momentum_quote_round(payload)
         self._quote_round_payload = payload
+        self._quote_round_published_monotonic = _time.monotonic()
         self._quote_round_event.set()
+        # Same committed payload, owned leaves only; no DB/I/O/await on this path.
+        try:
+            from app.paper.candidate_shadow import capture_quotes
+            capture_quotes(payload.get("records") or [], observed_at=datetime.now(),
+                           round_id=str(payload.get("round_id") or ""))
+        except Exception as exc:
+            logger.debug("候选研究行情旁路异常（不影响原消费者）：{}", type(exc).__name__)
 
     def _enqueue_momentum_quote_round(self, payload: dict) -> None:
         if not settings.PAPER_MOMENTUM_RETEST_SHADOW_ENABLED:
@@ -4302,7 +4924,7 @@ class DataScheduler:
                 }
             logger.warning("A2前向证据inbox溢出，保留显式缺口: round={}", dropped["payload"].get("round_id"))
 
-    async def _drain_momentum_quote_rounds(self, payload: dict) -> None:
+    async def _drain_momentum_quote_rounds(self, payload: dict) -> dict:
         """只推进已发布的A2纯行情证据；不回放板块/资金查询或任何订单。
 
         一次最多处理调用时已排队的帧，不消费交易payload之后的新轮次。
@@ -4312,7 +4934,8 @@ class DataScheduler:
 
         upper_at = local_clock(payload.get("committed_at"))
         if upper_at is None:
-            return
+            return {"status": "failed", "reason": "invalid_evidence_clock"}
+        processed = 0
         self._enqueue_momentum_quote_round(payload)  # 兼容直接调用；已发布轮次会去重。
         remaining = len(self._momentum_quote_inbox) + int(self._momentum_quote_inflight is not None)
         for _ in range(remaining):
@@ -4341,12 +4964,15 @@ class DataScheduler:
                         session, frame.get("records") or [], observed_at, coverage_loss=loss,
                     )
                 self._momentum_quote_inflight = None
+                processed += 1
                 if result.get("events"):
                     logger.info("强势股首次回踩影子扫描: events={} confirmed={} round={}",
                                 result.get("events"), result.get("confirmed"), frame.get("round_id"))
-            except Exception:
-                logger.exception("A2证据提交失败，保留当前帧下轮重试；主交易链路不受影响")
-                break
+            except Exception as exc:
+                logger.exception("A2证据提交失败，保留当前帧下轮重试；其他账户继续，整轮不报成功")
+                return {"status": "failed", "failed_round_id": str(frame.get("round_id") or ""),
+                        "error_type": type(exc).__name__, "processed_frames": processed}
+        return {"status": "completed", "processed_frames": processed}
 
     async def _restore_intraday_quote_state(self) -> None:
         """服务同日重启后恢复最近8分钟轨迹；只预热状态机，不回放交易。"""
@@ -4374,7 +5000,7 @@ class DataScheduler:
         """
         from app.api.v1 import paper
 
-        account_names = (*paper.PAPER_ALL_ACCOUNTS, *paper.PAPER_CHALLENGER_ACCOUNTS)
+        account_names = await self._paper_risk_account_names()
         health = {
             "status": "running", "quote_round_id": str(payload.get("round_id") or ""),
             "started_at": datetime.now().isoformat(), "accounts": [],
@@ -4409,12 +5035,7 @@ class DataScheduler:
                         health["status"] = "canceled"
                         raise
                     except Exception as exc:
-                        original = exc.orig if isinstance(exc, OperationalError) else None
-                        code = getattr(original, "sqlite_errorcode", None)
-                        sqlite_busy = isinstance(original, sqlite3.OperationalError) and (
-                            (isinstance(code, int) and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
-                            or str(original) in ("database is locked", "database table is locked")
-                        )
+                        sqlite_busy = self._sqlite_write_busy(exc)
                         if sqlite_busy and attempt == 1:
                             logger.warning(
                                 "持仓风控SQLite争用，已回滚并将更换会话重试一次: account={}",
@@ -4436,11 +5057,14 @@ class DataScheduler:
             # Both the event consumer and watchdog only mark success after this.
             raise RuntimeError("持仓风控未完成，本轮跳过新增候选开仓: " + ",".join(failures))
 
-    async def _process_quote_round_shadow(self, payload: dict, *, execute_challengers: bool = True) -> None:
-        """影子证据与隔离账户均消费同一批 owned records，不读取未来轮次。"""
+    async def _process_quote_round_shadow(self, payload: dict, *, execute_challengers: bool = True) -> dict:
+        """影子证据与隔离账户同轮执行；隔离错误不能变成成功完成信号。"""
         records = payload.get("records") or []
         observed_at = payload["committed_at"]
-        await self._drain_momentum_quote_rounds(payload)
+        momentum = await self._drain_momentum_quote_rounds(payload)
+        failures: list[str] = []
+        if not isinstance(momentum, dict) or momentum.get("status") != "completed":
+            failures.append("momentum_evidence")
 
         try:
             from app.paper.strategy_iteration_shadow import scan_strategy_iteration_shadow
@@ -4453,50 +5077,69 @@ class DataScheduler:
                     f"confirmed={result.get('confirmed')} round={payload.get('round_id')}"
                 )
         except Exception:
-            logger.exception("ABC3DF形态挑战者影子扫描失败；主交易链路不受影响")
+            failures.append("shadow_evidence")
+            logger.exception("ABC3DF形态挑战者影子扫描失败；保留故障状态，其他账户继续")
 
         if not execute_challengers:
-            return  # 风控故障仍采集影子证据，但不调用任何隔离账户交易入口。
-        try:
-            from app.api.v1 import paper
-            from app.paper.strategy_iteration_challenger import run_strategy_iteration_challenger_accounts
-
-            token = paper._QUOTE_ROUND_CONTEXT.set(payload)
-            try:
-                async with async_session() as session:
-                    result = await run_strategy_iteration_challenger_accounts(
-                        session,
-                        now=observed_at,
-                    )
-            finally:
-                paper._QUOTE_ROUND_CONTEXT.reset(token)
-            if result.get("entries") or result.get("sells") or result.get("blocked"):
-                logger.info(f"隔离Challenger模拟账户执行: {result}")
-        except Exception:
-            logger.exception("隔离Challenger模拟账户执行失败；Champion账户不受影响")
+            # 风控故障仍采集影子证据，但不调用任何隔离账户交易入口。
+            return {"status": "failed" if failures else "evidence_only", "failed_components": failures}
+        connected = await self._run_challenger_accounts_isolated(payload)
+        if connected["status"] != "completed":
+            failures.append("challenger_execution")
+        return {"status": "failed" if failures else "completed",
+                "failed_components": failures, "challenger_accounts": connected["accounts"]}
 
     async def _quote_round_loop(self) -> None:
         """健康轮次先持仓风控再入场；A2顺序采证，重型影子仅处理当前轮次。
 
-        读取payload与clear之间无await；交易去重不等于A2证据已经处理。
+        取得锁后才选最新payload并clear（中间无await），避免排队期间持有旧轮次。
+        A2 inbox仍保留每一帧；取得锁后发布的新帧会再次唤醒消费者。
         """
         while self.scheduler.running:
+            health = None
             try:
                 await self._quote_round_event.wait()
-                self._quote_round_event.clear()
-                payload = self._quote_round_payload
-                if not payload:
-                    continue
-                if payload.get("quality_status") != "ok":
-                    logger.warning(
-                        "行情轮次降级，交易失败关闭: "
-                        f"round={payload.get('round_id')} reason={payload.get('quality_reason')}"
-                    )
-                    async with self._quote_dispatch_lock:
-                        await self._expire_pending_paper_buys(datetime.now())
-                        await self._drain_momentum_quote_rounds(payload)
-                    continue
+                wait_started = _time.monotonic()
                 async with self._quote_dispatch_lock:
+                    acquired = _time.monotonic()
+                    self._quote_round_event.clear()
+                    payload = self._quote_round_payload
+                    if not payload:
+                        continue
+                    published = self._quote_round_published_monotonic
+                    health = {
+                        "status": "running", "round_id": str(payload.get("round_id") or ""),
+                        "actual_started_at": datetime.now().isoformat(),
+                        # committed_at is collection-complete, NOT a DB commit receipt.
+                        "round_collected_at": str(payload.get("committed_at") or ""),
+                        "round_as_of_at": str(payload.get("as_of_at") or ""),
+                        "source_max_at": str(payload.get("source_max_at") or ""),
+                        "received_max_at": str(payload.get("received_max_at") or ""),
+                        "lock_wait_ms": round((acquired - wait_started) * 1000, 3),
+                        "publish_to_start_ms": (
+                            round((acquired - published) * 1000, 3) if published is not None else None
+                        ),
+                        "stages_ms": {},
+                    }
+                    self._quote_consumer_health = health
+
+                    async def stage(name, call, *args, **kwargs):
+                        started = _time.monotonic()
+                        try:
+                            return await call(*args, **kwargs)
+                        finally:
+                            health["stages_ms"][name] = round((_time.monotonic() - started) * 1000, 3)
+
+                    if payload.get("quality_status") != "ok":
+                        logger.warning(
+                            "行情轮次降级，交易失败关闭: "
+                            f"round={payload.get('round_id')} reason={payload.get('quality_reason')}"
+                        )
+                        await stage("expire", self._expire_pending_paper_buys, datetime.now())
+                        evidence = await stage("a2_evidence", self._drain_momentum_quote_rounds, payload)
+                        self._require_paper_dispatch_success(evidence)
+                        health["status"] = "degraded"
+                        continue
                     current_round_id = str(payload.get("round_id") or "")
                     if (
                         current_round_id
@@ -4505,28 +5148,49 @@ class DataScheduler:
                         logger.debug(
                             f"行情轮次已由watchdog处理，跳过重复交易: round={current_round_id}"
                         )
-                        await self._drain_momentum_quote_rounds(payload)
+                        evidence = await stage("a2_evidence", self._drain_momentum_quote_rounds, payload)
+                        self._require_paper_dispatch_success(evidence)
+                        health["status"] = "deduplicated"
                         continue
+                    self._paper_dispatch_incomplete = True
                     try:
-                        await self._run_quote_round_position_risk(payload)
+                        await stage("position_risk", self._run_quote_round_position_risk, payload)
                     except Exception:
                         # 不新增风险，也不把退出故障扩散成A2/C2的行情采证断档。
-                        await self._process_quote_round_shadow(payload, execute_challengers=False)
+                        await stage("shadow_evidence", self._process_quote_round_shadow,
+                                    payload, execute_challengers=False)
                         raise
-                    await self._run_paper_accounts_isolated(
+                    primary_result = await stage(
+                        "entries", self._run_paper_accounts_isolated,
                         execute=True,
                         trigger="quote-round-entry",
                         execution_mode="intraday",
                         quote_payload=payload,
                         include_position_risk=False,
                     )
-                    await self._process_quote_round_shadow(payload)
+                    connected_result = await stage("shadow_and_challengers", self._process_quote_round_shadow, payload)
+                    portfolio_result = await stage("shared_portfolio", self._run_shared_portfolio_isolated,
+                                                   payload, primary_result, connected_result)
+                    health["shared_portfolio"] = portfolio_result
+                    self._require_paper_dispatch_success(primary_result, connected_result, portfolio_result)
+                    self._paper_dispatch_incomplete = False
                     self._last_quote_round_processed_at = datetime.now()
                     self._last_quote_round_processed_id = current_round_id or None
+                    health["status"] = "completed"
             except asyncio.CancelledError:
+                if health is not None:
+                    health["status"] = "canceled"
                 raise
             except Exception:
+                self._paper_dispatch_incomplete = True
+                if health is not None:
+                    health["status"] = "failed"
                 logger.exception("行情轮次消费者失败；60秒watchdog将兜底")
+            finally:
+                if health is not None:
+                    health["actual_finished_at"] = datetime.now().isoformat()
+                    health["dispatch_ms"] = round((_time.monotonic() - acquired) * 1000, 3)
+                    logger.info("Quote consumer timing: {}", health)
 
     async def _archive_quote_round(self, payload: dict) -> None:
         from app.data.quote_round import quote_round_archive
@@ -4616,17 +5280,32 @@ class DataScheduler:
         self._paper_buy_point_push_task = loop.create_task(self._paper_buy_point_push_loop())
 
     async def _paper_buy_point_push_loop(self):
-        # 消费本轮已提交买点，独立于交易锁；休市也清理过期/失败通知，但不会生成信号。
-        from app.push.paper_buy_points import dispatch_buy_points
+        # 两类通知各自消费；研究通道慢响应不能阻塞原账户买点，也不外层截断发送。
+        # 子任务归属既有受控心跳，停止/取消时全部回收，不产生游离发送任务。
+        from app.push.paper_buy_points import dispatch_buy_points, dispatch_c3_research
         await asyncio.sleep(2)
-        while self.scheduler.running:
-            try:
-                await dispatch_buy_points()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("策略买点推送心跳失败：{}", type(exc).__name__)
-            await asyncio.sleep(settings.PAPER_BUY_POINT_PUSH_INTERVAL_SEC)
+
+        async def consume(dispatch, label):
+            while self.scheduler.running:
+                try:
+                    await dispatch()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error("{}推送心跳失败：{}", label, type(exc).__name__)
+                await asyncio.sleep(settings.PAPER_BUY_POINT_PUSH_INTERVAL_SEC)
+
+        tasks = [
+            asyncio.create_task(consume(dispatch_buy_points, "策略买点")),
+            asyncio.create_task(consume(dispatch_c3_research, "C3研究观察")),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _start_anomaly_push_loop(self, loop: asyncio.AbstractEventLoop):
         """独立启动异动推送心跳，避免依赖行情采集任务的完成时机。"""
@@ -5017,7 +5696,7 @@ class DataScheduler:
                     trade_date=target_date,
                     limit_up_time=limit_row.limit_up_time,
                     seal_amount=limit_row.seal_amount,
-                    source="eastmoney+tencent",
+                    source="tencent",
                 )
                 session.add(broken)
                 rows.append(broken)
@@ -5070,6 +5749,9 @@ class DataScheduler:
         if not await trade_calendar.is_trade_day(target_date):
             return {"status": "skipped", "reason": "non_trade_day"}
         spot_result = await self._tencent_spot_collect(force=True)
+        # A real post-close Wencai response supplements the finalized Tencent
+        # state before the 15:10 snapshot; failure remains unknown, never EM fallback.
+        await self._intraday_fast(force=True)
         kline_result = await self._spot_to_kline_fill(finalize_close=True)
         async with async_session() as session:
             broken_result = await self._reconcile_broken_limit_close_state(session, target_date)
@@ -5124,7 +5806,7 @@ class DataScheduler:
     async def _tencent_spot_collect(self, *, force: bool = False):
         """腾讯实时行情采集 → stock_spot 表(单行覆盖)
 
-        采集范围: StockTag中可交易主板 + 仅观察板 + ST研究池（交易风控仍独立屏蔽）
+        采集范围: StockTag中合法沪深观察标的，含停牌/屏蔽标签（交易风控不变）
         频率: 盘中30秒/轮, 盘后15:01也采集一次(用于盘后展示)
         非交易日跳过
         """
@@ -5152,10 +5834,17 @@ class DataScheduler:
         if not self._tradeable_codes:
             async with async_session() as session:
                 result = await session.execute(
-                    select(StockTag.code).where(*_research_universe_filters())
+                    select(StockTag.code).where(
+                        *_research_universe_filters(include_risk_blocked=True)
+                    )
                 )
-                self._tradeable_codes = [r[0] for r in result.all()]
-                logger.info(f"[tencent] 可交易+仅观察+ST研究行情: {len(self._tradeable_codes)}只")
+                # 风险标签可能滞后于复牌；观测不依赖准入标签，也不清除它们。
+                # 保留既有号段校验，禁止将脏代码猜成腾讯证券身份。
+                self._tradeable_codes = [
+                    code for (code,) in result.all()
+                    if stock_tagger.get_board_type(code) not in {"unknown", "bse"}
+                ]
+                logger.info(f"[tencent] 沪深行情观察宇宙(含风险标签): {len(self._tradeable_codes)}只")
 
         if not self._tradeable_codes:
             return {"status": "missing", "reason": "empty_universe", "collected": 0}
@@ -5193,7 +5882,19 @@ class DataScheduler:
             set_=update_values,
         )
         async with async_session() as session:
+            # Preserve the per-code watermark even after a normal quote removes
+            # its pool row; an older cached quote must not resurrect that state.
+            previous_clocks = dict((await session.execute(select(
+                StockSpot.code, StockSpot.source_quote_at,
+            ).where(StockSpot.code.in_([row["code"] for row in records])))).all())
+            received_before_clock_guard = len(records)
+            records = [row for row in records if not (
+                local_clock(previous_clocks.get(row["code"])) is not None
+                and (local_clock(row.get("source_quote_at")) is None
+                     or local_clock(row["source_quote_at"]) < local_clock(previous_clocks[row["code"]]))
+            )]
             component_watermarks = {
+                "quote_rejected_regression_count": received_before_clock_guard - len(records),
                 "fund_flow_observed_at": await session.scalar(select(func.max(FundFlow.observed_at))),
                 "sentiment_observed_at": await session.scalar(select(func.max(MarketSentiment.observed_at))),
                 # sector_persistence 目前只有交易日粒度，明确记录精度而不伪造盘中时点。
@@ -5212,7 +5913,18 @@ class DataScheduler:
                 component_watermarks=component_watermarks,
                 previous_committed_at=previous_committed_at,
             )
-            await session.execute(upsert_stmt, records)
+            from app.data.limit_pool import persist_tencent_limit_state
+            # Same-transaction state projection: only verified returned codes may
+            # retire old pool rows. Missing/partial batches never clear the market.
+            limit_state = await persist_tencent_limit_state(
+                session, records, observed_at=collected_at,
+                expected_count=len(self._tradeable_codes),
+            )
+            component_evidence = json.loads(round_record["component_watermarks_json"])
+            component_evidence["limit_pool"] = limit_state
+            round_record["component_watermarks_json"] = json.dumps(component_evidence, ensure_ascii=False)
+            if records:
+                await session.execute(upsert_stmt, records)
             session.add(QuoteRound(**round_record))
             await session.commit()
             logger.debug(
@@ -5292,6 +6004,139 @@ class DataScheduler:
         # Caller must commit successfully before publishing committed=True.
         self._kline_observation_health = {**result, "committed": False}
         return result
+
+    async def _expire_after_hours_intents(self):
+        from app.trading.service import reconcile_paper_after_hours_intents
+        async with async_session() as session:
+            return await reconcile_paper_after_hours_intents(session)
+
+    async def _after_hours_research_codes(self, session):
+        from app.data.sources.after_hours_source import exchange_of
+        # Existing descriptive universe includes observe-only names, never trade authority.
+        raw = list((await session.scalars(select(StockTag.code).where(
+            *_research_universe_filters()).order_by(StockTag.code).limit(10001))).all())
+        eligible = []
+        for code in raw:
+            try:
+                exchange_of(code)
+                eligible.append(code)
+            except ValueError:
+                continue
+        cap = settings.AFTER_HOURS_RESEARCH_MAX_CODES
+        return eligible[:cap], {
+            "stored_eligible_codes": len(eligible), "selected_codes": min(len(eligible), cap),
+            "universe_truncated": len(raw) > 10000 or len(eligible) > cap,
+            "scope": "stored_Hu_Shen_A_share_research_universe",
+            "complete_market_coverage": False,
+        }
+
+    async def _freeze_regular_close_research(self):
+        from app.data.after_hours import observation, regular_close_material, append_observations
+        from app.data.sources.after_hours_source import local_now
+        from app.models.governance import TradeCalendarModel
+        from app.core.trade_calendar import is_official_closed_day
+        if not settings.AFTER_HOURS_RESEARCH_ENABLED:
+            return {"status": "disabled"}
+        now = local_now()
+        if not time(15) <= now.time() < time(15, 5):
+            return {"status": "blocked", "reason": "pre_fixed_price_baseline_window_ended"}
+        async with async_session() as session:
+            calendar = await session.get(TradeCalendarModel, now.date())
+            if (calendar is None or calendar.is_trade_day is not True or calendar.session_type != "full"
+                    or now.weekday() >= 5 or is_official_closed_day(now.date())):
+                return {"status": "blocked", "reason": "stored_calendar_not_confirmed_open"}
+            codes, coverage = await self._after_hours_research_codes(session)
+            spots = {row.code: row for row in (await session.scalars(select(StockSpot).where(
+                StockSpot.code.in_(codes)))).all()}
+            rows = []
+            for code in codes:
+                material = regular_close_material(spots.get(code), day=now.date(), received_at=now)
+                rows.append(observation(code=code, day=now.date(), stage="regular_close",
+                    source="tencent_close", source_version="tencent_pre_fixed_price_baseline_v1",
+                    received_at=now, accepted_at=local_now(), values=material,
+                    source_quote_at=material["source_quote_at"]))
+            result = await append_observations(session, rows)
+            await session.commit()
+        counts = dict(Counter(row.quality_status for row in rows))
+        return {"status": ("unavailable" if not rows else "partial"
+                          if counts.get("partial") or coverage["universe_truncated"] else "observed"),
+                **coverage, **result, "status_counts": counts, "trading_authority": False,
+                "started_at": now.isoformat(), "completed_at": local_now().isoformat(), "committed": True}
+
+    async def _collect_after_hours_research(self):
+        """Forward only, budgeted native session aggregates. Never execute orders."""
+        import httpx
+        from app.data.after_hours import observation, append_observations
+        from app.data.sources.after_hours_source import AfterHoursSource, local_now
+        from app.models.governance import TradeCalendarModel
+        from app.core.trade_calendar import is_official_closed_day
+        if not settings.AFTER_HOURS_RESEARCH_ENABLED:
+            return {"status": "disabled"}
+        if self._after_hours_research_lock.locked():
+            return {"status": "busy"}
+        async with self._after_hours_research_lock:
+            now = local_now()
+            if now.date() < date(2026, 7, 6) or now.time() < time(15, 30):
+                return {"status": "blocked", "reason": "fixed_price_session_not_ended"}
+            async with async_session() as session:
+                calendar = await session.get(TradeCalendarModel, now.date())
+                if (calendar is None or calendar.is_trade_day is not True or calendar.session_type != "full"
+                        or now.weekday() >= 5 or is_official_closed_day(now.date())):
+                    return {"status": "blocked", "reason": "stored_calendar_not_confirmed_open"}
+                codes, coverage = await self._after_hours_research_codes(session)
+            source = AfterHoursSource(provider=settings.AFTER_HOURS_RESEARCH_SOURCE)
+            deadline = _time.monotonic() + settings.AFTER_HOURS_RESEARCH_BUDGET_SEC
+            pending, inserted, counts = [], 0, Counter()
+            commit_ack_returned = False
+            self._after_hours_research_health = {"status": "collecting", **coverage,
+                "trade_date": now.date().isoformat(), "started_at": now.isoformat(),
+                "committed": False, "trading_authority": False}
+            async def collect_one(code):
+                try:
+                    if local_now().date() != now.date() or _time.monotonic() >= deadline:
+                        raise TimeoutError("forward observation budget/date ended")
+                    remaining = deadline - _time.monotonic()
+                    material = await asyncio.wait_for(
+                        source.collect(code, trade_date=now.date(), client=client),
+                        timeout=min(8.0, remaining))
+                    if _time.monotonic() >= deadline or local_now().date() != now.date():
+                        raise TimeoutError("source finished outside observation budget/date")
+                except Exception as exc:
+                    material = {**source.identity(code), "received_at": local_now(), "source_quote_at": None,
+                        "values": {"reason": "source_unavailable_" + type(exc).__name__}}
+                row = observation(code=code, day=now.date(), stage="after_hours",
+                                  accepted_at=local_now(), **material)
+                return row
+            try:
+                async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+                    for start in range(0, len(codes), 2):
+                        # The HTTP adapter never reads ordinary depth or reconstructs post volume.
+                        rows = await asyncio.gather(*(collect_one(code) for code in codes[start:start+2]))
+                        pending.extend(rows)
+                        counts.update(row.quality_status for row in rows)
+                        if len(pending) >= 50 or start + 2 >= len(codes):
+                            async with async_session() as session:
+                                result = await append_observations(session, pending)
+                                await session.commit()
+                                commit_ack_returned = True
+                                inserted += result["inserted"]
+                            pending.clear()
+                        # Once budget expired, emit explicit missing rows without making more GETs.
+                        if _time.monotonic() < deadline:
+                            await asyncio.sleep(source.rate_limit)
+                result = {"status": ("unavailable" if not codes else
+                    "partial" if counts.get("partial") or coverage["universe_truncated"] else "observed"),
+                    **coverage, "status_counts": dict(counts), "inserted": inserted,
+                    "trade_date": now.date().isoformat(), "started_at": now.isoformat(),
+                    "completed_at": local_now().isoformat(),
+                    "committed": commit_ack_returned, "source_finality_verified": False, "historical_pit": False,
+                    "trading_authority": False}
+                self._after_hours_research_health = result
+                return result
+            except Exception as exc:
+                self._after_hours_research_health.update(status="failed", committed=False,
+                    inserted=inserted, error_type=type(exc).__name__)
+                raise
 
     async def _ths_kline_daily(self):
         """同花顺日K线盘后增量采集 → stock_kline 表"""
@@ -5679,7 +6524,12 @@ class DataScheduler:
                 engine = SectorRotationEngine()
                 items = await engine.calc_sector_strength(session, today)
                 if items:
-                    await engine.save_strength_ranking(session, items, today)
+                    # calc_sector_strength emits one item per sector-code dict key.
+                    # Its existence queries need no preceding item's pending writes.
+                    # Defer autoflush to the writer's existing commit, rather than
+                    # holding SQLite's write lock over one UPDATE per next SELECT.
+                    with session.no_autoflush:
+                        await engine.save_strength_ranking(session, items, today)
 
                 # ---- 3. 计算生命周期(只算有涨停的板块, 避免全量计算) ----
                 await self._compute_lifecycle(session, today)
@@ -6186,6 +7036,10 @@ class DataScheduler:
             if recorded:
                 self._promotion_snapshot_completed_contexts.add(key)
             status = "completed" if recorded else str((payload or {}).get("status") or "no_snapshot")
+            if not recorded and key in self._promotion_snapshot_completed_contexts:
+                # Builder published successfully, but optional postprocessing failed.
+                status = "completed_postprocessing_error"
+                payload = {**(payload or {}), "status": status}
             timing = self._record_promotion_runtime_audit(
                 "snapshot", status, trigger=trigger, context=context,
                 started_at=requested_at.isoformat(),
@@ -6199,7 +7053,9 @@ class DataScheduler:
         except asyncio.TimeoutError:
             self._set_promotion_phase(None)
             return self._record_promotion_runtime_audit(
-                "snapshot", "timeout", trigger=trigger, context=context,
+                "snapshot", ("completed_postprocessing_timeout"
+                             if key in self._promotion_snapshot_completed_contexts else "timeout"),
+                trigger=trigger, context=context,
                 started_at=requested_at.isoformat(),
                 elapsed_ms=round((_time.monotonic() - now_tick) * 1000, 1),
                 schedule_lag_ms=round(queue_lag_ms, 1),
@@ -6417,6 +7273,9 @@ class DataScheduler:
                     snapshot_context=snapshot_context,
                     db=target_session,
                     quality_gate=quality_gate,
+                    on_committed=lambda run_id: self._promotion_snapshot_completed_contexts.add(
+                        (attempt_trade_date, snapshot_context)
+                    ),
                 )
                 payload["generation_attempt"] = generation_attempt
                 if quality_gate is not None:

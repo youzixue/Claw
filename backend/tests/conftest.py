@@ -14,6 +14,14 @@ os.environ["DATABASE_URL"] = (
     f"sqlite+aiosqlite:///{_TEST_DATABASE_PATH.as_posix()}"
 )
 os.environ["SQL_ECHO"] = "false"
+# Global AIProvider is constructed during collection, before test fixtures can
+# monkeypatch it. Never read the user\'s real saved key/account or push settings.
+os.environ["AI_CONFIG_PATH"] = str(_TEST_DATABASE_DIR / "isolated-ai.json")
+os.environ["AI_CODEX_HOME"] = str(_TEST_DATABASE_DIR / "isolated-codex")
+os.environ["AI_ENABLED"] = "false"
+os.environ["AI_API_KEY"] = ""
+os.environ["PUSH_ENABLED"] = "false"
+os.environ["PAPER_BUY_POINT_PUSH_ENABLED"] = "false"
 # 测试启动调度器时不得真的改变宿主电源断言；防休眠单测使用假子进程。
 os.environ["SCHEDULER_PREVENT_IDLE_SLEEP"] = "false"
 

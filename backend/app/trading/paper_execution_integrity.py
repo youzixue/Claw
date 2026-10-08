@@ -41,15 +41,27 @@ async def account_execution_integrity_evidence(db, order, execution):
 
     # Explicit leaf columns, not cached ORM entities or whole-object dumps.
     trade_fields = ("id", "account_id", "code", "trade_type", "price", "amount", "trade_time",
-                    "commission", "tax", "signal_id", "realized_pnl", "decision_round_id", "fill_round_id")
+                    "commission", "tax", "signal_id", "realized_pnl", "decision_round_id", "fill_round_id", "strategy_version")
     fill_fields = ("id", "fill_id", "order_id", "broker", "code", "side", "price", "quantity",
                    "commission", "tax", "realized_pnl", "broker_trade_id", "raw_json",
                    "decision_round_id", "fill_round_id", "trade_date", "filled_at")
-    order_fields = ("order_id", "account_id", "code", "side", "broker", "trade_date", "signal_id")
-    columns = ([getattr(PaperTradeLog, f).label("t_"+f) for f in trade_fields] +
-               [getattr(TradeFill, f).label("f_"+f) for f in fill_fields] +
-               [getattr(TradeOrder, f).label("o_"+f) for f in order_fields] +
-               [PaperAccount.account_name.label("t_account_name")])
+    order_fields = ("order_id", "account_id", "code", "side", "broker", "trade_date", "signal_id", "order_type")
+    sqlite = db.bind.dialect.name == "sqlite"
+    if sqlite:
+        from app.trading import paper_after_hours_resources as fixed_resources
+        fixed_marker = fixed_resources._fixed_receipt_marker()
+        columns = [fixed_resources._recognition_leaf(getattr(model, key), fixed=fixed_marker).label(prefix + key)
+            for model, fields, prefix in ((PaperTradeLog, trade_fields, "t_"), (TradeFill, fill_fields, "f_"),
+                                         (TradeOrder, order_fields, "o_")) for key in fields]
+        columns += [fixed_resources._recognition_leaf(PaperAccount.account_name, fixed=fixed_marker).label("t_account_name"),
+                    fixed_marker.label("fixed_receipt_marker"),
+                    fixed_resources._fixed_identity_leaf("account_id", 40).label("fixed_account_id"),
+                    fixed_resources._fixed_identity_leaf("side", 10).label("fixed_side")]
+    else:
+        columns = ([getattr(PaperTradeLog, f).label("t_"+f) for f in trade_fields] +
+                   [getattr(TradeFill, f).label("f_"+f) for f in fill_fields] +
+                   [getattr(TradeOrder, f).label("o_"+f) for f in order_fields] +
+                   [PaperAccount.account_name.label("t_account_name")])
     day_start = datetime.combine(order.trade_date, time())
     day_end = day_start + timedelta(days=1)
     link = TradeFill.broker_trade_id == cast(PaperTradeLog.id, String)
@@ -71,14 +83,16 @@ async def account_execution_integrity_evidence(db, order, execution):
         ledger_rows = (await db.execute(ledger_query.order_by(PaperTradeLog.id, TradeFill.id))).mappings().all()
         receipt_rows = (await db.execute(receipt_query.order_by(TradeFill.id))).mappings().all()
     rows = {(r["t_id"], r["f_id"]): r for r in (*ledger_rows, *receipt_rows)}
-    seen_trades, seen_fills, matched = set(), set(), []
+    seen_trades, seen_fills, matched, fixed_roots = set(), set(), [], {}
     try:
         for row in rows.values():
             raw = _json_loads_dict(row["f_raw_json"])
-            prior = raw.get("immediate_execution_evidence") or raw.get("pending_execution_timing")
+            fixed = raw.get("after_hours_fixed_execution")
+            is_fixed = bool(row.get("fixed_receipt_marker")) or fixed is not None or row["o_order_type"] == "after_hours_fixed"
+            prior = fixed if fixed is not None else (raw.get("immediate_execution_evidence") or raw.get("pending_execution_timing"))
             prior = prior if isinstance(prior, dict) else {}
-            accounts = {row["t_account_name"], row["o_account_id"], prior.get("account_id")} - {None, ""}
-            sides = {row["t_trade_type"], row["f_side"], row["o_side"], prior.get("side")}
+            accounts = {row["t_account_name"], row["o_account_id"], prior.get("account_id"), row.get("fixed_account_id")} - {None, ""}
+            sides = {row["t_trade_type"], row["f_side"], row["o_side"], prior.get("side"), row.get("fixed_side")}
             if order.side not in sides:
                 continue
             if proof["account_name"] not in accounts:
@@ -118,7 +132,7 @@ async def account_execution_integrity_evidence(db, order, execution):
                 return blocked("ledger_receipt_identity_conflict", row)
             # Match the original broker trade payload as well: a forged broker ID
             # must not let another order claim an unrelated same-price/quantity fill.
-            if (raw.get("id") != row["t_id"] or raw.get("code") != row["t_code"]
+            if not is_fixed and (raw.get("id") != row["t_id"] or raw.get("code") != row["t_code"]
                     or raw.get("trade_type") != row["t_trade_type"]
                     or raw.get("price") != row["t_price"] or raw.get("amount") != row["t_amount"]
                     or raw.get("commission") != row["t_commission"] or raw.get("tax") != row["t_tax"]
@@ -128,6 +142,36 @@ async def account_execution_integrity_evidence(db, order, execution):
                     or raw.get("decision_round_id") != row["t_decision_round_id"]
                     or raw.get("fill_round_id") != row["t_fill_round_id"]):
                 return blocked("ledger_receipt_identity_conflict", row)
+            if is_fixed:
+                from app.trading import paper_after_hours_resources as fixed_resources
+                from app.api.v1 import paper
+                if (row["o_order_type"] != fixed_resources.MODE
+                        or (not sqlite and (not isinstance(fixed, dict)
+                            or raw.get("immediate_execution_evidence") is not None
+                            or raw.get("pending_execution_timing") is not None))):
+                    return blocked("ledger_receipt_identity_conflict", row)
+                root_key = (row["t_account_id"], order.code, order.trade_date)
+                if root_key not in fixed_roots:
+                    # Read-only recognition of ALL durable history, not a new-fill permit.
+                    try:
+                        fixed_roots[root_key] = await fixed_resources._verified_fixed_receipt_bindings(db,
+                            account_numeric_id=row["t_account_id"], code=order.code,
+                            trade_date=order.trade_date, cutoff=paper._public_order_clock())
+                    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+                        return blocked("ledger_receipt_identity_conflict", row)
+                binding = fixed_roots[root_key].get(row["f_fill_id"])
+                expected = {"trade_id": row["t_id"], "trade_fill_id": row["f_id"],
+                    "fill_id": row["f_fill_id"], "account_numeric_id": row["t_account_id"],
+                    "code": row["t_code"], "side": row["t_trade_type"], "quantity": row["t_amount"],
+                    "price": row["t_price"], "filled_at": row["t_trade_time"],
+                    "signal_id": row["t_signal_id"], "strategy_version": row["t_strategy_version"],
+                    "decision_round_id": row["t_decision_round_id"], "fill_round_id": row["t_fill_round_id"]}
+                if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in expected.items()):
+                    return blocked("ledger_receipt_identity_conflict", row)
+                matched.append([row["t_id"], row["f_id"], row["f_fill_id"], row["f_order_id"],
+                    row["t_account_id"], row["t_fill_round_id"], row["t_amount"], row["t_price"],
+                    row["t_commission"], row["t_tax"], row["t_realized_pnl"], row["t_trade_time"].isoformat()])
+                continue
             request_id = str(row["f_fill_id"] or "").removeprefix("fill-")
             immediate = prior.get("contract_version") == "immediate_paper_fill_v2_20260914"
             timing = raw.get("ledger_execution_timing")

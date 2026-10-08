@@ -110,7 +110,13 @@ class StockTagger:
     def clean_name(name) -> str:
         if not isinstance(name, str):
             return ""
-        value = "".join(name.split())
+        # 只折叠全角ASCII的展示差异；不使用NFKC去合并圈字、上标或其它兼容字。
+        # 保留A/B、大小写、汉字及ST/*ST/退标记；代码校验不走名称规范化。
+        width_folded = "".join(
+            chr(ord(char) - 0xFEE0) if "\uff01" <= char <= "\uff5e" else char
+            for char in name
+        )
+        value = "".join(width_folded.split())
         return "" if value.lower() in {"", "nan", "none", "null", "--", "未知"} else value
 
     def name_risks(self, name) -> tuple[bool, bool]:
@@ -210,6 +216,54 @@ class StockTagger:
             blacklist = await session.get(StockBlacklist, code, populate_existing=True) if fresh else await session.get(StockBlacklist, code)
             name = await session.scalar(select(StockSpot.name).where(StockSpot.code == code))
         return self.resolve_status(code, tag, quote_name=name, blacklist=blacklist, at=at)
+
+    @staticmethod
+    def risk_fingerprint(tag, blacklist) -> dict:
+        """Owned leaves for compare-before-write and immutable status-transition audit."""
+        def fields(row, names):
+            if row is None:
+                return None
+            return {name: (value.isoformat() if isinstance(value, (date, datetime)) else value)
+                    for name in names for value in [getattr(row, name)]}
+        return {
+            "tag": fields(tag, ("code", "name", "board_type", "board_tag", "is_st",
+                "is_suspended", "is_delisting", "is_ipo_recent", "is_limit_up",
+                "is_limit_down", "ipo_date", "suspend_reason", "updated_at")),
+            "blacklist": fields(blacklist, ("code", "reason", "start_date", "end_date",
+                "auto_expire", "source")),
+        }
+
+    async def clear_verified_auto_suspension(self, session, tag, blacklist, *,
+                                             evidence, trade_date, observed_at):
+        """Only an explicit dated trading state retires a provable old automatic halt.
+
+        Call inside a locked transaction and archive before/after in the same commit.
+        This is not a generic risk-clear API or execution authorization.
+        """
+        if evidence.get("state") != "trading":
+            return "no_explicit_trading_evidence"
+        if tag is None or blacklist is None:
+            return "automatic_halt_provenance_missing"
+        if (blacklist.code != tag.code or blacklist.source != "auto"
+                or blacklist.reason != "suspended" or blacklist.auto_expire is not False
+                or blacklist.end_date is not None or blacklist.start_date is None):
+            return "independent_or_unverified_restriction"
+        # Day-only source evidence cannot order a halt and a resumption on the same day.
+        if blacklist.start_date >= trade_date:
+            return "same_day_or_future_halt"
+        if not tag.is_suspended or tag.board_tag != TAG_SUSPENDED:
+            return "independent_tag_restriction"
+        status = self.resolve_status(tag.code, tag, name=evidence.get("name"), at=observed_at)
+        if status["identity_issues"] or observed_at.date() != trade_date:
+            return "identity_or_date_conflict"
+        tag.is_suspended = False
+        # Preserve every other risk and its corresponding entry restriction.
+        tag.board_tag = (TAG_BLOCKED if status["is_st"] or status["is_delisting"]
+                         or tag.is_ipo_recent else self.get_board_tag(tag.board_type))
+        tag.updated_at = observed_at
+        # Do NOT backdate an inclusive end_date: archive the whole row atomically.
+        await session.delete(blacklist)
+        return "auto_suspension_cleared"
 
     async def tag_stock(self, session: AsyncSession, code: str, name: str = "",
                         is_st: Optional[bool] = None, is_suspended: Optional[bool] = None,

@@ -59,6 +59,13 @@ def evaluate_challenger_acceptance(
     policy: dict | None = None,
 ) -> dict:
     rules = {**DEFAULT_ACCEPTANCE_POLICY, **(policy or {})}
+    if (walk_forward.get("research_only") or walk_forward.get("unknown_labels_allowed")
+            or (walk_forward.get("challenger_metrics") or {}).get("research_only")
+            or (walk_forward.get("champion_metrics") or {}).get("research_only")):
+        return {"passed": False, "decision": "rejected", "policy": rules,
+                "checks": [{"name": "complete_verified_labels", "passed": False,
+                            "actual": "partial_historical_research", "required": "verified_complete"}],
+                "note": "含未知标签的历史研究不能取得影子或生产资格。"}
     challenger = walk_forward["challenger_metrics"]
     champion = walk_forward["champion_metrics"]
     checks: list[dict] = []

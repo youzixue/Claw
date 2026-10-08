@@ -3,7 +3,7 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
 _BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -35,6 +35,10 @@ class PaperChallengerExecutionPolicy(BaseModel):
     cash_buffer_pct: float = Field(default=0.02, ge=0, lt=1, allow_inf_nan=False)
     opening_risk_end: str = Field(default="09:35", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     opening_position_factor: float = Field(default=0.50, ge=0, le=1, allow_inf_nan=False)
+    target_top_up_enabled: bool = False
+    top_up_cooldown_sec: int = Field(default=1800, ge=60)
+    top_up_max_daily_layers: int = Field(default=2, ge=1, le=3)
+    top_up_max_cost_return_pct: float = Field(default=1.2, ge=0, allow_inf_nan=False)
 
 
 class Settings(BaseSettings):
@@ -49,6 +53,12 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     # macOS调度进程运行时请求AC防休眠，不改变全机设置，不能阻止合盖/手动休眠。
     SCHEDULER_PREVENT_IDLE_SLEEP: bool = True
+
+    # 前向盘后研究：免费源原生量额优先，保留官方模式；不授权订单。
+    AFTER_HOURS_RESEARCH_ENABLED: bool = True
+    AFTER_HOURS_RESEARCH_SOURCE: Literal["tencent_sina", "official"] = "tencent_sina"
+    AFTER_HOURS_RESEARCH_MAX_CODES: int = Field(default=6000, ge=1, le=10000)
+    AFTER_HOURS_RESEARCH_BUDGET_SEC: int = Field(default=1200, ge=8, le=1800)
 
     # === 数据库 ===
     DATABASE_URL: str = "sqlite+aiosqlite:///./claw.db"
@@ -103,6 +113,10 @@ class Settings(BaseSettings):
     FUND_FLOW_CONCEPT_WAIT_TIMEOUT_SEC: float = 1.0
     # pywencai
     PYWENCAI_RATE_LIMIT: float = 2.0
+    # 状态复用腾讯行情轮次；问财仅低频补字段，无东财回退。
+    LIMIT_POOL_SOURCE_MAX_AGE_SEC: float = Field(default=120.0, gt=0, le=300, allow_inf_nan=False)
+    LIMIT_POOL_WENCAI_INTERVAL_SEC: int = Field(default=300, ge=120)
+    LIMIT_POOL_WENCAI_WAIT_SEC: float = Field(default=45.0, gt=0, le=60, allow_inf_nan=False)
     # 问财自 2026-08 下旬起要求**登录会话**才返回数据：未登录时接口返回
     # 401+captcha_url 或 403 Access Denied，库随即在 `params.get('data')`
     # 抛出 `'NoneType' object has no attribute 'get'`。
@@ -131,6 +145,17 @@ class Settings(BaseSettings):
     AI_MODEL: str = "MiniMax-M2.7"
     AI_MAX_TOKENS: int = 2048
     AI_TEMPERATURE: float = 0.3
+    AI_PAYMENT_COOLDOWN_SEC: int = Field(default=300, ge=60, le=3600)
+    NEWS_GLOBAL_INDEX_CODES: str = "DJIA,SPX,NDX,HSI,N225,KS11,FTSE,GDAXI,FCHI,UDI"
+    NEWS_JOB_TIMEOUT_SEC: int = Field(default=180, ge=30, le=600)
+    NEWS_AI_BATCH_SIZE: int = Field(default=32, ge=1, le=300)
+    NEWS_AI_WAVE_SIZE: int = Field(default=4, ge=1, le=8)
+    NEWS_AI_FALLBACK_RETRY_SEC: int = Field(default=3600, ge=300, le=86400)
+    NEWS_AI_RETRY_COOLDOWN_SEC: int = Field(default=300, ge=60, le=3600)
+    NEWS_PREMARKET_RECOVERY_ENABLED: bool = True
+    NEWS_PREMARKET_RECOVERY_END_MINUTE: int = Field(default=55, ge=40, le=59)
+    NEWS_PREMARKET_RECOVERY_ATTEMPTS: int = Field(default=2, ge=1, le=3)
+    NEWS_PREMARKET_RECOVERY_COOLDOWN_SEC: int = Field(default=120, ge=60, le=600)
     AI_API_FORMAT: str = "anthropic"  # 保留现有 MiniMax 协议，另支持 openai
     AI_AUTH_MODE: str = "api_key"
     AI_CONFIG_PATH: Path = Path.home() / ".claw" / "ai-config.json"
@@ -148,6 +173,7 @@ class Settings(BaseSettings):
     # 用户选择只接收模拟策略买点；其他飞书通知保留实现，关闭本开关可恢复。
     FEISHU_PAPER_BUY_POINTS_ONLY: bool = True
     PAPER_BUY_POINT_PUSH_ENABLED: bool = True  # 十二账户真实策略买点，独立于成交提醒
+    C3_RESEARCH_PUSH_ENABLED: bool = False  # 用户暂停C3飞书；保留研究采证，不影响十二账户买点
     PAPER_BUY_POINT_PUSH_INTERVAL_SEC: int = Field(default=5, ge=1, le=60)
     PAPER_BUY_POINT_PUSH_MAX_AGE_SEC: int = Field(default=180, ge=30, le=600)
     PAPER_BUY_POINT_PUSH_RETRY_SEC: int = Field(default=15, ge=5, le=120)
@@ -283,6 +309,8 @@ class Settings(BaseSettings):
     # 首日仅接受授权后的新鲜行情与仍有效信号，不按上午旧价格回填成交。
     # 实验关闭只用于显式维护；历史亏损/牛熊切换不能自动关闭实验账户。
     PAPER_CONTINUOUS_EXPERIMENT_ENABLED: bool = True
+    # 同批候选只观察旁路：无订单/额度/正式通知；不参与执行版本。
+    PAPER_CANDIDATE_SHADOW_ENABLED: bool = True
     PAPER_EXPERIMENT_START_DATE: str = "2026-09-07"
     PAPER_EXPERIMENT_ACTIVATION_AT: str = "2026-09-07T14:33:17"
     PAPER_EXPERIMENT_VERSION: str = "continuous_paper_v1_pm"
@@ -299,6 +327,17 @@ class Settings(BaseSettings):
     PAPER_CONTROL_SAMPLE_ENABLED: bool = True
     # forced_probe 只写隔离研究账本，默认不生成任何订单且永不计入策略绩效。
     PAPER_FORCED_PROBE_ENABLED: bool = False
+
+    # Independent conservative experiment; not evidence of return optimization.
+    # Disabled until an operator supplies a precise, prospective activation instant.
+    PAPER_PORTFOLIO_ENABLED: bool = False
+    PAPER_PORTFOLIO_ACTIVATION_AT: str = ""
+    PAPER_PORTFOLIO_INITIAL_CAPITAL: float = 50_000
+    PAPER_PORTFOLIO_MAX_EXPOSURE_RATIO: float = 0.80
+    PAPER_PORTFOLIO_MAX_SYMBOL_RATIO: float = 0.20
+    PAPER_PORTFOLIO_MAX_SYMBOLS: int = 5
+    PAPER_PORTFOLIO_MAX_DAILY_NEW_SYMBOLS: int = 5
+    PAPER_PORTFOLIO_SIGNAL_TTL_SECONDS: int = 120
 
     # === 不可变行情轮次与分时归档 ===
     QUOTE_ROUND_MIN_COVERAGE: float = 0.95
@@ -319,27 +358,9 @@ class Settings(BaseSettings):
     PAPER_INTRADAY_CONFIRM_MAX_SAMPLE_GAP_SEC: int = 90
     # 行情轮询存在亚秒级调度抖动；59.9秒应按一分钟确认，不能因浮点时钟误差漏单。
     PAPER_CONFIRMATION_CLOCK_JITTER_SEC: float = 1.0
-    # === 2026-09-18 文档化：A 策略必要价格区间的隐含振幅上限 ===
-    # `_a_entry_price_band`（app/api/v1/paper.py）把 A 原入口的两条约束取交集：
-    #     下界 = high × (1 − dd)，dd 即本参数
-    #     上界 = low  × (1 + PAPER_AUTO_VALUE_ENTRY_MAX_REBOUND_FROM_LOW_PCT)
-    # 可解（交集非空）条件： high × (1 − dd) ≤ low × (1 + rb)
-    #        <=> 振幅 (high/low − 1) ≤ rb/(1 − dd) + dd/(1 − dd)
-    # 取 dd = 2.0%、rb = 3.0% 时，**隐含上限 = 5.10%**：
-    #     振幅 ≤ (1.03/0.98) − 1 = 5.102%
-    # 该 5.102% 是 A 入口对"日内振幅"的真实隐含约束：振幅大于它的候选，
-    # 下界恒高于上界，必要价格区间为空，`_pending_primary_buy_confirmation`
-    # 直接以"A原入口必要价格区间已无交集"撤销委托。
-    # 含义（已实测，见 outputs/today_review_20260917/T2-9-T2-10-离线实验-20260917.md）：
-    #   * 实测 9,387 条"必要价格区间为空"的隐含振幅中位为 **7.14%**，远超 5.10%
-    #     -> 该区间对绝大多数候选恒为空，dd 这个参数长期形同虚设
-    #   * 但**不要据此放宽 dd**：T2-10 反事实显示解锁后的候选池
-    #     胜率仅 47%~50%、均值 ≈ 0（n=5,595），即过滤掉的是一个零边际群体
-    # 因此本参数的正确用法是"承认它只适用于窄振幅标的"，
-    # 若要让入场规则对宽振幅候选真正生效，应换成**单一自洽**的规则
-    # （需独立的可证伪假设与实验），而不是调大 dd。
-    # 改本参数或 rb 都会移动 5.102% 这条线，
-    # tests/test_a_entry_band_amplitude_cap_20260918.py 会同步校验。
+    # legacy_high入口：高点回撤2%与低点反弹3%的交集隐含振幅≤5.102%。
+    # 09/18研究显示仅放宽高点回撤没有收益优势，因此A新版改用VWAP承接锚；
+    # 本参数保留给legacy对照，不参与新版A的高点门槛。B/C/D等独立策略保持原值。
     PAPER_INTRADAY_CONFIRM_MAX_PULLBACK_FROM_HIGH_PCT: float = 2.0
     # 旧PAPER_INTRADAY_CONFIRM_*仅归A；其他执行账户拥有各自的同值基线。
     # 可用JSON环境变量单独覆盖某账户，未提供的账户使用自身默认值，不继承A。
@@ -388,7 +409,8 @@ class Settings(BaseSettings):
     # === 3%~6%强势股首次回踩确认（产生影子证据；独立A2账户仍须执行层复核） ===
     # 版本阈值是前向实验协议的一部分；不得依据单日结果盘中改参。
     PAPER_MOMENTUM_RETEST_SHADOW_ENABLED: bool = True
-    PAPER_MOMENTUM_RETEST_SHADOW_VERSION: str = "momentum_retest_v3"
+    # v4 separates unknown-data recovery and ordered source-frame path evidence.
+    PAPER_MOMENTUM_RETEST_SHADOW_VERSION: str = "momentum_retest_v4"
     PAPER_MOMENTUM_RETEST_START: str = "09:35"
     PAPER_MOMENTUM_RETEST_CANDIDATE_END: str = "14:30"
     PAPER_MOMENTUM_RETEST_CONFIRM_END: str = "14:50"
@@ -460,7 +482,7 @@ class Settings(BaseSettings):
     PAPER_CHALLENGER_ACCOUNT_ENABLED: bool = True
     # A2消费已有首次回踩确认事件；E2独立验证高标强势/回封入口，不保证正收益。
     PAPER_CHALLENGER_A_VERSION: str = "a2_momentum_retest_v1"
-    PAPER_CHALLENGER_E_VERSION: str = "e2_highboard_reseal_v1"
+    PAPER_CHALLENGER_E_VERSION: str = "e2_highboard_reseal_v2"
     PAPER_CHALLENGER_A_AUTO_ORDER_ENABLED: bool = True
     PAPER_CHALLENGER_E_AUTO_ORDER_ENABLED: bool = True
     # 2026-09-17 复盘 行动项①：0.10 × 5 仓 = 50% 最大部署（一半资金永久闲置）、
@@ -507,7 +529,8 @@ class Settings(BaseSettings):
     PAPER_CHALLENGER_E_MAX_HOLD_DAYS: int = 3
     PAPER_CHALLENGER_E_MIN_CONSECUTIVE: int = 4
     PAPER_CHALLENGER_E_MAX_CONSECUTIVE: int = 8
-    PAPER_CHALLENGER_E_MIN_SEAL_AMOUNT: float = 1.0
+    # E2独立前向实验：5,000万元；E仍保留1亿元对照，非已证明收益最优值。
+    PAPER_CHALLENGER_E_MIN_SEAL_AMOUNT: float = 0.5
     PAPER_CHALLENGER_E_MAX_BREAK_COUNT: int = 2
     PAPER_CHALLENGER_E_REQUIRE_ABOVE_VWAP: bool = True
     PAPER_CHALLENGER_E_MAX_PULLBACK_FROM_HIGH_PCT: float = 2.0
@@ -638,6 +661,10 @@ class Settings(BaseSettings):
     PAPER_AUTO_SCALE_IN_MIN_SCORE: float = 84.0
     PAPER_AUTO_SCALE_IN_MIN_COST_RETURN_PCT: float = -1.5
     PAPER_AUTO_SCALE_IN_MAX_COST_RETURN_PCT: float = 1.2
+    # A低吸以VWAP承接为统一锚；legacy保留旧双锚用于对照研究。
+    PAPER_AUTO_ENTRY_ANCHOR: Literal["vwap_reclaim", "legacy_high"] = "vwap_reclaim"
+    PAPER_AUTO_SCALE_IN_COOLDOWN_SEC: int = Field(default=1800, ge=60)
+    PAPER_AUTO_SCALE_IN_MAX_DAILY_LAYERS: int = Field(default=2, ge=1, le=3)
     PAPER_AUTO_STRONG_MARKET_RECOVERY_ENABLED: bool = True
     PAPER_AUTO_STRONG_MARKET_RECOVERY_MIN_LIMIT_UP_COUNT: int = 100
     PAPER_AUTO_STRONG_MARKET_RECOVERY_MIN_ADVANCE_DECLINE_RATIO: float = 3.0
@@ -740,7 +767,7 @@ class Settings(BaseSettings):
     PAPER_AUTO_MA5_PULLBACK_MAX_BUY_AMOUNT: int = 5000
     PAPER_AUTO_MA5_PULLBACK_MAX_DAILY_LAYERS: int = 2
     PAPER_AUTO_MA5_PULLBACK_MAX_TOTAL_AMOUNT: int = 400
-    # 禁止单一评分触发近满仓；高质量信号同样先买一层，下一交易日再确认加仓。
+    # 禁止单一评分触发近满仓；高质量信号先买一层，冷却后重新确认才可加仓。
     PAPER_AUTO_FULL_CONVICTION_ENABLED: bool = False
     PAPER_AUTO_FULL_CONVICTION_MIN_SCORE: float = 96.0
     PAPER_AUTO_FULL_CONVICTION_POSITION_PCT: float = 0.95
@@ -946,6 +973,10 @@ class Settings(BaseSettings):
     # 已进入正式榜/召回榜的主线路线，再用同一板块的实时扩散强度二次确认。
     # 阈值复用 promotion 主线扩散既有口径，不允许回退旧快照或直接放行观察池。
     PAPER_MAINLINE_LIVE_CONFIRM_ENABLED: bool = True
+    # C消费本路线冻结资格，不受全市场展示榜名额挤占；仍须实时扩散确认。
+    PAPER_MAINLINE_ROUTE_POOL_ENABLED: bool = True
+    # B随当日正式盘中批次更新；D继续使用竞价/开盘专属批次。
+    PAPER_PROMOTION_INTRADAY_REFRESH_ENABLED: bool = True
     PAPER_MAINLINE_LIVE_CONFIRM_MIN_PROBABILITY: float = 0.02
     PAPER_MAINLINE_LIVE_CONFIRM_MIN_STRICT_CONFIRMATIONS: int = 2
     PAPER_MAINLINE_LIVE_CONFIRM_MIN_SECTOR_STRENGTH: float = 50.0
@@ -1036,7 +1067,7 @@ class Settings(BaseSettings):
     PAPER_STRATEGY_B_VERSION: str = "paper_b_promotion_dry_v2"
     PAPER_STRATEGY_C_VERSION: str = "paper_c_mainline_v2"
     PAPER_STRATEGY_D_VERSION: str = "paper_d_auction_quality_v2"
-    PAPER_STRATEGY_E_VERSION: str = "paper_e_highboard_v2"
+    PAPER_STRATEGY_E_VERSION: str = "paper_e_highboard_v3"
     PAPER_STRATEGY_F_VERSION: str = "paper_f_research_v2"
     # === 2026-08-31 复盘新增：硬止损仓位上限 ===
     # 任一持仓触发 PAPER_AUTO_STOP_LOSS_PCT 硬止损时, 单笔最大亏损不超过总资产的此比例。

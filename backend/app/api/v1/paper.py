@@ -19,10 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import OperationalError
 
 from app.config.settings import settings
-from app.paper.account_policy import account_confirmation_policy
+from app.paper.account_policy import EXIT_INPUT_CONTRACT_VERSION, account_confirmation_policy
 from app.paper.confirmation_evidence import (
     confirmation_evidence, freeze_log_evidence, historical_confirmation_evidence,
     order_confirmation_evidence, deferred_buy_log_evidence,
+    entry_consumer_timing, log_execution_timing, observe_candidate_stage,
 )
 from app.paper.experiment import execution_version, standard_execution_version, experiment_active, experiment_order_override, experiment_status, sentiment_is_required, sentiment_quality_at
 from app.core.price_limit_rules import is_limit_up_change, price_limit_rule
@@ -297,6 +298,9 @@ def _base_strategy_account(account_name: str) -> str:
 
 def _strategy_version(account_name: str) -> str:
     """执行协议变更独立版本；旧成交保留其入场版本，不混入新实验。"""
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT, portfolio_version
+    if account_name == PORTFOLIO_ACCOUNT:
+        return portfolio_version()
     base = _strategy_base_version(account_name)
     if settings.PAPER_CONTINUOUS_EXPERIMENT_ENABLED and account_name in (*PAPER_ALL_ACCOUNTS, *PAPER_CHALLENGER_ACCOUNTS):
         return execution_version(base, account_name=account_name)
@@ -485,6 +489,20 @@ async def _get_or_create_account(
 ) -> PaperAccount:
     """按账户名获取或创建模拟盘账户 (多策略并行)."""
     account_name = account_name or PAPER_ACCOUNT_DEFAULT
+    from app.trading.paper_authorization import fixed_price_account_identity
+    fixed_identity = fixed_price_account_identity(db, account_name)
+    if fixed_identity is not None:
+        with db.no_autoflush:
+            accounts = list((await db.scalars(select(PaperAccount).where(
+                PaperAccount.account_name == account_name, PaperAccount.status == "active")
+                .limit(2).execution_options(populate_existing=True))).all())
+        if len(accounts) != 1 or accounts[0].id != fixed_identity:
+            raise HTTPException(409, "盘后账务原活动账户已变化，禁止创建或重开账户")
+        return accounts[0]
+    from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+    if account_name == PORTFOLIO_ACCOUNT:
+        from app.paper.portfolio_wallet import get_portfolio_account
+        return await get_portfolio_account(db)
     lookup = (
         select(PaperAccount)
         .where(PaperAccount.account_name == account_name, PaperAccount.status == "active")
@@ -542,14 +560,17 @@ async def _stock_info(db: AsyncSession, code: str) -> tuple[Optional[str], Optio
     return (tag.name if tag else None), None
 
 
-def _commission(amount_value: float) -> float:
-    calculated = max(float(amount_value or 0), 0.0) * settings.PAPER_COMMISSION_RATE
-    minimum = max(float(getattr(settings, "PAPER_MIN_COMMISSION", 0) or 0), 0.0)
+def _commission(amount_value: float, *, fee_settings=None) -> float:
+    # Optional immutable preview inputs; existing book callers keep live settings.
+    policy = settings if fee_settings is None else fee_settings
+    calculated = max(float(amount_value or 0), 0.0) * policy.PAPER_COMMISSION_RATE
+    minimum = max(float(getattr(policy, "PAPER_MIN_COMMISSION", 0) or 0), 0.0)
     return round(max(calculated, minimum) if amount_value > 0 else 0.0, 2)
 
 
-def _stamp_tax(amount_value: float) -> float:
-    return round(amount_value * settings.PAPER_STAMP_TAX_RATE, 2)
+def _stamp_tax(amount_value: float, *, fee_settings=None) -> float:
+    policy = settings if fee_settings is None else fee_settings
+    return round(amount_value * policy.PAPER_STAMP_TAX_RATE, 2)
 
 
 async def _existing_paper_trade(
@@ -563,9 +584,18 @@ async def _existing_paper_trade(
     normalized = str(signal_id or "").strip()
     if not normalized:
         return None
+    from app.trading.paper_authorization import fixed_price_fragment_request_identity
+    fragment = fixed_price_fragment_request_identity(db)
+    query = select(PaperTradeLog)
+    if fragment is not None:
+        from sqlalchemy import String, cast
+        from app.models.trading import TradeFill
+        # All fragments retain the original decision signal. Only the stable
+        # typed fragment request/fill pair may replay this actual book entry.
+        query = query.join(TradeFill, TradeFill.broker_trade_id == cast(PaperTradeLog.id, String)).where(
+            TradeFill.fill_id == "fill-" + fragment, TradeFill.broker == "paper")
     return await db.scalar(
-        select(PaperTradeLog)
-        .where(
+        query.where(
             PaperTradeLog.account_id == account_id,
             PaperTradeLog.trade_type == trade_type,
             PaperTradeLog.signal_id == normalized,
@@ -833,7 +863,7 @@ def _strategy_display_meta(account: PaperAccount) -> dict:
     challenger_meta = {
         PAPER_ACCOUNT_CHALLENGER_A: {
             "label": "策略A2 · 首次回踩确认（持续模拟）",
-            "desc": "独立消费首次回踩确认，10%预算；止盈8%/止损5%/持仓5日；下一轮真实盘口撮合",
+            "desc": "独立消费首次回踩确认，预算和退出参数以当前账户配置为准；下一轮真实盘口撮合",
             "short": "A2",
         },
         PAPER_ACCOUNT_CHALLENGER_B: {
@@ -852,8 +882,8 @@ def _strategy_display_meta(account: PaperAccount) -> dict:
             "short": "D2",
         },
         PAPER_ACCOUNT_CHALLENGER_E: {
-            "label": "策略E2 · 高标强势/回封（持续模拟）",
-            "desc": "与E共享昨日封单/连板质量和退出约束，入口扩展至强势/回封；封死无卖盘不伪造成交",
+            "label": "策略E2 · 高标强势/触板（持续模拟）",
+            "desc": "独立高标质量门；收复昨收且非一价/跌停才进入强势确认；触板排队不等于回封路径认证",
             "short": "E2",
         },
         PAPER_ACCOUNT_CHALLENGER_F2: {
@@ -1000,6 +1030,9 @@ async def _round_trip_samples(trades: list[PaperTradeLog]) -> list[dict]:
     """按代码聚合从首次买入到仓位归零的完整交易轮次。"""
     state: dict[str, dict] = {}
     samples: list[dict] = []
+    # One ledger projection only: repeated closed lots often share the same
+    # dates. Never retain calendar results across refreshes/commits or failures.
+    hold_days_by_dates: dict[tuple[date, date], int] = {}
     for trade in sorted(trades, key=lambda item: (item.trade_time, item.id or 0)):
         code = trade.code
         bucket = state.setdefault(code, {
@@ -1040,13 +1073,12 @@ async def _round_trip_samples(trades: list[PaperTradeLog]) -> list[dict]:
             if bucket["amount"] <= 0 and bucket["buy_count"] > 0:
                 base = float(bucket["buy_cash"] or 0)
                 pnl = round(float(bucket["pnl"] or 0), 2)
-                hold_days = (
-                    await _trade_day_hold_days(
-                        bucket["buy_time"].date(),
-                        bucket["sell_time"].date(),
-                    )
-                    if bucket["buy_time"] and bucket["sell_time"] else None
-                )
+                hold_days = None
+                if bucket["buy_time"] and bucket["sell_time"]:
+                    dates = (bucket["buy_time"].date(), bucket["sell_time"].date())
+                    if dates not in hold_days_by_dates:
+                        hold_days_by_dates[dates] = await _trade_day_hold_days(*dates)
+                    hold_days = hold_days_by_dates[dates]
                 samples.append({
                     "code": code,
                     "buy_time": bucket["buy_time"].isoformat(sep=" ") if bucket["buy_time"] else None,
@@ -1439,12 +1471,28 @@ def _stable_intraday_entry_quote(
         return False, f"现价{price:.2f}低于VWAP{avg_price:.2f}", {}
     if high_price is None or high_price <= 0:
         return False, "日内高点缺失，不能识别冲高回落", {}
+    if high_price < price:
+        return False, "日内高点低于现价，报价矛盾不能确认分时路径", {}
+    if account_name in {PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_CHALLENGER_E}:
+        mode = _highboard_entry_evidence(spot, account_name=account_name)
+        if mode["issues"]:
+            issue = next((row for row in mode["issues"] if not row["recoverable"]), mode["issues"][0])
+            return False, issue["reason"], {}
     pullback_pct = max(0.0, (high_price - price) / high_price * 100.0)
     max_pullback = max(
         0.0,
         float(account_confirmation_policy(account_name)["max_pullback_from_high_pct"]),
     )
-    if pullback_pct > max_pullback:
+    vwap_entry = (account_name == PAPER_ACCOUNT_DEFAULT
+                  and settings.PAPER_AUTO_ENTRY_ANCHOR == "vwap_reclaim")
+    if vwap_entry:
+        low_price = _to_float(getattr(spot, "low", None))
+        if high_price < price or low_price is None or low_price <= 0 or low_price > price:
+            return False, "日内高低点缺失或与现价矛盾，无法验证回踩位置", {}
+        premium = (price / avg_price - 1) * 100
+        if premium > settings.PAPER_AUTO_VALUE_ENTRY_MAX_VWAP_PREMIUM_PCT:
+            return False, f"现价高于VWAP {premium:.2f}%，等待回踩承接", {}
+    elif pullback_pct > max_pullback:
         return False, f"较日内高点回落{pullback_pct:.2f}%超过{max_pullback:.2f}%", {}
     return True, "", {
         "price": price,
@@ -1452,7 +1500,57 @@ def _stable_intraday_entry_quote(
         "high_price": high_price,
         "limit_up": limit_up,
         "pullback_from_high_pct": round(pullback_pct, 4),
+        "entry_anchor": "vwap_reclaim" if vwap_entry else "day_high",
     }
+
+
+def _pending_primary_quote_issues(spot, *, account_name: str) -> list[dict]:
+    """Evaluate independent existing quote predicates before reducing severity.
+
+    Missing/invalid numbers never become zero or borrow a frozen candidate price.
+    A known VWAP/pullback failure remains terminal even with another unknown leaf.
+    Thresholds and the A VWAP-vs-day-high branch mirror the existing entry gate.
+    """
+    required = ["price", "prev_close", "avg_price", "high", "limit_up"]
+    if account_name == PAPER_ACCOUNT_DEFAULT:
+        required.append("low")
+    values = {key: _to_float(getattr(spot, key, None)) for key in required}
+    issues = [
+        {"code": f"missing_{key}", "reason": f"暂缺成交前有效{key}证据", "recoverable": True}
+        for key, value in values.items() if value is None or value <= 0
+    ]
+    price, avg, high = (values[key] for key in ("price", "avg_price", "high"))
+    price_valid = price is not None and price > 0
+    avg_valid = avg is not None and avg > 0
+    high_valid = high is not None and high > 0
+    vwap_entry = (account_name == PAPER_ACCOUNT_DEFAULT
+                  and settings.PAPER_AUTO_ENTRY_ANCHOR == "vwap_reclaim")
+    if price_valid and high_valid and high < price:
+        issues.append({"code": "invalid_high", "reason": "暂缺有效日内高点：高点低于现价",
+                       "recoverable": True})
+    if vwap_entry and price_valid:
+        low = values["low"]
+        if low is not None and low > price:
+            issues.append({"code": "invalid_low", "reason": "日内低点高于现价，原回踩位置已失效",
+                           "recoverable": False})
+    if price_valid and avg_valid and price < avg:
+        issues.append({"code": "below_vwap", "reason": f"现价{price:.2f}低于VWAP{avg:.2f}",
+                       "recoverable": False})
+    if vwap_entry:
+        if price_valid and avg_valid:
+            premium = (price / avg - 1) * 100
+            if premium > settings.PAPER_AUTO_VALUE_ENTRY_MAX_VWAP_PREMIUM_PCT:
+                issues.append({"code": "vwap_premium", "reason": f"现价高于VWAP {premium:.2f}%，等待回踩承接",
+                               "recoverable": False})
+    elif price_valid and high_valid and high >= price:
+        pullback = max(0.0, (high - price) / high * 100.0)
+        threshold = max(0.0, float(account_confirmation_policy(account_name)["max_pullback_from_high_pct"]))
+        if pullback > threshold:
+            issues.append({"code": "pullback", "reason": f"较日内高点回落{pullback:.2f}%超过{threshold:.2f}%",
+                           "recoverable": False})
+    if account_name in {PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_CHALLENGER_E}:
+        issues.extend(_highboard_entry_evidence(spot, account_name=account_name)["issues"])
+    return issues
 
 
 async def _pending_primary_buy_confirmation(
@@ -1463,24 +1561,51 @@ async def _pending_primary_buy_confirmation(
     if (candidate.get("code") != getattr(spot, "code", None)
             or candidate.get("_source") != source):
         return "canceled", "原始候选与本轮代码/来源不一致"
-    # No stale candidate-price fallback on a fill round.
-    required = ["price", "prev_close", "avg_price", "high", "limit_up"]
-    if account_name == PAPER_ACCOUNT_DEFAULT:
-        required += ["low"]
-    for key in required:
-        value = _to_float(getattr(spot, key, None))
-        if value is None or value <= 0:
-            return "waiting", f"暂缺成交前有效{key}证据"
-    if float(spot.high) < float(spot.price):
-        return "waiting", "暂缺有效日内高点：高点低于现价"
-    stable, reason, _ = _stable_intraday_entry_quote(spot, account_name=account_name)
-    if not stable:
-        return "canceled", f"原分时确认已失效：{reason}"
+    # Immutable route/account failures must not be concealed by missing quotes.
+    if source.startswith("promotion_"):
+        if source != f"promotion_{account_name}" or account_name not in PAPER_PROMOTION_ACCOUNTS:
+            return "canceled", "原晋级路线与执行账户不一致"
+    elif source == "tenbagger_midline":
+        if account_name not in {PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_CHALLENGER_E}:
+            return "canceled", "高标路线与执行账户不一致"
+        from app.paper.experiment import HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION
+        if candidate.get("entry_mode_contract") != HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION:
+            return "canceled", "高标原模式合同缺失或已替换，禁止用新规则补成交旧信号"
+        if candidate.get("entry_variant") not in _highboard_entry_modes(account_name):
+            return "canceled", "高标原模式身份缺失、非法或不属于本账户，禁止补造模式证据"
+        # A known mode transition is terminal even if an unrelated VWAP is unknown.
+        # Never let missing data preserve an old order until its original mode returns.
+        current_mode = _highboard_entry_evidence(spot, account_name=account_name)
+        if (current_mode["valid"]
+                and current_mode["mode"] != candidate.get("entry_variant")):
+            return "canceled", "高标原模式已切换，旧触板/强势/低位委托不得替换模式证据"
+    elif source == "reversal_pullback":
+        if account_name != PAPER_ACCOUNT_REVERSAL:
+            return "canceled", "反包路线与执行账户不一致"
+    elif account_name != PAPER_ACCOUNT_DEFAULT:
+        return "canceled", "无可验证的原账户买入路线，失败关闭"
+    issues = _pending_primary_quote_issues(spot, account_name=account_name)
+    if issues:
+        terminal = next((issue for issue in issues if not issue["recoverable"]), None)
+        if terminal is not None:
+            return "canceled", f"原分时确认已失效：{terminal['reason']}"
+        if account_name != PAPER_ACCOUNT_REVERSAL:
+            return "waiting", issues[0]["reason"]
+    if not issues:
+        stable, reason, _ = _stable_intraday_entry_quote(spot, account_name=account_name)
+        if not stable:
+            return "canceled", f"原分时确认已失效：{reason}"
     diagnostics: list[dict] = []
     def empty_candidate_status() -> str:
         # Use the existing structured diagnostic, never infer recoverability
         # from a Chinese reason substring or permit a trade on missing data.
-        relevant = [d for d in diagnostics if d.get("code") in (None, candidate["code"])]
+        from app.paper.candidate_audit import candidate_trace
+        relevant = [d for d in diagnostics if d.get("code") in (None, candidate["code"])
+                    and candidate_trace(d) is None]
+        if account_name == PAPER_ACCOUNT_REVERSAL and any(isinstance(d.get("candidate"), dict)
+               and d["candidate"].get("signal_date") not in (None, candidate.get("signal_date"))
+               for d in relevant):
+            return "canceled"
         if relevant and all(
             d.get("stage_code") == "data_gate"
             and ((isinstance(d.get("candidate"), dict)
@@ -1491,7 +1616,8 @@ async def _pending_primary_buy_confirmation(
             return "waiting"
         return "canceled"
 
-    if source != "next_day_plan" and _to_float(getattr(spot, "change_pct", None)) is None:
+    if (source != "next_day_plan" and account_name != PAPER_ACCOUNT_REVERSAL
+            and _to_float(getattr(spot, "change_pct", None)) is None):
         return "waiting", "暂缺成交前涨幅证据"
     if source.startswith("promotion_"):
         if source != f"promotion_{account_name}" or account_name not in PAPER_PROMOTION_ACCOUNTS:
@@ -1516,7 +1642,8 @@ async def _pending_primary_buy_confirmation(
         if account_name != PAPER_ACCOUNT_REVERSAL:
             return "canceled", "反包路线与执行账户不一致"
         rows, notes = await _reversal_pullback_candidates(
-            db, limit=1, trade_date=now.date(), only_code=str(candidate["code"]))
+            db, limit=1, trade_date=now.date(), only_code=str(candidate["code"]),
+            diagnostics=diagnostics, pending_recheck=True)
     elif account_name == PAPER_ACCOUNT_DEFAULT:
         current = dict(candidate)
         reason = await _confirm_candidate_main_fund(
@@ -1539,6 +1666,13 @@ async def _pending_primary_buy_confirmation(
         return empty_candidate_status(), "原形态路线当前实时确认未通过：" + "；".join(notes)
     if rows[0].get("signal_date") != candidate.get("signal_date"):
         return "canceled", "原形态信号日期已替换，旧委托不得消费新信号"
+    if source == "tenbagger_midline":
+        if rows[0].get("entry_mode_contract") != candidate.get("entry_mode_contract"):
+            return "canceled", "高标模式合同不一致，原委托不得替换模式证据"
+        if rows[0].get("entry_variant") != candidate.get("entry_variant"):
+            return "canceled", "高标原模式已切换，旧触板/强势/低位委托不得替换模式证据"
+    if issues:
+        return "waiting", issues[0]["reason"]  # F may check identity, never trade through an unknown quote.
     return "valid", ""
 
 
@@ -1584,11 +1718,27 @@ async def _champion_intraday_confirmation_status(
     source: str,
     current_at: datetime,
     account_name: str = PAPER_ACCOUNT_DEFAULT,
+    portfolio_only: bool = False,
+    current_entry_mode: str | None = None,
 ) -> tuple[bool, int, float]:
     """只恢复本账户当前版本且当时已提交的确认；旧版本不为新参数凑帧数。"""
     policy = account_confirmation_policy(account_name)
     min_samples = max(int(policy["min_samples"]), 1)
     max_gap = max(int(policy["max_sample_gap_sec"]), 1)
+    highboard = account_name in {PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_CHALLENGER_E}
+    if highboard and current_entry_mode not in _highboard_entry_modes(account_name):
+        return False, 0, 0.0
+    actions = ("confirm_buy", "portfolio_confirm") if portfolio_only else ("confirm_buy",)
+    reset_actions = ("skip_buy", "portfolio_skip") if portfolio_only else ("skip_buy",)
+    row_scope = (PaperAutoTradeLog.source == source) & PaperAutoTradeLog.action.in_(
+        (*actions, *reset_actions)
+    )
+    if highboard:
+        row_scope = row_scope | (
+            (PaperAutoTradeLog.source == source) & (PaperAutoTradeLog.action == "skip_buy")
+        ) | (
+            (PaperAutoTradeLog.source == "candidate") & (PaperAutoTradeLog.action == "candidate_reject")
+        )
     rows = list(
         (
             await db.scalars(
@@ -1597,8 +1747,7 @@ async def _champion_intraday_confirmation_status(
                     PaperAutoTradeLog.account_id == account_id,
                     PaperAutoTradeLog.trade_date == trade_date,
                     PaperAutoTradeLog.code == code,
-                    PaperAutoTradeLog.source == source,
-                    PaperAutoTradeLog.action == "confirm_buy",
+                    row_scope,
                     PaperAutoTradeLog.strategy_version == _strategy_version(account_name),
                     PaperAutoTradeLog.created_at <= current_at,
                 )
@@ -1610,15 +1759,32 @@ async def _champion_intraday_confirmation_status(
     sample_times: list[datetime] = []
     for row in rows:
         payload = _json_loads_dict(row.candidate_json)
+        if payload.get("primary_confirmation_reset") is True:
+            break
+        if not highboard and row.action not in actions:
+            continue  # Capacity skips alone do not invalidate the quote path.
+        if highboard:
+            from app.paper.experiment import HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION
+            if row.action == "candidate_reject" or payload.get("highboard_confirmation_reset") is True:
+                break
+            if row.action not in actions:
+                continue  # Capacity/position skips do not invalidate a valid price path.
+            if (payload.get("entry_mode_contract") != HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION
+                    or payload.get("entry_variant") != current_entry_mode):
+                break  # Mode transitions reset the streak; never splice A -> B -> A.
         if payload.get("confirmation_version") != "champion_persistent_v1":
             continue
-        parsed = payload.get("confirmation_sample_at")
+        # Commit clocks cannot manufacture distinct market observations.
+        parsed = payload.get("confirmation_source_quote_at")
         try:
             sample_at = datetime.fromisoformat(str(parsed))
+            committed_at = row.created_at
+            if (sample_at.date() != trade_date or sample_at > current_at
+                    or not isinstance(committed_at, datetime) or sample_at > committed_at):
+                continue
         except (TypeError, ValueError):
-            sample_at = row.created_at if isinstance(row.created_at, datetime) else None
-        if sample_at is not None:
-            sample_times.append(sample_at)
+            continue
+        sample_times.append(sample_at)
     return _confirmation_streak_status(
         sample_times,
         current_at=current_at,
@@ -1795,6 +1961,10 @@ def _auto_log_payload(log: PaperAutoTradeLog) -> dict:
         "sector_name": candidate.get("sector_name") or candidate.get("driver_primary") or "",
         "stop_loss_price": candidate.get("stop_loss_price"),
         "confirmation_evidence": confirmation_evidence(candidate),
+        "candidate_trace": candidate.get("candidate_trace") if isinstance(candidate.get("candidate_trace"), dict) else None,
+        "candidate_audit_summary": candidate.get("candidate_audit_summary") if isinstance(candidate.get("candidate_audit_summary"), dict) else None,
+        "prediction_run_id": candidate.get("prediction_run_id"),
+        "prediction_snapshot_id": candidate.get("prediction_snapshot_id"),
     }
 
 
@@ -2043,9 +2213,13 @@ async def _add_auto_log(
     threshold_value: Optional[float] = None,
     created_at: Optional[datetime] = None,
     deferred_buy_outcome: Optional[dict] = None,
+    flush: bool = True,
 ) -> PaperAutoTradeLog:
     round_context = _quote_round_context()
     candidate_payload = dict(candidate or {})
+    timing = log_execution_timing(candidate_payload)
+    if timing is not None:
+        candidate_payload["execution_timing"] = timing
     if deferred_buy_outcome is not None:
         try:
             candidate_payload.update(deferred_buy_log_evidence(
@@ -2121,8 +2295,83 @@ async def _add_auto_log(
         code_version=str(round_context.get("code_version") or "") or None,
     )
     db.add(log)
-    await db.flush()
+    if flush:
+        await db.flush()
     return log
+
+
+def _capture_primary_candidate_shadow(
+    *, account, candidate=None, spot=None, run_id="", stage="", reason="",
+    original_candidate=False, original_confirmed=None, original_gate=None,
+    reported_at=None,
+):
+    """Non-blocking observation; never a formal log, notification or authorization.
+
+    Capture already evaluated leaves. Quote-path confirmation is NOT a formal
+    strategy confirmation. A producer observation does not assert DB persistence.
+    """
+    if not settings.PAPER_CANDIDATE_SHADOW_ENABLED:
+        return
+    try:
+        from app.paper.candidate_shadow import capture_frame
+        from app.paper.intraday_route_research import STRATEGY_CANDIDATE_ACCOUNTS
+
+        account_name = str(account.account_name or "")
+        route = next((key for key, value in STRATEGY_CANDIDATE_ACCOUNTS.items()
+                      if value == account_name), None)
+        if route not in ("A", "B", "C", "D", "E", "E2", "F"):
+            return
+        item = candidate if isinstance(candidate, dict) else {}
+        source = str(item.get("_source") or "")
+        quote = {key: getattr(spot, key, None) for key in (
+            "code", "price", "prev_close", "open", "high", "low", "change_pct",
+            "avg_price", "volume_ratio", "amount", "volume", "limit_up",
+            "ask1_price", "ask1_volume", "orderbook_imbalance",
+            "source_quote_at", "received_at", "updated_at", "quote_round_id",
+        )} if spot is not None else {}
+        leaves = {key: item.get(key) for key in (
+            "_source", "probability", "prediction_run_id", "prediction_snapshot_id",
+            "prediction_run_key", "snapshot_context", "signal_date",
+            "trade_gate_passed", "watch_only", "snapshot_actionable",
+            "conditional_mainline_confirmation", "candidate_eligibility_basis",
+            "consecutive_days", "gap_days", "dip_min", "vol_ratio",
+            "entry_variant", "confirmation_sample_count", "confirmation_persistence_sec",
+            "confirmation_version", "candidate_count", "diagnostic_count",
+        ) if item.get(key) is not None and isinstance(item.get(key), (str, int, float, bool))}
+        identities = {}
+        if original_candidate:
+            identities["pool_identity"] = True
+            if route == "C":
+                # Actionable alone cannot reconstruct causal mainline evidence.
+                identities["mainline_identity"] = (
+                    True if item.get("conditional_mainline_confirmation") is True else None)
+            if route in ("E", "E2") and source == "tenbagger_midline":
+                identities["highboard_identity"] = True
+            if route == "F" and source == "reversal_pullback":
+                identities["broken_board_identity"] = True
+        code = str(item.get("code") or getattr(spot, "code", "") or "")
+        at = datetime.now()  # actual capture clock, not nominal round collection time
+        if isinstance(reported_at, datetime) and reported_at.date() != at.date():
+            return  # no historical/backfilled invocation enters the forward experiment
+        if original_confirmed is True:
+            identities["original_confirmed_at"] = at
+        cohort = item.get("prediction_run_id") or item.get("signal_date") or "current_pool"
+        episode_id = f"primary:{at.date()}:{account_name}:{source}:{cohort}:{code}"
+        capture_frame({
+            "route": route, "account_id": account.id, "account_name": account_name,
+            "production_version": _strategy_version(account_name),
+            "code": code, "name": str(item.get("name") or ""),
+            "observed_at": at, "producer_reported_at": reported_at,
+            "evidence_ref": f"primary:{run_id}:{code or 'scan'}:{stage}:{at.isoformat()}",
+            "scan_id": run_id, "episode_id": episode_id, "stage": stage, "reason": reason,
+            "original_candidate": original_candidate,
+            "original_confirmed": original_confirmed, "original_gate": original_gate,
+            "quote": quote, "gate_inputs": {"producer": "run_paper_auto_trade", **leaves},
+            "identities": identities, "probability": item.get("probability"),
+            "source_persistence": "producer_observed_not_commit_receipt",
+        })
+    except Exception as exc:
+        logger.debug("Candidate shadow observation unavailable (%s)", type(exc).__name__)
 
 
 async def _position_context(db: AsyncSession, account: PaperAccount) -> tuple[dict, float]:
@@ -2528,8 +2777,8 @@ def _auto_buy_amount(account: PaperAccount, price: float, open_count: int, score
     if total_assets > 0 and price > 0 and stop_loss_pct > 0 and max_loss_pct > 0:
         max_loss_amount = total_assets * (max_loss_pct / 100.0)
         cap_amount = _round_lot(max_loss_amount / (price * (stop_loss_pct / 100.0)))
-        if cap_amount > 0:
-            amount = min(amount, cap_amount)
+        # Less than one lot means no admissible quantity, not an absent cap.
+        amount = min(amount, cap_amount)
     return amount
 
 
@@ -2636,6 +2885,9 @@ def _scale_in_reject_reason(
     score: float,
     total_assets: float,
     bought_code_today: bool,
+    now: datetime | None = None,
+    last_buy_at: datetime | None = None,
+    daily_layers: int | None = None,
 ) -> str:
     """同股加仓只允许支撑回收后的下一层，不允许追涨或下跌摊平。"""
     if not settings.PAPER_AUTO_SCALE_IN_ENABLED:
@@ -2643,13 +2895,35 @@ def _scale_in_reject_reason(
     if score < settings.PAPER_AUTO_SCALE_IN_MIN_SCORE:
         return f"评分{score:.1f}未达到追加层门槛{settings.PAPER_AUTO_SCALE_IN_MIN_SCORE:.1f}"
     if bought_code_today:
-        return "今日已完成该股一层建仓，等待下一交易日再次确认"
+        if now is None or last_buy_at is None or daily_layers is None:
+            return "今日已完成该股一层建仓，缺少新一层的成交/确认时间证据"
+        if daily_layers >= settings.PAPER_AUTO_SCALE_IN_MAX_DAILY_LAYERS:
+            return "今日已达到同股建仓层数上限"
+        try:
+            confirmed_at = datetime.fromisoformat(str(candidate.get("confirmation_sample_at")))
+            persistence = float(candidate.get("confirmation_persistence_sec") or 0)
+            samples = int(candidate.get("confirmation_sample_count") or 0)
+            policy = account_confirmation_policy()
+            fresh = (
+                last_buy_at.date() == now.date() == confirmed_at.date()
+                and 0 <= (now - confirmed_at).total_seconds() <= settings.PAPER_EXECUTION_QUOTE_MAX_AGE_SEC
+                and samples >= policy["min_samples"]
+                and math.isfinite(persistence) and persistence >= policy["min_persistence_sec"] - policy["clock_jitter_sec"]
+                and (confirmed_at - timedelta(seconds=persistence) - last_buy_at).total_seconds()
+                >= settings.PAPER_AUTO_SCALE_IN_COOLDOWN_SEC
+            )
+        except (TypeError, ValueError, OverflowError):
+            fresh = False
+        if not fresh:
+            return "追加层须在上次成交冷却后重新完成持续确认，不能复用首层确认"
     if not _candidate_allows_continuous_participation(candidate, score):
         return "当前不是已确认的回踩/低点回收信号，不追加仓位"
     cost = float(position.buy_price or 0)
     if cost <= 0 or price <= 0:
         return "缺少有效持仓成本或现价"
     cost_return_pct = (price / cost - 1) * 100
+    if bought_code_today and cost_return_pct < 0:
+        return "同日追加层须站稳持仓成本，不做下跌摊平"
     if cost_return_pct < settings.PAPER_AUTO_SCALE_IN_MIN_COST_RETURN_PCT:
         return f"现价较成本{cost_return_pct:.2f}%，尚未确认止跌，不做下跌摊平"
     if cost_return_pct > settings.PAPER_AUTO_SCALE_IN_MAX_COST_RETURN_PCT:
@@ -2663,6 +2937,41 @@ def _scale_in_reject_reason(
     if position_pct >= settings.PAPER_AUTO_STAGED_ENTRY_MAX_POSITION_PCT:
         return f"当前单股仓位已达{position_pct * 100:.1f}%，不再加层"
     return ""
+
+
+async def _same_day_buy_layers(
+    db: AsyncSession, *, account_id: int, code: str, now: datetime,
+    as_of: datetime | None = None,
+) -> tuple[int, datetime | None]:
+    """同一原委托的已核实分批成交只计一层；未知逐笔计，冷却从末次成交算。"""
+    from app.paper.position_policy import buy_order_evidence
+
+    # Market round time and actual book observation are separate clocks.
+    cutoff = min(datetime.combine(now.date(), time.max), as_of) if as_of is not None else now
+    rows = list((await db.scalars(select(PaperTradeLog).where(
+        PaperTradeLog.account_id == account_id, PaperTradeLog.code == code,
+        PaperTradeLog.trade_type == "buy",
+        PaperTradeLog.trade_time >= datetime.combine(now.date(), time.min),
+        PaperTradeLog.trade_time <= cutoff,
+    ))).all())
+    evidence = await buy_order_evidence(db, account_id=account_id, trades=rows, as_of=cutoff)
+    layers = {
+        ("order", evidence[row.id]["order_id"]) if evidence[row.id]["status"] == "verified"
+        else ("ledger", row.id)
+        for row in rows
+    }
+    return len(layers), max((row.trade_time for row in rows), default=None)
+
+
+def _scale_in_risk_amount(amount: int, *, position: PaperPosition, price: float,
+                          stop_loss: float, total_assets: float) -> int:
+    """追加层按持仓合计风险额度限量；与单笔预算、资金风控取交集。"""
+    risk_per_share = price - stop_loss
+    if not all(math.isfinite(value) for value in (risk_per_share, stop_loss, total_assets)) or risk_per_share <= 0 or stop_loss <= 0:
+        return 0
+    loss_budget = total_assets * settings.PAPER_AUTO_HARD_STOP_MAX_LOSS_PCT / 100
+    total_cap = _round_lot(loss_budget / risk_per_share)
+    return min(_round_lot(amount), _round_lot(max(0, total_cap - int(position.buy_amount or 0))))
 
 
 def _is_full_exit_reason(reason: str) -> bool:
@@ -2887,9 +3196,24 @@ async def _today_auto_new_buy_logs(
     account_id: Optional[int] = None,
     *,
     include_legacy_null: bool = False,
+    as_of: datetime | None = None,
 ) -> list[PaperAutoTradeLog]:
+    """Quota projection, not raw history: verified slices share one original order.
+
+    Unknown/contradictory facts retain their individual log slots. Only an
+    original-order scale_in marker can exempt a verified, consistent group.
+    """
+    from app.models.trading import TradeFill
+    from app.paper.position_policy import buy_order_evidence
+
+    start = datetime.combine(trade_date, time.min)
+    cutoff = min(datetime.combine(trade_date, time.max),
+                 as_of if as_of is not None else _public_order_clock())
+    if cutoff < start:
+        return []
     stmt = select(PaperAutoTradeLog).where(
         PaperAutoTradeLog.trade_date == trade_date,
+        PaperAutoTradeLog.created_at <= cutoff,
         PaperAutoTradeLog.action == "buy",
         PaperAutoTradeLog.decision == "executed",
         PaperAutoTradeLog.source != "position-t",
@@ -2901,12 +3225,80 @@ async def _today_auto_new_buy_logs(
             )
         else:
             stmt = stmt.where(PaperAutoTradeLog.account_id == account_id)
-    rows = (
-        await db.execute(
+    with db.no_autoflush:
+        rows = list((await db.scalars(
             stmt.order_by(PaperAutoTradeLog.created_at, PaperAutoTradeLog.id)
+        )).all())
+        if account_id is None or not rows:
+            return rows
+        ids = sorted({row.executed_trade_id for row in rows
+                      if row.account_id == account_id
+                      and type(row.executed_trade_id) is int})
+        trades = {}
+        order_hints = {}
+        for offset in range(0, len(ids), 400):
+            batch = ids[offset:offset + 400]
+            for trade in (await db.scalars(
+                select(PaperTradeLog).where(PaperTradeLog.id.in_(batch))
+            )).all():
+                trades[trade.id] = trade
+            # Untrusted receipt links can only taint a group, never merge or
+            # exempt it. This preserves conflicts even when strict proof fails.
+            for receipt_id, order_id in (await db.execute(select(
+                TradeFill.broker_trade_id, TradeFill.order_id,
+            ).where(TradeFill.broker_trade_id.in_([str(value) for value in batch])))).all():
+                order_hints.setdefault(receipt_id, set()).add(order_id)
+        visible = [trade for trade in trades.values()
+                   if trade.account_id == account_id and trade.trade_type == "buy"
+                   and start <= trade.trade_time <= cutoff]
+        evidence = await buy_order_evidence(
+            db, account_id=account_id, trades=visible, as_of=cutoff,
         )
-    ).scalars().all()
-    return list(rows)
+
+    kept, groups, tainted = [], {}, set()
+    for row in rows:
+        # Legacy NULL belongs to no proven wallet, even when its pointer happens
+        # to name this account's trade. Preserve it without spreading its flags.
+        if row.account_id != account_id:
+            kept.append(row)
+            continue
+        trade = trades.get(row.executed_trade_id)
+        proof = evidence.get(row.executed_trade_id, {})
+        exact = (
+            trade is not None and proof.get("status") == "verified"
+            and row.code == trade.code and row.strategy_version == trade.strategy_version
+            and row.created_at.date() == trade_date
+            and (trade.trade_time <= row.created_at
+                 or (bool(row.quote_round_id)
+                     and row.quote_round_id in {trade.decision_round_id, trade.fill_round_id}))
+        )
+        if not exact:
+            kept.append(row)
+            tainted.update(order_hints.get(str(row.executed_trade_id), ()))
+            continue
+        groups.setdefault(proof["order_id"], []).append((row, proof))
+
+    for order_id, group in groups.items():
+        candidates = [_json_loads_dict(row.candidate_json) for row, _ in group]
+        sectors = {_candidate_sector_key(candidate) for candidate in candidates}
+        order_scale = group[0][1]["scale_in"]
+        explicit_markers = {
+            candidate["scale_in"] for candidate in candidates
+            if type(candidate.get("scale_in")) is bool
+        }
+        marker_conflict = len(explicit_markers) > 1 or any(
+            "scale_in" in candidate and (
+                type(candidate["scale_in"]) is not bool
+                or (order_scale is not None and candidate["scale_in"] is not order_scale)
+            )
+            for candidate in candidates
+        )
+        if order_id in tainted or len(sectors) != 1 or marker_conflict:
+            kept.extend(row for row, _ in group)
+        elif order_scale is not True:
+            kept.append(group[0][0])
+    # Both daily and sector quotas must consume exactly this same projection.
+    return sorted(kept, key=lambda row: (row.created_at, row.id))
 
 
 def _sector_counts_from_auto_logs(logs: list[PaperAutoTradeLog]) -> dict[str, int]:
@@ -3175,11 +3567,7 @@ def _candidate_price_levels(candidate: dict, key: str) -> list[float]:
 
 
 def _a_entry_price_band(spot: StockSpot | None) -> dict:
-    """只审计A正涨幅入口的必要条件交集，不生成信号或放宽任一原阈值。
-
-    分时稳定要求报价 >= H*(1-回撤上限)，低吸要求成交价 <= L*(1+反弹上限)。
-    买单还须经过盘口/其余策略/资金风控；交集非空绝不等于可买。
-    """
+    """A必要价格区间；新版统一VWAP锚并保留振幅位置，非买入充分条件。"""
     high = _to_float(getattr(spot, "high", None))
     low = _to_float(getattr(spot, "low", None))
     change = _to_float(getattr(spot, "change_pct", None))
@@ -3189,6 +3577,16 @@ def _a_entry_price_band(spot: StockSpot | None) -> dict:
     rebound = float(settings.PAPER_AUTO_VALUE_ENTRY_MAX_REBOUND_FROM_LOW_PCT)
     lower = high * (1 - drawdown / 100)
     upper = low * (1 + rebound / 100)
+    anchor = settings.PAPER_AUTO_ENTRY_ANCHOR
+    if anchor == "vwap_reclaim":
+        vwap = _to_float(getattr(spot, "avg_price", None))
+        if vwap is None or vwap <= 0:
+            return {"status": "missing", "entry_anchor": anchor, "sufficient_for_entry": False}
+        lower = vwap
+        upper = min(
+            vwap * (1 + settings.PAPER_AUTO_VALUE_ENTRY_MAX_VWAP_PREMIUM_PCT / 100),
+            low + (high - low) * settings.PAPER_AUTO_VALUE_ENTRY_MAX_RANGE_POSITION,
+        )
     return {
         "status": "empty" if lower > upper + 1e-8 else "nonempty",
         "lower_price": round(lower, 8),
@@ -3198,6 +3596,7 @@ def _a_entry_price_band(spot: StockSpot | None) -> dict:
         "max_low_rebound_pct": rebound,
         "sufficient_for_entry": False,
         "basis": "current_round_necessary_constraints",
+        "entry_anchor": anchor,
     }
 
 
@@ -3266,6 +3665,7 @@ def _candidate_execution_value_reject_reason(
         if (
             change_pct is not None
             and change_pct > 0
+            and settings.PAPER_AUTO_ENTRY_ANCHOR == "legacy_high"
             and rebound_from_low_pct > settings.PAPER_AUTO_VALUE_ENTRY_MAX_REBOUND_FROM_LOW_PCT
         ):
             return (
@@ -3420,6 +3820,7 @@ def _short_weak_confirmation_count(
     orderbook_imbalance: Optional[float],
     volume_ratio: Optional[float],
     change_pct: Optional[float],
+    volume_negative_ratio: Optional[float] = None,
 ) -> int:
     confirmations = 0
     if price is not None and avg_price is not None and price < avg_price:
@@ -3432,7 +3833,7 @@ def _short_weak_confirmation_count(
         confirmations += 1
     if (
         volume_ratio is not None
-        and volume_ratio >= settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO
+        and volume_ratio >= _number_or(volume_negative_ratio, settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO)
         and change_pct is not None
         and change_pct < 0
     ):
@@ -3450,6 +3851,7 @@ def _short_independent_weak_evidence_count(
     orderbook_imbalance: Optional[float],
     volume_ratio: Optional[float],
     change_pct: Optional[float],
+    volume_negative_ratio: Optional[float] = None,
 ) -> int:
     """开盘噪声窗专用：只统计"独立走弱证据"。
 
@@ -3479,7 +3881,7 @@ def _short_independent_weak_evidence_count(
         evidences += 1
     if (
         volume_ratio is not None
-        and volume_ratio >= settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO
+        and volume_ratio >= _number_or(volume_negative_ratio, settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO)
         and change_pct is not None
         and change_pct < 0
     ):
@@ -3501,6 +3903,7 @@ def _confirmed_sector_retreat_sell_reason(
     volume_ratio: Optional[float],
     change_pct: Optional[float],
     close_position: Optional[float],
+    volume_negative_ratio: Optional[float] = None,
 ) -> str:
     """板块退潮只能加速已被个股盘口确认的退出，不能单独触发清仓。"""
     if not sector_retreat_reason:
@@ -3513,6 +3916,7 @@ def _confirmed_sector_retreat_sell_reason(
         orderbook_imbalance=orderbook_imbalance,
         volume_ratio=volume_ratio,
         change_pct=change_pct,
+        volume_negative_ratio=volume_negative_ratio,
     )
     weak_parts: list[str] = []
     if price is not None and avg_price is not None and price < avg_price:
@@ -3525,7 +3929,7 @@ def _confirmed_sector_retreat_sell_reason(
         weak_parts.append("盘口卖压")
     if (
         volume_ratio is not None
-        and volume_ratio >= settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO
+        and volume_ratio >= _number_or(volume_negative_ratio, settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO)
         and change_pct is not None
         and change_pct < 0
     ):
@@ -3594,9 +3998,23 @@ async def _apply_auto_position_risk(
     if not position:
         return
     if stop_loss_price and stop_loss_price > 0:
+        from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+        account_name = await db.scalar(select(PaperAccount.account_name).where(PaperAccount.id == account_id))
+        if account_name == PORTFOLIO_ACCOUNT:
+            # A delayed audit/reconciliation receipt cannot loosen a stop raised
+            # since the original order. The locked BUY guard already checks fills.
+            stop_loss_price = max(stop_loss_price, float(position.stop_loss_price or 0))
         position.stop_loss_price = round(stop_loss_price, 2)
     position.buy_reason = reason
     await db.flush()
+
+
+class _SourceScanNotes(list):
+    """Human notes plus explicit source-health facts; never classify note text."""
+
+    def __init__(self, values=(), *, issues=()):
+        super().__init__(values)
+        self.issues = list(issues)
 
 
 async def _next_day_plan_buy_candidates(
@@ -3612,7 +4030,7 @@ async def _next_day_plan_buy_candidates(
         snapshot = await prewarm_next_day_plan_snapshot(db, None, force_refresh=False, limit=max(limit, 20))
     except Exception as exc:
         await db.rollback()
-        return [], [f"高胜率明日预案加载失败：{exc}"]
+        return [], _SourceScanNotes([f"高胜率明日预案加载失败：{exc}"], issues=[{"source": "next_day_plan", "reason_code": "source_read_failed"}])
 
     snapshot_date = None
     try:
@@ -3620,7 +4038,7 @@ async def _next_day_plan_buy_candidates(
     except ValueError:
         snapshot_date = None
     if not await _is_signal_snapshot_valid_for_trade(snapshot_date, trade_date):
-        return [], [f"明日预案最新信号日为{snapshot.get('trade_date') or '--'}，不是今日可执行预案"]
+        return [], _SourceScanNotes([f"明日预案最新信号日为{snapshot.get('trade_date') or '--'}，不是今日可执行预案"], issues=[{"source": "next_day_plan", "reason_code": "source_snapshot_not_current"}])
 
     candidates: list[dict] = []
     rejected = 0
@@ -4377,6 +4795,7 @@ async def _restore_armed_reversal_candidates(
                     PaperAutoTradeLog.trade_date == trade_date,
                     PaperAutoTradeLog.created_at >= cutoff,
                     PaperAutoTradeLog.created_at <= now,
+                    ~PaperAutoTradeLog.action.in_(("portfolio_confirm", "portfolio_skip")),
                     PaperAutoTradeLog.source.in_(
                         ("green_limit_reversal", "underwater_reversal")
                     ),
@@ -4585,7 +5004,7 @@ async def _anomaly_buy_point_candidates(
         snapshot = await prewarm_anomaly_snapshot(db, None, force_refresh=False)
     except Exception as exc:
         await db.rollback()
-        return [], [f"异动买点加载失败：{exc}"]
+        return [], _SourceScanNotes([f"异动买点加载失败：{exc}"], issues=[{"source": "anomaly_buy_point", "reason_code": "source_read_failed"}])
 
     snapshot_date = None
     try:
@@ -4593,7 +5012,7 @@ async def _anomaly_buy_point_candidates(
     except ValueError:
         snapshot_date = None
     if not await _is_signal_snapshot_valid_for_trade(snapshot_date, trade_date):
-        return [], [f"异动买点最新信号日为{snapshot.get('trade_date') or '--'}，不是今日可执行信号"]
+        return [], _SourceScanNotes([f"异动买点最新信号日为{snapshot.get('trade_date') or '--'}，不是今日可执行信号"], issues=[{"source": "anomaly_buy_point", "reason_code": "source_snapshot_not_current"}])
 
     anomalies = [
         item for item in (snapshot.get("anomalies") or [])
@@ -4604,6 +5023,8 @@ async def _anomaly_buy_point_candidates(
         rows = await _enrich_stock_rows_with_b1(rows, db, target_date=snapshot_date)
     except Exception:
         await db.rollback()
+        notes = _SourceScanNotes(notes, issues=[{"source": "anomaly_buy_point", "reason_code": "source_enrichment_failed"}])
+        notes.append("异动买点B1增强读取失败，来源采证降级")
     funds = await _paper_main_fund_map(db, trade_date=trade_date, codes=[row.get("code") for row in rows])
     # 外部页面增强默认当前时刻；这里恢复本轮可见资金，不回写页面/行情快照。
     rows = [dict(row) for row in rows]
@@ -4704,29 +5125,47 @@ async def _paper_auto_buy_candidates(
     account_id: Optional[int] = None,
     include_daily_participation: bool = False,
     include_icepoint_reversal: bool = False,
+    participation_existing_codes: set[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
-    plan_candidates, plan_notes = await _next_day_plan_buy_candidates(db, limit=limit, trade_date=trade_date)
-    green_candidates, green_notes = await _green_limit_reversal_candidates(db, limit=limit, trade_date=trade_date)
-    underwater_candidates, underwater_notes = await _underwater_reversal_candidates(db, limit=limit, trade_date=trade_date)
-    ma5_candidates, ma5_notes = await _ma5_pullback_candidates(db, limit=limit, trade_date=trade_date)
-    anomaly_candidates, anomaly_notes = await _anomaly_buy_point_candidates(db, limit=limit, trade_date=trade_date)
+    # Observation only: preserve this source order and the original same-session awaits.
+    span_context = {"round_id": _quote_round_context().get("round_id"),
+                    "span_account_id": account_id}
+    plan_candidates, plan_notes = await observe_candidate_stage(
+        "plan", _next_day_plan_buy_candidates, db, limit=limit, trade_date=trade_date, **span_context)
+    green_candidates, green_notes = await observe_candidate_stage(
+        "green", _green_limit_reversal_candidates, db, limit=limit, trade_date=trade_date, **span_context)
+    underwater_candidates, underwater_notes = await observe_candidate_stage(
+        "underwater", _underwater_reversal_candidates, db, limit=limit, trade_date=trade_date, **span_context)
+    ma5_candidates, ma5_notes = await observe_candidate_stage(
+        "ma5", _ma5_pullback_candidates, db, limit=limit, trade_date=trade_date, **span_context)
+    anomaly_candidates, anomaly_notes = await observe_candidate_stage(
+        "anomaly", _anomaly_buy_point_candidates, db, limit=limit, trade_date=trade_date, **span_context)
     daily_candidates: list[dict] = []
     daily_notes: list[str] = []
     if include_daily_participation:
-        daily_candidates = await _daily_participation_candidates(db, limit=limit, trade_date=trade_date)
+        daily_candidates = await observe_candidate_stage(
+            "daily", _daily_participation_candidates, db, result_kind="candidates",
+            limit=limit, trade_date=trade_date, only_codes=participation_existing_codes,
+            **span_context,
+        )
         if daily_candidates:
-            daily_notes.append("今日尚未开仓，市场不弱，启用每日参与保障候选")
+            daily_notes.append("市场允许每日参与；已有开仓后仅重评持仓追加层" if participation_existing_codes is not None
+                               else "今日尚未开仓，市场不弱，启用每日参与保障候选")
     icepoint_candidates: list[dict] = []
     icepoint_notes: list[str] = []
     if include_icepoint_reversal:
-        icepoint_candidates = await _icepoint_reversal_candidates(db, limit=limit, trade_date=trade_date)
+        icepoint_candidates = await observe_candidate_stage(
+            "icepoint", _icepoint_reversal_candidates, db, result_kind="candidates",
+            limit=limit, trade_date=trade_date, only_codes=participation_existing_codes,
+            **span_context,
+        )
         if icepoint_candidates:
             icepoint_notes.append("市场处于冰点/弱修复区，启用冰点转强候选")
     restored_candidates: list[dict] = []
     restored_notes: list[str] = []
     if account_id is not None:
-        restored_candidates, restored_notes = await _restore_armed_reversal_candidates(
-            db,
+        restored_candidates, restored_notes = await observe_candidate_stage(
+            "restore", _restore_armed_reversal_candidates, db, **span_context,
             account_id=account_id,
             trade_date=trade_date,
             existing_candidates=[*green_candidates, *underwater_candidates],
@@ -4743,8 +5182,10 @@ async def _paper_auto_buy_candidates(
         *daily_candidates,
     ]
     # 外部计划/异动中的旧主力字段不是当前资金；独立冻结合格资金，不改原rank。
-    funds = await _paper_main_fund_map(
-        db, trade_date=trade_date, codes=[item.get("code") for item in all_candidates],
+    funds = await observe_candidate_stage(
+        "fund", _paper_main_fund_map, db, **span_context, result_kind="fund",
+        input_candidate_count=len(all_candidates),
+        trade_date=trade_date, codes=[item.get("code") for item in all_candidates],
     )
     for candidate in all_candidates:
         _bind_main_fund_evidence(candidate, funds.get(str(candidate.get("code") or "")))
@@ -4802,16 +5243,12 @@ async def _paper_auto_buy_candidates(
             continue
         seen.add(code)
         merged.append(candidate)
-    return merged[:limit], [
-        *plan_notes,
-        *green_notes,
-        *underwater_notes,
-        *restored_notes,
-        *ma5_notes,
-        *anomaly_notes,
-        *icepoint_notes,
-        *daily_notes,
-    ]
+    note_groups = (plan_notes, green_notes, underwater_notes, restored_notes,
+                   ma5_notes, anomaly_notes, icepoint_notes, daily_notes)
+    return merged[:limit], _SourceScanNotes(
+        [note for group in note_groups for note in group],
+        issues=[issue for group in note_groups for issue in getattr(group, "issues", ())],
+    )
 
 
 # =========================================================================
@@ -4857,6 +5294,8 @@ async def _promotion_mainline_live_sector_context(
         if isinstance(sector_trade_date, date)
         else ""
     )
+    observed_at = getattr(persistence, "observed_at", None)
+    result["sector_observed_at"] = observed_at.isoformat() if isinstance(observed_at, datetime) else None
     return result
 
 
@@ -4888,43 +5327,65 @@ def _promotion_snapshot_probability(record) -> float:
     ).production_probability
 
 
+def _mainline_frozen_route_eligible(record) -> bool:
+    """新增入口只接受完整冻结资格；不把缺证据的观察池升级为买点。"""
+    if not settings.PAPER_MAINLINE_ROUTE_POOL_ENABLED:
+        return False
+    factors = _json_loads_dict(getattr(record, "features_json", None))
+    return (
+        getattr(record, "rank_scope", None) == "pool_unranked"
+        and factors.get("prediction_rank_contract_version") == "promotion_rank_contract_v1"
+        and factors.get("prediction_rank_contract_complete") is True
+        and factors.get("prediction_rank_eligible") is True
+        and getattr(record, "trade_gate_passed", None) is True
+        and getattr(record, "watch_only", None) is False
+    )
+
+
 def _promotion_mainline_live_confirm_reject_reason(
     record,
     latest_run,
     *,
     trade_date: date,
     sector_context: dict,
+    visible_at: datetime | None = None,
+    diagnostic: dict | None = None,
 ) -> str:
     """给 C 增加独立且保守的盘中板块扩散确认，不改写上游不可变快照。"""
+    def reject(code, message):
+        if diagnostic is not None:
+            diagnostic["predicate_code"] = code
+        return message
     if not settings.PAPER_MAINLINE_LIVE_CONFIRM_ENABLED:
-        return "主线扩散独立盘中确认开关未启用"
+        return reject("disabled", "主线扩散独立盘中确认开关未启用")
     snapshot_context = str(getattr(latest_run, "snapshot_context", "") or "")
     if (
         snapshot_context not in PAPER_MAINLINE_INTRADAY_CONTEXTS
         or getattr(latest_run, "reference_trade_date", None) != trade_date
     ):
-        return "仅允许消费当日主线盘中不可变快照，禁止用收盘版或旧批次补单"
-    if str(getattr(record, "rank_scope", "") or "") not in {"ranked", "recall_ranked"}:
-        return "候选未进入正式Top12或Top30召回榜"
+        return reject("context", "仅允许消费当日主线盘中不可变快照，禁止用收盘版或旧批次补单")
+    if (str(getattr(record, "rank_scope", "") or "") not in {"ranked", "recall_ranked"}
+            and not _mainline_frozen_route_eligible(record)):
+        return reject("rank_scope", "候选既未入正式/召回榜，也缺少完整冻结路线资格")
 
     factors = _json_loads_dict(getattr(record, "features_json", None))
     if not (
         factors.get("broad_rotation_member_setup")
         and factors.get("sector_catalyst_spread")
     ):
-        return "治理快照缺少主线扩散成员与板块催化证据"
+        return reject("structure_evidence", "治理快照缺少主线扩散成员与板块催化证据")
     try:
         probability = _promotion_snapshot_probability(record)
     except ProbabilityContractError as exc:
-        return f"冻结生产概率合同无效：{exc}"
+        return reject("probability_contract", f"冻结生产概率合同无效：{exc}")
     if probability < settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_PROBABILITY:
-        return (
+        return reject("probability_floor",
             f"首板概率{probability:.3f}低于独立确认下限"
             f"{settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_PROBABILITY:.3f}"
         )
     strict_count = int(factors.get("strict_confirmation_count") or 0)
     if strict_count < settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_STRICT_CONFIRMATIONS:
-        return (
+        return reject("structure_count",
             f"结构确认{strict_count}项，低于"
             f"{settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_STRICT_CONFIRMATIONS}项"
         )
@@ -4933,25 +5394,36 @@ def _promotion_mainline_live_confirm_reject_reason(
         frozen_sector_strength < settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_SECTOR_STRENGTH
         and not factors.get("broad_rotation_cluster_setup")
     ):
-        return "09:35快照的主线强度不足且未形成板块簇"
+        return reject("frozen_strength", "09:35快照的主线强度不足且未形成板块簇")
 
     if not sector_context:
-        return "缺少快照所指同一板块的实时数据"
+        return reject("sector_missing", "缺少快照所指同一板块的实时数据")
     if str(sector_context.get("sector_trade_date") or "") != trade_date.isoformat():
-        return "同一板块实时数据不是当日快照"
+        return reject("sector_date", "同一板块实时数据不是当日快照")
+    # Ranked/recall-ranked candidates need the same point-in-time sector proof
+    # as the frozen route pool; rank does not authorize future/missing observations.
+    try:
+        observed_at = datetime.fromisoformat(str(sector_context.get("sector_observed_at")))
+        visible = visible_at or _paper_now()
+        valid_clock = (observed_at.tzinfo is None and visible.tzinfo is None
+                       and observed_at.date() == trade_date and observed_at <= visible)
+    except (AttributeError, TypeError, ValueError):
+        valid_clock = False
+    if not valid_clock:
+        return reject("sector_clock", "实时板块证据缺少可验证观测时点或晚于本轮可见截止")
     current_strength = _to_float(sector_context.get("sector_strength")) or 0.0
     current_change = _to_float(sector_context.get("sector_change_pct")) or 0.0
     current_flow = _to_float(sector_context.get("sector_fund_flow")) or 0.0
     current_limit_ups = int(sector_context.get("sector_limit_up_count") or 0)
     if current_strength < settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_SECTOR_STRENGTH:
-        return (
+        return reject("sector_strength",
             f"板块实时强度{current_strength:.0f}低于"
             f"{settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_SECTOR_STRENGTH:.0f}"
         )
     if current_change <= 0 or current_flow <= 0:
-        return "板块尚未同时完成上涨与资金净流入确认"
+        return reject("sector_flow", "板块尚未同时完成上涨与资金净流入确认")
     if current_limit_ups < settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_SECTOR_LIMIT_UP_COUNT:
-        return (
+        return reject("sector_limit_count",
             f"板块实时涨停{current_limit_ups}家，低于扩散确认所需"
             f"{settings.PAPER_MAINLINE_LIVE_CONFIRM_MIN_SECTOR_LIMIT_UP_COUNT}家"
         )
@@ -4982,13 +5454,14 @@ async def _promotion_route_buy_candidates(
     from app.api.v1.promotion import PROMOTION_MODEL_VERSION
     from app.models.promotion import PromotionPredictionRun, PromotionPredictionSnapshot
 
-    # 15:10/20:00 只消费上一交易日收盘快照；B/D只用09:25/09:35开盘确认，
-    # C额外消费10:00/10:30/13:05/14:00/14:30主线刷新。先锁定该策略允许的最新批次，
+    # 15:10/20:00 只消费上一交易日收盘快照；B/C接续当日正式刷新，D限于开盘。
+    # 先锁定该策略允许的最新批次，
     # 再查具体赛道，确保质量失败或该批次无候选时都不会回退到更旧批次。
     previous_trade_date = await trade_calendar.previous_trade_day(trade_date)
     allowed_intraday_contexts = (
         PAPER_MAINLINE_ALLOWED_CONTEXTS
-        if account_name == PAPER_ACCOUNT_MAINLINE
+        if (account_name == PAPER_ACCOUNT_MAINLINE
+            or (account_name == PAPER_ACCOUNT_PROMOTION and settings.PAPER_PROMOTION_INTRADAY_REFRESH_ENABLED))
         else PAPER_OPEN_CONFIRM_CONTEXTS
     )
     latest_run = (
@@ -5013,7 +5486,7 @@ async def _promotion_route_buy_candidates(
         )
     ).scalar_one_or_none()
     if latest_run is None:
-        return [], [f"{label}赛道暂无今日允许消费的当前模型不可变正式批次"]
+        return [], _SourceScanNotes([f"{label}赛道暂无今日允许消费的当前模型不可变正式批次"], issues=[{"source": route, "reason_code": "prediction_batch_missing"}])
     if latest_run.status != "completed":
         reason = f"{label}最新正式批次{latest_run.run_key}状态为{latest_run.status}，禁止回退旧批次"
         if diagnostics is not None:
@@ -5119,15 +5592,7 @@ async def _promotion_route_buy_candidates(
         PromotionPredictionSnapshot.trade_gate_passed.is_(True),
         PromotionPredictionSnapshot.watch_only.is_(False),
     ]
-    if account_name == PAPER_ACCOUNT_MAINLINE:
-        # 当前首板模型把“结构可执行”与“主动盘口确认”拆开，而主线路线没有
-        # 独立的上游主动确认字段。仅给当日主线盘中正式榜/召回榜保留下游
-        # 同板块实时扩散确认机会；B/D仍必须原样消费 actionable=true。
-        snapshot_filters.append(or_(
-            PromotionPredictionSnapshot.actionable.is_(True),
-            PromotionPredictionSnapshot.rank_scope.in_(("ranked", "recall_ranked")),
-        ))
-    else:
+    if account_name != PAPER_ACCOUNT_MAINLINE:
         snapshot_filters.append(PromotionPredictionSnapshot.actionable.is_(True))
     # Validate the entire selected route pool before SQL eligibility/probability
     # filters can hide bad evidence. Never use old columns to prefilter new values.
@@ -5137,8 +5602,30 @@ async def _promotion_route_buy_candidates(
         PromotionPredictionSnapshot.candidate_route == route,
         PromotionPredictionSnapshot.prediction_trade_date == signal_date,
     ))).all())
+    from app.paper.candidate_audit import promotion_trace
+    def trace(record, reason_code, reason, **kwargs):
+        if diagnostics is not None and (only_code is None or str(record.code or "").strip() == only_code):
+            diagnostics.append(promotion_trace(
+                record, latest_run, cutoff=cutoff, decision_at=decision_at,
+                reason_code=reason_code, reason=reason, **kwargs))
     probabilities = {}
+    visibility_issue = ""
     for row in probability_pool:
+        # The completed batch clock alone cannot certify a later-created stock
+        # snapshot. Validate the whole selected route, including watch-only rows.
+        if (not isinstance(row.created_at, datetime) or row.created_at.tzinfo is not None
+                or row.created_at > cutoff):
+            reason = f"{label}快照{row.id}创建时点缺失或晚于本轮可见截止，禁止消费或回退旧批次"
+            if diagnostics is not None:
+                diagnostics.append({
+                    "reason": reason, "stage_code": "data_gate",
+                    "reason_code": "prediction_not_visible",
+                    "candidate": {"run_key": latest_run.run_key, "route": route,
+                                  "blocking_snapshot_id": row.id, "blocking_code": row.code,
+                                  "snapshot_created_at": row.created_at.isoformat() if isinstance(row.created_at, datetime) else None,
+                                  "visible_cutoff": cutoff.isoformat(), "recoverable": True},
+                })
+            visibility_issue = visibility_issue or reason
         try:
             probabilities[row.id] = _promotion_snapshot_probability(row)
         except ProbabilityContractError as exc:
@@ -5152,6 +5639,8 @@ async def _promotion_route_buy_candidates(
                                   "code": row.code, "route_pool": len(probability_pool)},
                 })
             return [], [reason]
+    if visibility_issue:
+        return [], [visibility_issue]
     records = (
         await db.execute(
             select(PromotionPredictionSnapshot)
@@ -5166,12 +5655,35 @@ async def _promotion_route_buy_candidates(
         row for row in records
         if not enforce_probability_floor or probabilities[row.id] >= min_probability
     ]
+    if account_name == PAPER_ACCOUNT_MAINLINE:
+        records = [row for row in records if (
+            row.actionable is True or row.rank_scope in {"ranked", "recall_ranked"}
+            or (latest_run.snapshot_context in PAPER_MAINLINE_INTRADAY_CONTEXTS
+                and latest_run.reference_trade_date == trade_date
+                and _mainline_frozen_route_eligible(row))
+        )]
     records.sort(key=lambda row: (
         -probabilities[row.id], row.rank_position if row.rank_position is not None else -1, row.id,
     ))
+    accepted_ids = {row.id for row in records}
+    for row in probability_pool:
+        if row.id in accepted_ids:
+            continue
+        if row.trade_gate_passed is not True:
+            rc, why = "candidate_trade_gate_failed", "冻结单股交易资格未通过"
+        elif row.watch_only is not False:
+            rc, why = "candidate_watch_only", "冻结单股仅观察，不能升级为买单"
+        elif account_name != PAPER_ACCOUNT_MAINLINE and row.actionable is not True:
+            rc, why = "candidate_not_actionable", "冻结单股actionable未通过"
+        elif enforce_probability_floor and probabilities[row.id] < min_probability:
+            rc, why = "candidate_probability_below_floor", "冻结生产概率低于本账户执行下限"
+        else:
+            rc, why = "candidate_mainline_scope", "未满足主线actionable/排名或允许的冻结资格分支"
+        trace(row, rc, why, probability=probabilities[row.id],
+              threshold=min_probability if enforce_probability_floor else None)
     if not records:
         if account_name == PAPER_ACCOUNT_MAINLINE:
-            eligibility = "治理快照可执行标志或当日主线盘中正式榜/召回榜入口"
+            eligibility = "治理快照可执行标志或当日主线冻结资格及独立实时确认"
         else:
             eligibility = (
                 f"单候选可执行标志与概率≥{min_probability:.2f}"
@@ -5217,10 +5729,11 @@ async def _promotion_route_buy_candidates(
                     f"其中未进入全局正式/召回榜{counts['rank_eligible_unranked']}；"
                     "排名资格不等于入榜，入榜仍需原有实时确认；"
                 )
-            diagnostics.append({
+            diagnostics.insert(0, {
                 "reason": (
                     f"{label}执行条件交集为0：路线池{len(pool)}，交易资格非观察{len(gate_rows)}，"
                     f"可执行{len(actionable_rows)}，正式/召回排名{len(ranked_rows)}；"
+                    f"概率达标{counts['probability_pass']}；"
                     f"{rank_note}仍需{eligibility}，不将观察池升级买单"
                 ),
                 "stage_code": "strategy_filter", "reason_code": "candidate_contract_empty",
@@ -5246,53 +5759,60 @@ async def _promotion_route_buy_candidates(
     # —— 它是静态标签，不是证据。后果：B 在 10 个交易日里 35 个过概率门槛的候选
     # 只成交 1 笔，却无法回答"剩下 34 个各自被哪一条挡掉"。
     # 这是纯诊断字段，不参与任何判定，也不改变任何候选的取舍。
-    rejection_counts: dict[str, int] = []
+    rejection_counts: dict[str, int] = {}
 
-    def _reject(reason: str) -> None:
+    def _reject(reason: str, reason_code: str, *, data=False, metrics=None) -> None:
         nonlocal rejected
         rejected += 1
-        for entry in rejection_counts:
-            if entry[0] == reason:
-                entry[1] += 1
-                return
-        rejection_counts.append((reason, 1))
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+        trace(record, reason_code, reason, stage="candidate_quote",
+              decision="wait" if data else "rejected", technical_evaluated=True,
+              probability=probabilities[record.id],
+              metrics={"recoverable": data, **(metrics or {})})
 
     mainline_rejections: list[str] = []
     for record in records:
-        if len(candidates) >= limit:
-            break
         code = str(record.code or "").strip()
         if not code or (only_code is not None and code != only_code):
             continue
-        spot = await _spot_by_code(db, code)
-        if not spot or not spot.price or float(spot.price) <= 0:
-            _reject("行情缺失")
+        if len(candidates) >= limit:
+            trace(record, "candidate_scan_limit", "本轮候选数量上限，未继续评估该股实时技术条件",
+                  decision="deferred", stage="candidate_scan", probability=probabilities[record.id],
+                  metrics={"candidate_limit": limit})
             continue
-        price = float(spot.price)
-        prev_close = float(getattr(spot, "prev_close", 0) or 0)
-        if prev_close <= 0:
-            _reject("行情缺失")
+        spot = await _spot_by_code(db, code)
+        if spot is None:
+            _reject("行情缺失", "candidate_quote_missing", data=True)
+            continue
+        price = _to_float(getattr(spot, "price", None))
+        prev_close = _to_float(getattr(spot, "prev_close", None))
+        raw_limit = getattr(spot, "limit_up", None)
+        limit_value = _to_float(raw_limit)
+        if (price is None or price <= 0 or prev_close is None or prev_close <= 0
+                or (raw_limit is not None and limit_value is None)):
+            _reject("行情缺失", "candidate_quote_invalid", data=True,
+                    metrics={"price": price, "prev_close": prev_close, "limit_up": limit_value})
             continue
         change_pct = _to_float(getattr(spot, "change_pct", None))
         if change_pct is None:
-            _reject("行情缺失")
+            _reject("行情缺失", "candidate_quote_invalid", data=True)
             continue
         # 盘中确认: 现价涨幅下限(不低开/要求高开)与上限(不追高)
         if change_pct < min_confirm:
-            _reject("低开")
+            _reject("低开", "candidate_change_below_min", metrics={"change_pct": change_pct, "minimum": min_confirm})
             continue
         if change_pct > max_confirm:
-            _reject("追高")
+            _reject("追高", "candidate_change_above_max", metrics={"change_pct": change_pct, "maximum": max_confirm})
             continue
         # 涨停/一字板不追 (用 limit_up 或涨幅判断)
-        limit_up_price = float(getattr(spot, "limit_up", 0) or 0)
+        limit_up_price = limit_value or 0
         if limit_up_price > 0 and price >= limit_up_price * 0.998:
-            _reject("一字/涨停")
+            _reject("一字/涨停", "candidate_near_limit", metrics={"price": price, "limit_up": limit_up_price})
             continue
         # 量比健康 (有承接, 不缩量)
         volume_ratio = _to_float(getattr(spot, "volume_ratio", None))
         if volume_ratio is None or volume_ratio <= 0 or volume_ratio < 0.6:
-            _reject("缩量")
+            _reject("缩量", "candidate_volume_ratio_below_min", metrics={"volume_ratio": volume_ratio, "minimum": 0.6})
             continue
         # ST/退市过滤 — tag 标记 或 stock_blacklist 命中即拦截 (2026-08-31 修复 600002 类静默通过)
         tag = (
@@ -5308,7 +5828,7 @@ async def _promotion_route_buy_candidates(
             )
         ).scalar_one_or_none()
         if blocked_reason:
-            _reject(f"黑名单:{blocked_reason.reason}")
+            _reject(f"黑名单:{blocked_reason.reason}", "candidate_blacklist")
             notes.append(f"{code} 在黑名单({blocked_reason.reason})中, 拒绝候选")
             continue
         if (
@@ -5316,7 +5836,7 @@ async def _promotion_route_buy_candidates(
             or (tag is not None and tag.board_tag != "tradeable")
             or (tag and (tag.is_st or tag.is_suspended or tag.is_delisting))
         ):
-            _reject("ST/退市/停牌/非主板")
+            _reject("ST/退市/停牌/非主板", "candidate_untradeable")
             notes.append(f"{code} 非主板可交易标的或标记为 ST/退市/停牌, 拒绝候选")
             continue
 
@@ -5329,14 +5849,17 @@ async def _promotion_route_buy_candidates(
                 code=code,
                 factors=factors,
             )
+            mainline_diagnostic = {}
             mainline_reject_reason = _promotion_mainline_live_confirm_reject_reason(
                 record,
                 latest_run,
                 trade_date=trade_date,
                 sector_context=mainline_sector_context,
+                visible_at=cutoff, diagnostic=mainline_diagnostic,
             )
             if mainline_reject_reason:
-                _reject(f"主线独立确认:{mainline_reject_reason[:40]}")
+                _reject(f"主线独立确认:{mainline_reject_reason[:40]}", "candidate_mainline_unconfirmed",
+                        metrics={"full_reason": mainline_reject_reason, **mainline_diagnostic})
                 if len(mainline_rejections) < 3:
                     mainline_rejections.append(
                         f"{code} {record.name or spot.name or code}：{mainline_reject_reason}"
@@ -5369,6 +5892,10 @@ async def _promotion_route_buy_candidates(
             "signal_date": signal_date.isoformat(),
             "prediction_run_id": latest_run.id,
             "prediction_snapshot_id": record.id,
+            "candidate_eligibility_basis": (
+                "frozen_route_eligible_live_confirmed" if _mainline_frozen_route_eligible(record)
+                and conditional_mainline_confirmation else "snapshot_actionable_or_ranked"
+            ),
             # Frozen provenance only; never supplement from current news.
             "news_evidence": deepcopy(frozen_news_evidence) if isinstance(frozen_news_evidence, dict) else {},
             "prediction_run_key": latest_run.run_key,
@@ -5383,12 +5910,15 @@ async def _promotion_route_buy_candidates(
             "entry_condition": entry_condition,
             **mainline_sector_context,
         })
+        trace(record, "candidate_selected", "本轮原候选入口通过，仍须持续确认/预算/风控及原委托链",
+              decision="candidate", stage="candidate_scan", technical_evaluated=True,
+              probability=probability, metrics={"price": price, "change_pct": change_pct, "volume_ratio": volume_ratio})
 
     notes.extend(mainline_rejections)
     if rejected:
         detail = "、".join(
             f"{reason}×{count}"
-            for reason, count in sorted(rejection_counts, key=lambda item: -item[1])
+            for reason, count in sorted(rejection_counts.items(), key=lambda item: -item[1])
         )
         notes.append(f"已过滤{rejected}只不满足盘中确认条件的{label}候选：{detail}")
     if not candidates:
@@ -5475,6 +6005,84 @@ async def _tenbagger_pullback_confirmed(
     )
 
 
+def _highboard_entry_modes(account_name: str) -> tuple[str, ...]:
+    if account_name == PAPER_ACCOUNT_TENBAGGER:
+        return ("e_low_entry", "e_low_recovery")
+    if account_name == PAPER_ACCOUNT_CHALLENGER_E:
+        return ("e2_strong_entry", "e2_strong_recovery", "e2_limit_touch")
+    return ()
+
+
+def _highboard_entry_evidence(spot, *, account_name: str) -> dict:
+    """Validate E/E2 mode geometry, not profitability or an invented OHLC path.
+
+    Equality to VWAP/day-high is not recovery evidence at a locked limit price.
+    OHLC can prove a price range, never the order of touch/open/reseal events.
+    Keep this same contract at candidate, confirmation and pending-fill boundaries.
+    """
+    from app.paper.experiment import HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION
+
+    keys = ("price", "prev_close", "open", "high", "low", "limit_up", "limit_down")
+    values = {key: _to_float(getattr(spot, key, None)) for key in keys}
+    issues = [
+        {"code": f"highboard_missing_{key}", "reason": f"高标模式暂缺有效{key}证据",
+         "recoverable": True}
+        for key, value in values.items() if value is None or value <= 0
+    ]
+    valid = lambda key: values[key] is not None and values[key] > 0
+    price, previous, opening, high, low, upper, lower = (values[key] for key in keys)
+    if valid("price") and valid("limit_down") and round(price, 2) <= round(lower, 2):
+        issues.append({"code": "highboard_at_limit_down",
+                       "reason": "现价仍在跌停边界，不能以VWAP相等/高点回撤为0认定高标承接",
+                       "recoverable": False})
+    if valid("high") and valid("low"):
+        if (valid("price") and round(high, 2) == round(low, 2)
+                and round(price, 2) == round(high, 2)):
+            issues.append({"code": "highboard_no_price_path",
+                           "reason": "一价行情没有可验证的盘中承接/强势价格路径",
+                           "recoverable": False})
+        elif high < low:
+            issues.append({"code": "highboard_invalid_range", "reason": "高标日内高低点矛盾",
+                           "recoverable": True})
+        for key in ("price", "open"):
+            if valid(key) and not low <= values[key] <= high:
+                issues.append({"code": f"highboard_invalid_{key}",
+                               "reason": f"高标{key}不在已观测日内高低区间内",
+                               "recoverable": True})
+    if valid("limit_down") and valid("limit_up"):
+        if lower >= upper or (valid("prev_close") and not lower < previous < upper):
+            issues.append({"code": "highboard_invalid_limits",
+                           "reason": "高标涨跌停边界与昨收矛盾", "recoverable": True})
+        elif valid("price") and price > upper + 0.005:
+            issues.append({"code": "highboard_above_limit", "reason": "高标现价超出涨停边界",
+                           "recoverable": True})
+    is_e2 = account_name == PAPER_ACCOUNT_CHALLENGER_E
+    if is_e2 and valid("price") and valid("prev_close") and price < previous:
+        issues.append({"code": "highboard_strength_not_reclaimed",
+                       "reason": "E2尚未收复昨收，负开/跌停不能标记强势入口成立",
+                       "recoverable": False})
+    if not is_e2 and valid("price") and valid("prev_close") and valid("low"):
+        if price < previous and price <= low:
+            issues.append({"code": "highboard_low_not_recovered",
+                           "reason": "E负涨幅入口尚未离开日内低点，不能认定低位承接",
+                           "recoverable": False})
+    mode = None
+    if not issues:
+        at_upper = round(price, 2) >= round(upper, 2)
+        mode = (
+            ("e2_limit_touch" if at_upper else
+             "e2_strong_recovery" if opening < previous else "e2_strong_entry")
+            if is_e2 else ("e_low_recovery" if price < previous else "e_low_entry")
+        )
+    return {
+        "contract": HIGHBOARD_ENTRY_MODE_CONTRACT_VERSION,
+        "account_name": account_name, "mode": mode, "valid": not issues,
+        "quote": values, "issues": issues,
+        "reseal_path_status": "unverified",
+        "path_basis": "current_quote_range_not_ordered_touch_open_reseal",
+    }
+
+
 def _highboard_policy(account_name: str) -> dict:
     """E/E2共享算法实现但不共享可调参数；单位保持封单亿元、仓位比例。"""
     is_e2 = account_name == PAPER_ACCOUNT_CHALLENGER_E
@@ -5509,13 +6117,9 @@ async def _tenbagger_midline_candidates(
 ) -> tuple[list[dict], list[str]]:
     """策略E候选: 连板高标接力 (2026-08-31 重建, 取代十倍评分).
 
-    数据依据 (回放诊断):
-      - 十倍评分模型5维与未来收益负相关(总分越高越亏), E回放全线亏损
-      - 连板≥4 高标: 次日买入持有5日 +3.13% 胜率55.6% (唯一正期望信号)
-      - 加-8%止损后期望提升到 +2.35% (截断-35%尾部)
-
     数据流: limit_up_pool (连板≥4) → 涨停质量过滤(封板资金/炸板) →
-            次日盘中确认(非一字板可交易) → 买入.
+            次日盘中确认(非一字板可交易) → 买入。E2封单门槛独立实验；
+    历史日线筛选覆盖和旧回放收益不能证明当前执行规则具有正期望。
     """
     notes: list[str] = []
     if not settings.PAPER_TENBAGGER_ENABLED and not experiment_active(account_name, at=trade_date):
@@ -5550,6 +6154,19 @@ async def _tenbagger_midline_candidates(
         code = str(item.code or "").strip()
         if not code or (only_code is not None and code != only_code):
             continue
+        seal_amount = _to_float(item.seal_amount)
+        raw_break_count = _to_float(item.break_count)
+        break_count = (int(raw_break_count) if raw_break_count is not None
+                       and raw_break_count >= 0 and raw_break_count.is_integer() else None)
+        quality_checks = {
+            "seal_amount_yuan": seal_amount,
+            "min_seal_amount_yuan": cfg['min_seal_amount'] * 1e8,
+            "seal_amount_passed": (seal_amount >= cfg['min_seal_amount'] * 1e8
+                                   if seal_amount is not None and seal_amount >= 0 else None),
+            "break_count": break_count,
+            "max_break_count": cfg['max_break_count'],
+            "break_count_passed": break_count <= cfg['max_break_count'] if break_count is not None else None,
+        }
         def reject(reason_code: str, reason: str, metric=None, threshold=None, *, data=False):
             if diagnostics is not None:
                 diagnostics.append({
@@ -5558,13 +6175,13 @@ async def _tenbagger_midline_candidates(
                     "stage_code": "data_gate" if data else "strategy_filter",
                     "metric_value": metric, "threshold_value": threshold,
                     "candidate": {"signal_date": signal_date.isoformat(),
-                                  "recoverable": data, "entry_account": account_name},
+                                  "recoverable": data, "entry_account": account_name,
+                                  "quality_checks": quality_checks},
                 })
 
         # 2. 涨停质量: 封板资金 ≥ 阈值, 炸板次数 ≤ 上限
-        seal_amount = _to_float(item.seal_amount)
-        if seal_amount is None:
-            reject("seal_amount_missing", "昨日封单数据缺失，不能当作0或直接通过", data=True)
+        if seal_amount is None or seal_amount < 0:
+            reject("seal_amount_missing", "昨日封单数据缺失或无效，不能当作0或直接通过", data=True)
             rejected += 1
             continue
         if seal_amount < cfg['min_seal_amount'] * 1e8:
@@ -5573,17 +6190,28 @@ async def _tenbagger_midline_candidates(
                    seal_amount, cfg['min_seal_amount'] * 1e8)
             rejected += 1
             continue
-        break_count = int(item.break_count or 0)
+        if break_count is None:
+            reject("break_count_missing", "昨日炸板次数缺失或无效，不能当作0次通过", data=True)
+            rejected += 1
+            continue
         if break_count > cfg['max_break_count']:
             reject("break_count_above_max", f"昨日炸板{break_count}次超过策略上限",
                    break_count, cfg['max_break_count'])
             rejected += 1
             continue
-        # 3. 实时 spot 确认：开板时直接成交；曾开板后回封可提交涨停排队。
-        # 真一字板仍不纳入，避免改变当前高标策略的已验证样本口径。
+        # 3. 同一模式合同覆盖候选、确认与待成交复验；不把OHLC当回封时序。
+        # 一价/跌停不构成承接，E2处于负涨幅区间须先收复昨收。
         spot = await _spot_by_code(db, code)
         if not spot or not spot.price or float(spot.price) <= 0:
             reject("quote_missing", "本轮高标行情缺失或无效，等待新鲜报价", data=True)
+            rejected += 1
+            continue
+        mode_evidence = _highboard_entry_evidence(spot, account_name=account_name)
+        quality_checks["entry_mode_evidence"] = mode_evidence
+        if mode_evidence["issues"]:
+            issue = next((row for row in mode_evidence["issues"] if not row["recoverable"]),
+                         mode_evidence["issues"][0])
+            reject(issue["code"], issue["reason"], data=issue["recoverable"])
             rejected += 1
             continue
         price = float(spot.price)
@@ -5656,7 +6284,7 @@ async def _tenbagger_midline_candidates(
                     and traded_below_limit
                     and _is_limit_up_queue_quote(spot)
                 ):
-                    reject("limit_queue_ineligible", "无可成交卖盘且不满足曾开板回封排队条件，禁止假成交")
+                    reject("limit_queue_ineligible", "无可成交卖盘且不满足非一价触板排队条件，禁止假成交或认定回封路径")
                     rejected += 1
                     continue
                 limit_up_queue = True
@@ -5714,6 +6342,7 @@ async def _tenbagger_midline_candidates(
             "consecutive_days": consecutive,
             "seal_amount": round(seal_amount / 1e8, 2),
             "break_count": break_count,
+            "quality_checks": quality_checks,
             "price": price,
             "change_pct": change_pct,
             "avg_price": avg_price,
@@ -5731,16 +6360,18 @@ async def _tenbagger_midline_candidates(
             "take_profit_pct": cfg['take_profit_pct'],
             "max_hold_days": cfg['max_hold_days'],
             "signal_date": signal_date.isoformat(),
-            "strategy_label": "E2高标强势/回封实验" if is_e2 else "E高标低位接力实验",
-            "entry_variant": "e2_strong_reseal" if is_e2 else "e_low_entry",
+            "strategy_label": "E2高标强势入口实验" if is_e2 else "E高标低位接力实验",
+            "entry_variant": mode_evidence["mode"],
+            "entry_mode_contract": mode_evidence["contract"],
+            "entry_mode_evidence": mode_evidence,
             "max_entry_change_pct": max_entry_change,
             "entry_condition": (
                 f"{signal_date}连板{consecutive}板, 封板资金{seal_amount/1e8:.1f}亿, "
                 f"炸板{break_count}次；"
                 + (
-                    "次日曾开板后回封，按涨停价排队等待真实成交证据"
+                    "当前触及涨停且盘中存在低于涨停价的报价，排队等待真实成交证据；未认证回封时序"
                     if limit_up_queue
-                    else "次日已开板可交易"
+                    else f"当前{mode_evidence['mode']}价格结构通过，仍须持续确认和成交复验；未认证回封时序"
                 )
             ),
             "limit_up_reason": str(item.limit_up_reason or ""),
@@ -5902,12 +6533,45 @@ def _reversal_kline_pattern(
     }
 
 
+def _reversal_live_confirmation_issues(spot) -> tuple[list[dict], dict]:
+    """One copy of F live predicates; independent invalids dominate unknowns in pending rechecks."""
+    issues = []
+    def reject(reason_code, reason, metric=None, threshold=None, *, data=False):
+        issues.append(dict(reason_code=reason_code, reason=reason, metric_value=metric,
+                           threshold_value=threshold, data=data))
+    values = {key: _to_float(getattr(spot, key, None))
+              for key in ("price", "change_pct", "avg_price", "high", "limit_up")}
+    price, change, avg, high, limit = (values[key] for key in values)
+    valid_price = price is not None and price > 0
+    if not valid_price:
+        reject("quote_missing", "本轮反包行情缺失或无效，等待新鲜报价", data=True)
+    if change is None or change > settings.PAPER_REVERSAL_MAX_INTRADAY_CONFIRM_CHANGE_PCT:
+        reject("change_missing" if change is None else "entry_change_above_max",
+               "本轮涨幅缺失" if change is None else "当前涨幅超过反包入口上限",
+               change, settings.PAPER_REVERSAL_MAX_INTRADAY_CONFIRM_CHANGE_PCT, data=change is None)
+    missing_vwap = avg is None or avg <= 0
+    if settings.PAPER_REVERSAL_REQUIRE_ABOVE_VWAP and (missing_vwap or (valid_price and price < avg)):
+        reject("vwap_missing" if missing_vwap else "below_vwap",
+               "本轮VWAP缺失或无效" if missing_vwap else "现价低于VWAP", price, avg, data=missing_vwap)
+    pullback = max(0.0, (high-price)/high*100.0) if valid_price and high is not None and high > 0 else None
+    if pullback is None or pullback > settings.PAPER_REVERSAL_MAX_PULLBACK_FROM_HIGH_PCT:
+        reject("high_missing" if pullback is None else "high_pullback_above_max",
+               "本轮日内高点缺失" if pullback is None else "高点回撤超过反包入口上限",
+               pullback, settings.PAPER_REVERSAL_MAX_PULLBACK_FROM_HIGH_PCT, data=pullback is None)
+    if limit is None or limit <= 0:
+        reject("limit_price_missing", "本轮涨停价缺失，无法校验价格边界", data=True)
+    elif valid_price and price >= limit * 0.998:
+        reject("reversal_current_at_limit", "本轮现价接近涨停，原策略等待开板", price, limit * 0.998)
+    return issues, {**values, "pullback_from_high_pct": pullback}
+
+
 async def _reversal_pullback_candidates(
     db: AsyncSession,
     limit: int,
     trade_date: date,
     only_code: str | None = None,
     diagnostics: Optional[list[dict]] = None,
+    pending_recheck: bool = False,
 ) -> tuple[list[dict], list[str]]:
     """策略F候选: 断板反包 (2026-08-31 晚新增).
 
@@ -5969,6 +6633,7 @@ async def _reversal_pullback_candidates(
                         "history_quality": "not_pit_certified_by_pattern_check",
                         "rule_snapshot": dict(cfg),
                         "requires_new_evidence": data,
+                        "recoverable": data,
                     },
                 })
         # 2. 历史K线断板反包形态确认
@@ -5991,67 +6656,20 @@ async def _reversal_pullback_candidates(
                 reject(failure["reason_code"], failure["reason"],
                        failure["metric_value"], failure["threshold_value"],
                        data=failure["stage_code"] == "data_gate")
-            rejected += 1
-            continue
+            if not pending_recheck:
+                rejected += 1
+                continue
         # 3. 实时 spot 确认: 已开板可交易 + 放量
         spot = await _spot_by_code(db, code)
-        if not spot or not spot.price or float(spot.price) <= 0:
-            reject("quote_missing", "本轮反包行情缺失或无效，等待新鲜报价", data=True)
+        quote_issues, live = _reversal_live_confirmation_issues(spot)
+        for failure in (quote_issues if pending_recheck else quote_issues[:1]):
+            reject(failure["reason_code"], failure["reason"], failure["metric_value"],
+                   failure["threshold_value"], data=failure["data"])
+        if quote_issues and not pending_recheck:
             rejected += 1
             continue
-        price = float(spot.price)
-        change_pct = _to_float(getattr(spot, "change_pct", None))
-        if (
-            change_pct is None
-            or change_pct > settings.PAPER_REVERSAL_MAX_INTRADAY_CONFIRM_CHANGE_PCT
-        ):
-            reject("change_missing" if change_pct is None else "entry_change_above_max",
-                   "本轮涨幅缺失" if change_pct is None else "当前涨幅超过反包入口上限",
-                   change_pct, settings.PAPER_REVERSAL_MAX_INTRADAY_CONFIRM_CHANGE_PCT,
-                   data=change_pct is None)
-            rejected += 1
-            continue
-        avg_price = _to_float(getattr(spot, "avg_price", None))
-        if (
-            settings.PAPER_REVERSAL_REQUIRE_ABOVE_VWAP
-            and (avg_price is None or avg_price <= 0 or price < avg_price)
-        ):
-            missing_vwap = avg_price is None or avg_price <= 0
-            reject("vwap_missing" if missing_vwap else "below_vwap",
-                   "本轮VWAP缺失或无效" if missing_vwap else "现价低于VWAP",
-                   price, avg_price, data=missing_vwap)
-            rejected += 1
-            continue
-        high_price = _to_float(getattr(spot, "high", None))
-        pullback_from_high_pct = (
-            max(0.0, (high_price - price) / high_price * 100.0)
-            if high_price is not None and high_price > 0
-            else None
-        )
-        if (
-            pullback_from_high_pct is None
-            or pullback_from_high_pct
-            > settings.PAPER_REVERSAL_MAX_PULLBACK_FROM_HIGH_PCT
-        ):
-            reject("high_missing" if pullback_from_high_pct is None else "high_pullback_above_max",
-                   "本轮日内高点缺失" if pullback_from_high_pct is None else "高点回撤超过反包入口上限",
-                   pullback_from_high_pct, settings.PAPER_REVERSAL_MAX_PULLBACK_FROM_HIGH_PCT,
-                   data=pullback_from_high_pct is None)
-            rejected += 1
-            continue
-        limit_up_price = float(getattr(spot, "limit_up", 0) or 0)
-        if limit_up_price <= 0:
-            reject("limit_price_missing", "本轮涨停价缺失，无法校验价格边界", data=True)
-            rejected += 1
-            continue
-        if price >= limit_up_price * 0.998:
-            # 仍封死/一字, 无法买入 → 等开板
-            reject("reversal_current_at_limit", "本轮现价接近涨停，原策略等待开板",
-                   price, limit_up_price * 0.998)
-            rejected += 1
-            continue
-        # 放量使用已收盘信号日全日成交量，禁止把执行日盘中部分量与历史全日量比较。
-        vol_ratio = float(pattern["vol_ratio"])
+        price, change_pct, avg_price, high_price, pullback_from_high_pct = (
+            live[key] for key in ("price", "change_pct", "avg_price", "high", "pullback_from_high_pct"))
         # 4. ST/停牌/退市过滤 — tag 标记 或 stock_blacklist 命中即拦截 (2026-08-31 修复)
         tag = (
             await db.execute(select(StockTag).where(StockTag.code == code))
@@ -6079,6 +6697,12 @@ async def _reversal_pullback_candidates(
             rejected += 1
             continue
 
+        # Pending rechecks collect independent failures before reducing severity.
+        # Missing history must not hide an already-invalid quote or stock identity.
+        if not pattern or quote_issues:
+            rejected += 1
+            continue
+        vol_ratio = float(pattern["vol_ratio"])  # Original closed signal-day volume.
         vwap_premium_pct = (
             max(0.0, (price / avg_price - 1.0) * 100.0)
             if avg_price is not None and avg_price > 0
@@ -6148,7 +6772,7 @@ def _midline_sell_reason(
     hold_days: int,
     params: Optional[dict] = None,
 ) -> str:
-    """E/F只执行回放验证过的止损、止盈与交易日到期退出。"""
+    """按持仓冻结参数执行止损、止盈和交易日到期/盈利宽限，不认证收益。"""
     price = _to_float(ctx.get("price"))
     stop_loss_price = _to_float(ctx.get("stop_loss_price")) or _to_float(position.stop_loss_price)
     take_profit_pct = _to_float((params or {}).get("take_profit_pct")) or settings.PAPER_HIGHBOARD_TAKE_PROFIT_PCT
@@ -6182,7 +6806,8 @@ def _midline_sell_reason(
     return ""
 
 
-async def _daily_participation_candidates(db: AsyncSession, limit: int, *, trade_date: date | None = None) -> list[dict]:
+async def _daily_participation_candidates(db: AsyncSession, limit: int, *, trade_date: date | None = None,
+                                        only_codes: set[str] | None = None) -> list[dict]:
     trade_date = trade_date or _paper_now().date()
     if not settings.PAPER_AUTO_DAILY_PARTICIPATION_ENABLED:
         return []
@@ -6196,6 +6821,7 @@ async def _daily_participation_candidates(db: AsyncSession, limit: int, *, trade
         dict(item)
         for item in (payload.get("rank") or [])
         if item.get("is_tradeable", True)
+        and (only_codes is None or str(item.get("code") or "").strip() in only_codes)
     ]
     codes = [str(item.get("code") or "").strip() for item in rows]
     codes = [code for code in codes if code]
@@ -6515,9 +7141,12 @@ async def _ma5_pullback_candidates(
     return selected, notes
 
 
-async def _icepoint_reversal_candidates(db: AsyncSession, limit: int, *, trade_date: date | None = None) -> list[dict]:
+async def _icepoint_reversal_candidates(db: AsyncSession, limit: int, *, trade_date: date | None = None,
+                                      only_codes: set[str] | None = None) -> list[dict]:
     trade_date = trade_date or _paper_now().date()
     rows = await _radar_candidates(db, limit=max(limit * 4, 12))
+    if only_codes is not None:
+        rows = [row for row in rows if str(row.get("code") or "").strip() in only_codes]
     if db is None:
         return []
     codes = [str(item.get("code") or "").strip() for item in rows]
@@ -6985,39 +7614,47 @@ async def _sector_retreat_reason(
 
 async def _build_short_sell_context(db: AsyncSession, position: PaperPosition, trade_date: Optional[date] = None) -> dict:
     spot = await _spot_by_code(db, position.code)
-    # 2026-08-31: 拉 21 根 K 线以支持 MA10/MA20 计算 (修复策略E"跌破MA20"死代码)
-    k_rows = await _latest_kline_rows(db, position.code, limit=21)
+    # 交易调用传入决策交易日；兼容调用以轮次时钟为准，不从最新日线反推。
+    trade_date = trade_date or _paper_now().date()
+    # 当日日K会被后续报价/终场数据覆盖，不能作为当前轮次的OHLC或收盘价。
+    k_rows = await _recent_kline_rows_before(db, position.code, trade_date, limit=20)
     latest_k = k_rows[-1] if k_rows else None
-    closes = [_to_float(row.close) for row in k_rows]
-    closes = [value for value in closes if value is not None]
-    ma5 = round(sum(closes[-5:]) / 5, 4) if len(closes) >= 5 else None
-    ma10 = round(sum(closes[-10:]) / 10, 4) if len(closes) >= 10 else None
-    ma20 = round(sum(closes[-20:]) / 20, 4) if len(closes) >= 20 else None
 
-    price = _to_float(getattr(spot, "price", None)) or _to_float(getattr(latest_k, "close", None)) or position.current_price or position.buy_price
-    open_price = _to_float(getattr(spot, "open", None)) or _to_float(getattr(latest_k, "open", None))
-    high = _to_float(getattr(spot, "high", None)) or _to_float(getattr(latest_k, "high", None))
-    low = _to_float(getattr(spot, "low", None)) or _to_float(getattr(latest_k, "low", None))
-    change_pct = _to_float(getattr(spot, "change_pct", None)) or _to_float(getattr(latest_k, "change_pct", None))
-    limit_down = _to_float(getattr(spot, "limit_down", None))
+    def positive(value):
+        parsed = _to_float(value)
+        return parsed if parsed is not None and parsed > 0 else None
+
+    quote_price = positive(getattr(spot, "price", None))
+    quote_ok, _ = _execution_quote_status(spot, trade_date)
+    closes = [positive(row.close) for row in k_rows]
+    if quote_ok and quote_price is not None:
+        closes.append(quote_price)
+
+    def moving_average(period):
+        values = closes[-period:]
+        # 不丢弃坏值后往更早日期补足，避免悄悄更换MA的窗口。
+        return round(sum(values) / period, 4) if len(values) == period and all(
+            value is not None for value in values
+        ) else None
+
+    ma5, ma10, ma20 = (moving_average(period) for period in (5, 10, 20))
+    # 无有效报价时只保留估值回退供展示，提交仍必须通过实时行情硬门槛。
+    price = quote_price or positive(getattr(latest_k, "close", None)) or positive(position.current_price) or positive(position.buy_price)
+    open_price = positive(getattr(spot, "open", None))
+    high = positive(getattr(spot, "high", None))
+    low = positive(getattr(spot, "low", None))
+    change_pct = _to_float(getattr(spot, "change_pct", None))
+    limit_down = positive(getattr(spot, "limit_down", None))
+    # 腾讯量比与日成交量/前五日均量不是同一指标；缺实时量比就保持缺失。
     volume_ratio = _to_float(getattr(spot, "volume_ratio", None))
-    if volume_ratio is None and len(k_rows) >= 6:
-        today_volume = _to_float(k_rows[-1].volume)
-        prev_volumes = [_to_float(row.volume) for row in k_rows[-6:-1]]
-        prev_volumes = [value for value in prev_volumes if value and value > 0]
-        if today_volume and prev_volumes:
-            volume_ratio = round(today_volume / (sum(prev_volumes) / len(prev_volumes)), 2)
+    if volume_ratio is not None and volume_ratio < 0:
+        volume_ratio = None
 
     close_position = None
-    if price is not None and high is not None and low is not None and high > low:
+    if price is not None and high is not None and low is not None and high > low and low <= price <= high:
         close_position = round((price - low) / (high - low), 2)
 
-    prev_kline = None
-    if trade_date:
-        prev_rows = await _recent_kline_rows_before(db, position.code, trade_date, limit=1)
-        prev_kline = prev_rows[-1] if prev_rows else None
-    elif len(k_rows) >= 2:
-        prev_kline = k_rows[-2]
+    prev_kline = latest_k
     prev_change_pct = _to_float(getattr(prev_kline, "change_pct", None))
     prev_close = _to_float(getattr(prev_kline, "close", None))
     prev_prev_close = _to_float(getattr(prev_kline, "prev_close", None))
@@ -7035,6 +7672,15 @@ async def _build_short_sell_context(db: AsyncSession, position: PaperPosition, t
         open_gap_from_prev_close_pct = round((open_price / prev_close - 1) * 100, 2)
 
     return {
+        "exit_input_contract": EXIT_INPUT_CONTRACT_VERSION,
+        "exit_input_basis": {
+            "trade_date": trade_date.isoformat(),
+            "intraday_fields": "current_quote_only",
+            "ma_basis": "prior_daily_closes_plus_current_quote" if quote_ok else "prior_daily_closes_only",
+            "last_prior_kline_date": latest_k.trade_date.isoformat() if latest_k else None,
+            # 兼容日K投影没有历史可用时钟，不能据此声称是PIT收益回测。
+            "historical_kline_availability": "unverified_compatibility_projection",
+        },
         "price": price,
         "open": open_price,
         "high": high,
@@ -7045,10 +7691,10 @@ async def _build_short_sell_context(db: AsyncSession, position: PaperPosition, t
         "ma5": ma5,
         "ma10": ma10,
         "ma20": ma20,
-        "avg_price": _to_float(getattr(spot, "avg_price", None)),
+        "avg_price": positive(getattr(spot, "avg_price", None)),
         "min5_change": _paper_effective_min5_change(
             spot,
-            trade_date=trade_date or date.today(),
+            trade_date=trade_date,
         ),
         "orderbook_imbalance": _to_float(getattr(spot, "orderbook_imbalance", None)),
         "bid_ask_spread": _to_float(getattr(spot, "bid_ask_spread", None)),
@@ -7098,6 +7744,7 @@ def _short_sell_reason(
     breakeven_protect_high_profit_pct = _number_or((params or {}).get("breakeven_protect_high_profit_pct"), settings.PAPER_AUTO_BREAKEVEN_PROTECT_HIGH_PROFIT_PCT)
     breakeven_protect_low_pct = _number_or((params or {}).get("breakeven_protect_low_pct"), settings.PAPER_AUTO_BREAKEVEN_PROTECT_LOW_PCT)
     breakeven_protect_high_pct = _number_or((params or {}).get("breakeven_protect_high_pct"), settings.PAPER_AUTO_BREAKEVEN_PROTECT_HIGH_PCT)
+    volume_negative_ratio = _number_or((params or {}).get("volume_negative_ratio"), settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO)
 
     price = _to_float(ctx.get("price"))
     open_price = _to_float(ctx.get("open"))
@@ -7123,6 +7770,7 @@ def _short_sell_reason(
         orderbook_imbalance=orderbook_imbalance,
         volume_ratio=volume_ratio,
         change_pct=change_pct,
+        volume_negative_ratio=volume_negative_ratio,
     )
     # 2026-09-17 复盘修复：窗内门槛改用独立证据，避免同义反复造成的假豁免。
     independent_evidence = _short_independent_weak_evidence_count(
@@ -7134,6 +7782,7 @@ def _short_sell_reason(
         orderbook_imbalance=orderbook_imbalance,
         volume_ratio=volume_ratio,
         change_pct=change_pct,
+        volume_negative_ratio=volume_negative_ratio,
     )
     open_noise_stop_min_evidence = int(
         (params or {}).get("open_noise_stop_min_evidence")
@@ -7186,6 +7835,13 @@ def _short_sell_reason(
             return ""
         return f"触发硬止损：{profit_pct:.2f}%"
     if open_noise and independent_evidence < open_noise_weak_min_evidence:
+        # 弱触发门不遮蔽已冻结的止盈/到期合同；只在原本整段被拦截时
+        # 评估这两项，避免改变证据充分或窗外的原退出优先级。
+        # 上方止损及其既有开盘豁免仍优先，不由到期条件绕过。
+        if profit_pct >= take_profit_pct:
+            return f"触发短线止盈：{profit_pct:.2f}%"
+        if hold_days >= max_hold_days and profit_pct <= 0:
+            return f"持仓{hold_days}天未转强，时间止损"
         return ""
     if profit_pct <= -small_stop_loss_pct:
         if weak_confirmations >= 2 or profit_pct <= -(small_stop_loss_pct + 1.0):
@@ -7228,7 +7884,7 @@ def _short_sell_reason(
         return f"跌破5日线：现价{price:.2f} < MA5 {ma5:.2f}"
     if (
         volume_ratio is not None
-        and volume_ratio >= _number_or((params or {}).get("volume_negative_ratio"), settings.PAPER_AUTO_VOLUME_NEGATIVE_RATIO)
+        and volume_ratio >= volume_negative_ratio
         and change_pct is not None
         and change_pct < 0
         and price is not None
@@ -7247,6 +7903,7 @@ def _short_sell_reason(
         volume_ratio=volume_ratio,
         change_pct=change_pct,
         close_position=close_position,
+        volume_negative_ratio=volume_negative_ratio,
     )
     if confirmed_sector_retreat:
         return confirmed_sector_retreat
@@ -7299,8 +7956,10 @@ async def _run_auto_sells(
     positions = await _open_positions(db, account.id)
     default_sell_params = _strategy_sell_params(account)
     base_account_name = _base_strategy_account(str(account.account_name or ""))
-    is_midline = (base_account_name in (PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_REVERSAL)
-                  or account.account_name == PAPER_ACCOUNT_CHALLENGER_A)
+    default_is_midline = (base_account_name in (PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_REVERSAL)
+                          or account.account_name == PAPER_ACCOUNT_CHALLENGER_A)
+    hold_clock_cache = {}
+    registered_calendar_years = {}
     for position in positions:
         await _refresh_expired_paper_rows(db, account, position)
         if getattr(position, "is_closed", False):
@@ -7309,6 +7968,13 @@ async def _run_auto_sells(
             db, account_name=str(account.account_name), position=position,
             defaults=default_sell_params, as_of=quote_now or _paper_now(),
         )
+        from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+        is_midline = default_is_midline
+        if account.account_name == PORTFOLIO_ACCOUNT:
+            from app.paper.portfolio_provenance import PortfolioIdentityError
+            if exit_policy.get("exit_mode") not in {"short", "midline"} or not sell_params:
+                raise PortfolioIdentityError("共享持仓无法核验首次成交的原策略退出规则")
+            is_midline = exit_policy["exit_mode"] == "midline"
         sell_ctx = await _build_short_sell_context(db, position, trade_date)
         sell_ctx["exit_policy"] = exit_policy
         sell_ctx["exit_parameters"] = sell_params
@@ -7340,7 +8006,74 @@ async def _run_auto_sells(
         profit_pct = float(position.profit_pct or 0)
         if position.buy_price:
             profit_pct = round((price / position.buy_price - 1) * 100, 2)
-        hold_days = int(position.hold_days or 0)
+        # The valuation cache is not a decision clock: the lightweight monitor
+        # can run before any account/NAV refresh. Never rewrite the position here.
+        buy_time = getattr(position, "buy_time", None)
+        hold_days = None
+        clock_error = None
+        clock_reason = None
+        try:
+            if (not isinstance(buy_time, datetime) or type(trade_date) is not date
+                    or buy_time.date() > trade_date
+                    or (quote_now is not None and buy_time > quote_now)):
+                raise ValueError("invalid_position_clock")
+            buy_day = buy_time.date()
+            if buy_day not in hold_clock_cache:
+                # The legacy helper's calendar can silently fall back to weekdays
+                # or sync a sparse year. Require local facts before calling it;
+                # use a separate read session so failure cannot poison sell work.
+                from app.core.trade_calendar import is_official_closed_day
+                from app.db.session import async_session as calendar_session
+                from app.models.governance import TradeCalendarModel
+                expected_days = 0
+                if buy_day < trade_date:
+                    for year in range(buy_day.year, trade_date.year + 1):
+                        if year not in registered_calendar_years:
+                            async with calendar_session() as calendar_db:
+                                rows = (await calendar_db.execute(select(
+                                    TradeCalendarModel.trade_date, TradeCalendarModel.is_trade_day,
+                                ).where(
+                                    TradeCalendarModel.trade_date >= date(year, 1, 1),
+                                    TradeCalendarModel.trade_date <= date(year, 12, 31),
+                                ))).all()
+                            registered_calendar_years[year] = dict(rows)
+                        # Matches _ensure_loaded's local-only branch; do not
+                        # initiate source sync from the position risk monitor.
+                        if len(registered_calendar_years[year]) <= 200:
+                            raise ValueError("calendar_year_unavailable")
+                    day = buy_day + timedelta(days=1)
+                    while day <= trade_date:
+                        fact = registered_calendar_years[day.year].get(day)
+                        if is_official_closed_day(day):
+                            pass
+                        elif type(fact) is bool:
+                            expected_days += int(fact)
+                        elif day.weekday() < 5:
+                            raise ValueError("calendar_date_unavailable")
+                        day += timedelta(days=1)
+                resolved = await _trade_day_hold_days(buy_day, trade_date)
+                if type(resolved) is not int or resolved < 0 or resolved != expected_days:
+                    raise ValueError("calendar_count_invalid")
+                hold_clock_cache[buy_day] = resolved
+            hold_days = hold_clock_cache[buy_day]
+        except Exception as clock_exc:
+            clock_error = type(clock_exc).__name__
+            clock_reason = (str(clock_exc) if type(clock_exc) is ValueError and str(clock_exc) in {
+                "invalid_position_clock", "calendar_year_unavailable",
+                "calendar_date_unavailable", "calendar_count_invalid",
+            } else "calendar_lookup_failed")
+        sell_ctx["exit_hold_clock"] = {
+            "status": "known" if hold_days is not None else "unknown",
+            "basis": "decision_trade_calendar" if hold_days is not None else "calendar_unavailable",
+            "buy_date": buy_time.date().isoformat() if isinstance(buy_time, datetime) else None,
+            "trade_date": trade_date.isoformat(),
+            "hold_days": hold_days,
+            "error_type": clock_error,
+            "reason_code": clock_reason,
+        }
+        # -1 is only an internal predicate sentinel: every existing age-dependent
+        # rung uses >=. Unknown is persisted as null, never as zero/calendar days.
+        evaluation_hold_days = hold_days if hold_days is not None else -1
         forced_exit_reason = str(
             (forced_exit_reason_by_code or {}).get(position.code) or ""
         ).strip()
@@ -7350,17 +8083,38 @@ async def _run_auto_sells(
             reason = forced_exit_reason
         elif is_midline:
             # E/F及对应次账户、A2均消费自身建仓时退出规则，不再临时继承主账户设置。
-            reason = _midline_sell_reason(position, sell_ctx, profit_pct, hold_days, params=sell_params)
+            reason = _midline_sell_reason(position, sell_ctx, profit_pct, evaluation_hold_days, params=sell_params)
         else:
+            sell_evaluated_at = quote_now or datetime.now()
             reason = _short_sell_reason(
                 position,
                 sell_ctx,
                 profit_pct,
-                hold_days,
+                evaluation_hold_days,
                 trade_date,
-                quote_now or datetime.now(),
+                sell_evaluated_at,
                 params=sell_params,
             )
+            if hold_days is None and reason:
+                # Unknown age must not make a later soft full-exit rung reachable
+                # merely by skipping an earlier partial-exit rung. In the current
+                # main short ladder, earlier age predicates all use >= 1 and
+                # expiry is last. The closed opening-noise branch can return only
+                # age-free TP or empty for unknown age, never a later soft rung.
+                # This is a dependency probe, NOT an estimate/assignment of age.
+                age_enabled_reason = _short_sell_reason(
+                    position, sell_ctx, profit_pct, 1, trade_date,
+                    sell_evaluated_at, params=sell_params,
+                )
+                if age_enabled_reason != reason:
+                    sell_ctx["exit_hold_clock"].update(
+                        priority_status="ambiguous",
+                        suppressed_reason=reason,
+                        age_enabled_reason=age_enabled_reason,
+                    )
+                    reason = ""
+                else:
+                    sell_ctx["exit_hold_clock"]["priority_status"] = "age_invariant"
         # 策略触发与执行拦截并列保存；后续T+1/盘口/订单分支不得覆盖原触发。
         sell_ctx["exit_trigger_reason"] = reason
         sell_ctx["exit_execution_status"] = "evaluating" if reason else "not_requested"
@@ -7378,7 +8132,7 @@ async def _run_auto_sells(
             except Exception as observation_exc:
                 logger.warning("[paper] position observation unavailable (%s)", type(observation_exc).__name__)
         if not reason:
-            if not log_holds:
+            if not log_holds and hold_days is not None:
                 continue
             logs.append(await _add_auto_log(
                 db,
@@ -7391,7 +8145,9 @@ async def _run_auto_sells(
                 name=position.name or "",
                 action="hold",
                 decision="wait",
-                reason=f"继续持有：持仓{hold_days}个交易日，盈亏{profit_pct:.2f}%，卖点未触发",
+                reason=(f"继续持有：持仓{hold_days}个交易日，盈亏{profit_pct:.2f}%，卖点未触发"
+                        if hold_days is not None else
+                        "持仓交易日未知：跳过持有期相关退出，其他风险退出仍按原规则评估"),
                 price=price,
                 amount=position.buy_amount,
                 candidate=sell_ctx,
@@ -7549,13 +8305,31 @@ async def _run_auto_sells(
             ))
             continue
 
-        if await _has_active_paper_order(
-            db,
-            account_name=account.account_name,
-            code=position.code,
-            side="sell",
-            trade_date=trade_date,
-        ):
+        active_sell = await _has_active_paper_order(
+            db, account_name=account.account_name, code=position.code,
+            side="sell", trade_date=trade_date,
+        )
+        if active_sell and _is_full_exit_reason(str(sell_ctx.get("exit_trigger_reason") or "")):
+            from app.trading.service import cancel_reduction_for_protective_exit
+            upgrade = await cancel_reduction_for_protective_exit(
+                db, account_name=account.account_name, position=position,
+                quantity=sell_amount, candidate=sell_ctx,
+                decision_at=quote_now or _paper_now(),
+                decision_round_id=str(_quote_round_context().get("round_id") or ""),
+                strategy_id=order_strategy_id, source=order_source,
+            )
+            await _refresh_expired_paper_rows(db, account, position, *logs)
+            sell_ctx["exit_upgrade"] = upgrade
+            if upgrade["status"] == "canceled":
+                active_sell = False
+                logs.append(await _add_auto_log(
+                    db, account_id=account.id, run_id=run_id, trade_date=trade_date,
+                    trigger=trigger, source="position", code=position.code,
+                    name=position.name or "", action="cancel_sell", decision="canceled",
+                    reason="保护性全退出升级：仅撤销旧T减仓余量，新委托与成交须独立核验",
+                    amount=upgrade["canceled_remaining_quantity"], candidate=sell_ctx,
+                ))
+        if active_sell:
             block_exit(sell_ctx, code="active_sell_order", reason="已有未终结卖出委托，等待下一健康报价轮次继续按深度撮合", status="order_pending")
             logs.append(await _add_auto_log(
                 db,
@@ -7889,7 +8663,7 @@ async def _run_auto_t_buybacks(
             ))
             continue
 
-        ctx = await _build_short_sell_context(db, position)
+        ctx = await _build_short_sell_context(db, position, trade_date)
         spot = await _spot_by_code(db, position.code)
         quote_ok, quote_reason = _execution_quote_status(spot, trade_date)
         if not quote_ok:
@@ -8752,7 +9526,8 @@ async def run_paper_position_risk_monitor(
             quote_now=observed_at,
             log_holds=False,
         ))
-        if _base_strategy_account(account_name) == PAPER_ACCOUNT_TENBAGGER:
+        from app.paper.portfolio_contract import PORTFOLIO_ACCOUNT
+        if _base_strategy_account(account_name) == PAPER_ACCOUNT_TENBAGGER or account_name == PORTFOLIO_ACCOUNT:
             logs.extend(await _reconcile_highboard_queue_logs(
                 db,
                 account=account,
@@ -8784,6 +9559,8 @@ async def finalize_paper_daily_outcomes(
 ) -> dict:
     """收盘固化所有 Champion/Challenger 的终态；无成交也必须有明确原因。"""
     from app.models.trading import TradeFill, TradeOrder
+    from app.models.paper import PaperShadowEvent
+    from app.paper.experiment import execution_signal_identity
 
     finalized_at = observed_at or _paper_now()
     target_date = trade_date or finalized_at.date()
@@ -8799,6 +9576,9 @@ async def finalize_paper_daily_outcomes(
                     TradeOrder.broker == "paper",
                     TradeOrder.trade_date == target_date,
                     TradeOrder.status.in_(("pending", "submitted", "partial")),
+                    # Fixed-price intents have their own typed expiry/CAS; never
+                    # override a suspected economic conflict with ordinary depth finalization.
+                    TradeOrder.order_type != "after_hours_fixed",
                 )
             )
         ).all()
@@ -8876,6 +9656,7 @@ async def finalize_paper_daily_outcomes(
                         TradeOrder.broker == "paper",
                         TradeOrder.account_id == account_name,
                         TradeOrder.trade_date == target_date,
+                        TradeOrder.order_type != "after_hours_fixed",
                         TradeOrder.created_at <= finalized_at,
                         (TradeOrder.strategy_version == strategy_version
                          if settings.PAPER_CONTINUOUS_EXPERIMENT_ENABLED else True),
@@ -8910,6 +9691,32 @@ async def finalize_paper_daily_outcomes(
         decision_count = sum(item.action != "scan" for item in logs)
         data_waits = [item for item in logs if item.stage_code == "data_gate"]
         strategy_rejects = [item for item in logs if item.stage_code == "strategy_filter"]
+        # 子账户扫描心跳不包含上游证据失败。只汇总当前执行所绑定的路由版本，
+        # 不能把其他账户、旧版或收盘后补写的影子事件当作本日运行证据。
+        signal_identity = execution_signal_identity(account_name)
+        shadow_counts: dict[str, int] = {}
+        shadow_blocked_codes: set[str] = set()
+        if signal_identity.get("route_id"):
+            shadow_rows = (await db.execute(
+                select(PaperShadowEvent.event_type, PaperShadowEvent.code,
+                       func.count(PaperShadowEvent.id))
+                .where(
+                    PaperShadowEvent.route_id == signal_identity["route_id"],
+                    PaperShadowEvent.route_version == signal_identity["route_version"],
+                    PaperShadowEvent.trade_date == target_date,
+                    PaperShadowEvent.observed_at <= finalized_at,
+                    PaperShadowEvent.created_at <= finalized_at,
+                    PaperShadowEvent.event_type.in_(("coverage_blocked", "evidence_blocked",
+                                                     "structural_pool", "eligible", "confirmed")),
+                )
+                .group_by(PaperShadowEvent.event_type, PaperShadowEvent.code)
+            )).all()
+            for event_type, code, count in shadow_rows:
+                shadow_counts[event_type] = shadow_counts.get(event_type, 0) + count
+                if event_type in {"coverage_blocked", "evidence_blocked"}:
+                    shadow_blocked_codes.add(str(code))
+        shadow_data_wait_count = sum(shadow_counts.get(key, 0) for key in
+                                     ("coverage_blocked", "evidence_blocked"))
         submitted_count = len(orders)
         fill_count = len(fills)
         blocked_count = sum(1 for item in logs if item.decision == "blocked")
@@ -8936,10 +9743,11 @@ async def finalize_paper_daily_outcomes(
             terminal_status = "order_unfilled"
             reason_code = "close_unfilled"
             reason = "当日委托经下一轮/五档撮合后仍未成交，收盘终态撤单"
-        elif data_waits:
+        elif data_waits or shadow_data_wait_count:
             terminal_status = "data_limited"
             reason_code = "necessary_data_wait_no_fill"
-            reason = f"当日有{len(data_waits)}条必要数据等待且无成交；不能仅归因没有策略候选"
+            reason = (f"当日有{len(data_waits)}条必要数据等待、{shadow_data_wait_count}条上游证据缺口记录且无成交；"
+                      "不能仅归因没有策略候选（记录数不是独立机会数）")
         elif blocked_count:
             terminal_status = "blocked"
             reason_code = "risk_or_execution_blocked"
@@ -8959,10 +9767,14 @@ async def finalize_paper_daily_outcomes(
             terminal_status = "candidate_observed"
             reason_code = "candidate_no_order"
             reason = "记录到候选但未形成可执行委托；控制样本不计入绩效"
+        elif any(shadow_counts.get(key, 0) for key in ("structural_pool", "eligible", "confirmed")):
+            terminal_status = "candidate_observed"
+            reason_code = "shadow_candidate_no_order"
+            reason = "上游已记录结构候选，但未形成可执行委托；需区分形态、持续确认及执行门槛"
         elif scan_count:
             terminal_status = "no_candidate"
             reason_code = "scanned_no_candidate"
-            reason = "当日扫描已运行，但没有候选通过既有Champion门禁"
+            reason = "当日扫描已运行，但没有候选通过本账户入口门槛"
         else:
             terminal_status = "not_run"
             reason_code = "no_run_evidence"
@@ -8991,6 +9803,14 @@ async def finalize_paper_daily_outcomes(
             "data_wait_count": len(data_waits),
             "strategy_reject_count": len(strategy_rejects),
             "data_wait_reason_codes": sorted({str(item.reason_code) for item in data_waits}),
+            "shadow_evidence": {
+                "route_id": signal_identity.get("route_id"),
+                "route_version": signal_identity.get("route_version"),
+                "event_counts": shadow_counts,
+                "data_wait_record_count": shadow_data_wait_count,
+                "blocked_codes": sorted(shadow_blocked_codes),
+                "count_basis": "evidence_records_not_opportunities",
+            },
             "scope": "account_current_execution_version" if settings.PAPER_CONTINUOUS_EXPERIMENT_ENABLED else "legacy_account_day",
         }
         outcome = await db.scalar(
@@ -9077,6 +9897,10 @@ async def run_paper_auto_trade(
         if execution_mode == "intraday":
             should_run, skip_reason = await _should_run_intraday_auto_trade(decision_now)
             if not should_run:
+                _capture_primary_candidate_shadow(
+                    account=account, run_id=run_id, stage="not_scanned",
+                    reason=skip_reason, reported_at=decision_now,
+                )
                 log = await _add_auto_log(
                     db,
                     account_id=account.id,
@@ -9155,6 +9979,10 @@ async def run_paper_auto_trade(
                 stage_code="runtime_scan", reason_code="account_scan_entered",
                 created_at=decision_now,
             )
+            # This receipt only proves entry into the scan, before any new order.
+            # Do not retain its SQLite writer while collecting slow candidates;
+            # cancellation may leave an observed heartbeat, never a claimed fill.
+            await db.commit()
 
         if not settings.PAPER_AUTO_TRADE_ENABLED and execute_orders:
             logs.append(await _add_auto_log(
@@ -9256,6 +10084,7 @@ async def run_paper_auto_trade(
             trade_date,
             account_id=account.id,
             include_legacy_null=account_name == PAPER_ACCOUNT_DEFAULT,
+            as_of=_public_order_clock(),
         )
         today_new_buy_count = len(today_new_buy_logs)
         today_bought_codes = {str(item.code) for item in today_new_buy_logs if item.code}
@@ -9266,13 +10095,18 @@ async def run_paper_auto_trade(
         )
         market_sentiment = await _market_sentiment_for_date(db, trade_date)
         strong_market_recovery_day = _is_strong_market_recovery_sentiment(market_sentiment)
+        scale_in_codes = {
+            position.code for position in open_positions
+            if account_name == PAPER_ACCOUNT_DEFAULT and settings.PAPER_AUTO_SCALE_IN_ENABLED
+            and position.strategy_version == _strategy_version(account_name)
+        }
         include_daily_participation = (
-            today_new_buy_count == 0
+            (today_new_buy_count == 0 or bool(scale_in_codes))
             and _is_daily_participation_time(decision_now)
             and _market_allows_daily_participation(market_sentiment)
         )
         include_icepoint_reversal = (
-            today_new_buy_count == 0
+            (today_new_buy_count == 0 or bool(scale_in_codes))
             and _is_icepoint_reversal_time(decision_now)
             and _market_is_icepoint_reversal_setup(market_sentiment)
         )
@@ -9293,7 +10127,7 @@ async def run_paper_auto_trade(
                     now=decision_now,
                 )
             elif _base_strategy_account(account_name) == PAPER_ACCOUNT_TENBAGGER:
-                # E低位入口与E2强势/回封入口共享质量和成交硬约束，独立账户配对实验。
+                # E低位入口与E2强势/触板入口共享质量和成交硬约束，独立账户配对实验。
                 candidates, candidate_notes = await _tenbagger_midline_candidates(
                     db,
                     limit=max_candidates,
@@ -9318,7 +10152,51 @@ async def run_paper_auto_trade(
                     account_id=account.id,
                     include_daily_participation=include_daily_participation,
                     include_icepoint_reversal=include_icepoint_reversal,
+                    participation_existing_codes=scale_in_codes if today_new_buy_count > 0 else None,
                 )
+        try:
+            if execution_mode == "intraday":
+                _capture_primary_candidate_shadow(
+                    account=account, run_id=run_id, stage="scan_completed" if allow_buys else "not_scanned",
+                    candidate={"candidate_count": len(candidates) if allow_buys else None,
+                               "diagnostic_count": len(candidate_diagnostics) if allow_buys else None},
+                    reason=(f"original_candidate_count={len(candidates)}; "
+                            + "；".join(str(note) for note in candidate_notes[:3]) if allow_buys
+                            else "original_buy_scan_disabled"), reported_at=decision_now,
+                )
+                for research_item in candidates:
+                    _capture_primary_candidate_shadow(
+                        account=account, candidate=research_item, run_id=run_id,
+                        stage="candidate_observed", original_candidate=True,
+                        reason="original_selected_pool_not_formal_confirmation",
+                        reported_at=decision_now,
+                    )
+                for research_diagnostic in candidate_diagnostics:
+                    if research_diagnostic.get("reason_code") == "candidate_selected":
+                        # The selected list above is the actual bounded original cohort.
+                        continue
+                    research_item = dict(research_diagnostic.get("candidate") or {})
+                    research_item.update({key: research_diagnostic.get(key) for key in ("code", "name")
+                                          if research_diagnostic.get(key)})
+                    _capture_primary_candidate_shadow(
+                        account=account, candidate=research_item, run_id=run_id,
+                        stage=str(research_diagnostic.get("stage_code") or "candidate_filter"),
+                        reason=str(research_diagnostic.get("reason_code") or research_diagnostic.get("reason") or ""),
+                        reported_at=decision_now,
+                    )
+        except Exception as exc:
+            logger.debug("Candidate research denominator unavailable (%s)", type(exc).__name__)
+        # Only explicit producer health facts: zero candidates / probability misses
+        # are successful scans, not source failures.
+        source_scan_issues = list(getattr(candidate_notes, "issues", ()))
+        source_scan_issues.extend(
+            {"source": account_name, "reason_code": item["reason_code"]}
+            for item in candidate_diagnostics
+            if item.get("reason_code") in {
+                "prediction_batch_blocked", "prediction_not_visible",
+                "candidate_data_missing", "probability_contract_invalid",
+            }
+        )
         await _record_control_sample(
             db,
             account=account,
@@ -9326,11 +10204,81 @@ async def run_paper_auto_trade(
             observed_at=decision_now,
             candidates=candidates,
         )
+        # Keep the independent list and control sample untouched. Only source-wallet
+        # history restrictions are lifted for the evidence side channel.
+        from app.paper.portfolio_contract import portfolio_active
+        portfolio_capture = (
+            execute_buy_orders and execution_mode == "intraday"
+            and portfolio_active(decision_now)
+        )
+        portfolio_candidates: list[dict] = []
+        if portfolio_capture and allow_buys and account_name == PAPER_ACCOUNT_DEFAULT and today_new_buy_count > 0:
+            if _is_daily_participation_time(decision_now) and _market_allows_daily_participation(market_sentiment):
+                portfolio_candidates.extend(await _daily_participation_candidates(
+                    db, limit=max_candidates, trade_date=trade_date, only_codes=None))
+            if _is_icepoint_reversal_time(decision_now) and _market_is_icepoint_reversal_setup(market_sentiment):
+                portfolio_candidates.extend(await _icepoint_reversal_candidates(
+                    db, limit=max_candidates, trade_date=trade_date, only_codes=None))
+            independent_codes = {str(item.get("code") or "") for item in candidates}
+            unique = {}
+            for item in portfolio_candidates:
+                code = str(item.get("code") or "")
+                if code and code not in independent_codes and code not in unique:
+                    unique[code] = dict(item)
+            portfolio_candidates = list(unique.values())
+            funds = await _paper_main_fund_map(
+                db, trade_date=trade_date, codes=list(unique))
+            for item in portfolio_candidates:
+                _bind_main_fund_evidence(item, funds.get(str(item.get("code") or "")))
+        portfolio_candidate_ids = {id(item) for item in portfolio_candidates}
+        portfolio_only = False
+        research_quotes = {}
+
+        async def _entry_log(*args, **kwargs):
+            item = kwargs.get("candidate")
+            if (account_name in {PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_CHALLENGER_E}
+                    and kwargs.get("action") == "skip_buy" and isinstance(item, dict)
+                    and item.get("confirmation_version") != "champion_persistent_v1"):
+                item["highboard_confirmation_reset"] = True
+            # A separate action keeps added evidence out of original confirmation
+            # streaks and armed-reversal restoration, including failure audits.
+            if portfolio_only:
+                kwargs["action"] = {"confirm_buy": "portfolio_confirm", "skip_buy": "portfolio_skip"}[kwargs["action"]]
+            result = await _add_auto_log(*args, **kwargs)
+            if not portfolio_only and execution_mode == "intraday":
+                _capture_primary_candidate_shadow(
+                    account=account, candidate=kwargs.get("candidate"),
+                    spot=research_quotes.get(str(kwargs.get("code") or "")), run_id=run_id,
+                    stage=str(kwargs.get("reason_code") or kwargs.get("action") or "original_gate"),
+                    reason=str(kwargs.get("reason") or ""), original_candidate=True,
+                    original_confirmed=None,
+                    original_gate=False if kwargs.get("action") == "skip_buy" else None,
+                    reported_at=decision_now,
+                )
+            return result
+
         bought = 0
         dry_run_new_codes: set[str] = set()
 
-        # 结构化原因逐个落账，不受三条展示摘要截断；数据等待与策略拒绝分开。
+        # Immutable pool decisions persist on state transitions, not on every
+        # quote. A per-round receipt links reused rows without cloning the pool.
+        from app.paper.candidate_audit import append_candidate_audits, candidate_trace
+        audit_logs, audit_summary = await append_candidate_audits(
+            db, candidate_diagnostics, append_log=_add_auto_log, account_id=account.id,
+            strategy_version=_strategy_version(account_name), run_id=run_id,
+            trade_date=trade_date, trigger=trigger)
+        logs.extend(audit_logs)
+        if audit_summary["evaluated"]:
+            logs.append(await _add_auto_log(
+                db, run_id=run_id, trade_date=trade_date, trigger=trigger,
+                account_id=account.id, source="candidate", action="candidate_scan",
+                decision="observed", stage_code="candidate_scan",
+                reason_code="candidate_audit_observed", reason="逐股候选状态观察；不等于买点确认或成交",
+                candidate={"candidate_audit_summary": audit_summary}))
+        # Original global gate diagnostics keep their severity/consumer semantics.
         for diagnostic in candidate_diagnostics:
+            if candidate_trace(diagnostic) is not None:
+                continue
             logs.append(await _add_auto_log(
                 db, run_id=run_id, trade_date=trade_date, trigger=trigger,
                 source="candidate", action="candidate_reject", decision="wait",
@@ -9384,13 +10332,14 @@ async def run_paper_auto_trade(
                 reason=reason,
             ))
 
-        for candidate in candidates:
+        for candidate in [*candidates, *portfolio_candidates]:
             if not allow_buys:
                 break
             code = str(candidate.get("code") or "").strip()
             if not code:
                 continue
             source = str(candidate.get("_source") or "candidate")
+            candidate["execution_timing"] = entry_consumer_timing(decision_at=decision_now)
             if account_name == PAPER_ACCOUNT_DEFAULT and execution_mode == "intraday":
                 # SAVEPOINT-isolated observation; audit errors return unknown and never feed execution_confirmation.
                 candidate["confirmation_evidence"] = await historical_confirmation_evidence(
@@ -9398,10 +10347,19 @@ async def run_paper_auto_trade(
                     source=source, strategy_version=_strategy_version(account_name),
                     observed_at=decision_now,
                 )
-            if code in queued_codes:
+            portfolio_only = id(candidate) in portfolio_candidate_ids or (portfolio_capture and code in queued_codes)
+            if code in queued_codes and not portfolio_only:
                 # 已有同代码涨停排队单，禁止每分钟重复报单。
                 continue
             spot = await _spot_by_code(db, code)
+            research_quotes[code] = spot
+            if execution_mode == "intraday" and not portfolio_only:
+                _capture_primary_candidate_shadow(
+                    account=account, candidate=candidate, spot=spot, run_id=run_id,
+                    stage="candidate_quote_observed", original_candidate=True,
+                    reason="same_original_candidate_quote_before_confirmation",
+                    reported_at=decision_now,
+                )
             display_name = (
                 str(getattr(spot, "name", "") or "")
                 or str(candidate.get("name") or "")
@@ -9411,7 +10369,7 @@ async def run_paper_auto_trade(
                 score = float(candidate.get("score") or 0)
             quote_ok, quote_reason = _execution_quote_status(spot, trade_date)
             if not quote_ok:
-                logs.append(await _add_auto_log(
+                logs.append(await _entry_log(
                     db,
                     account_id=account.id,
                     run_id=run_id,
@@ -9436,7 +10394,7 @@ async def run_paper_auto_trade(
                 candidate["execution_confirmation"] = False
                 if "confirmation_evidence" in candidate:
                     candidate["confirmation_evidence"]["current_setup_valid"] = "false"
-                logs.append(await _add_auto_log(
+                logs.append(await _entry_log(
                     db, account_id=account.id, run_id=run_id, trade_date=trade_date,
                     trigger=trigger, source=source, code=code, name=display_name,
                     action="skip_buy", decision="blocked", reason=fund_reject,
@@ -9449,14 +10407,15 @@ async def run_paper_auto_trade(
                     price_band = _a_entry_price_band(spot)
                     candidate["entry_price_band"] = price_band
                     if price_band["status"] == "empty":
+                        candidate["primary_confirmation_reset"] = True
                         candidate["confirmation_evidence"]["current_setup_valid"] = "false"
-                        logs.append(await _add_auto_log(
+                        logs.append(await _entry_log(
                             db, account_id=account.id, run_id=run_id,
                             trade_date=trade_date, trigger=trigger, source=source,
                             code=code, name=display_name, action="skip_buy", decision="skipped",
                             reason=(
-                                f"A策略必要价格区间为空：高点保持要求≥{price_band['lower_price']:.4f}，"
-                                f"低点反弹上限要求≤{price_band['upper_price']:.4f}；"
+                                f"A策略必要价格区间为空：{price_band.get('entry_anchor')}承接下界≥{price_band['lower_price']:.4f}，"
+                                f"低吸上界≤{price_band['upper_price']:.4f}；"
                                 "当前振幅不适合该低吸规则，不是T+1禁买或账户暂停"
                             ),
                             price=market_price, candidate_score=score, candidate=candidate,
@@ -9468,9 +10427,10 @@ async def run_paper_auto_trade(
                 confirmation_policy = account_confirmation_policy(account_name)
                 stable_ok, stable_reason, stable_metrics = _stable_intraday_entry_quote(spot, account_name=account_name)
                 if not stable_ok:
+                    candidate["primary_confirmation_reset"] = True
                     if "confirmation_evidence" in candidate:
                         candidate["confirmation_evidence"]["current_setup_valid"] = "false"
-                    logs.append(await _add_auto_log(
+                    logs.append(await _entry_log(
                         db,
                         account_id=account.id,
                         run_id=run_id,
@@ -9487,12 +10447,23 @@ async def run_paper_auto_trade(
                         candidate=candidate,
                     ))
                     continue
-                sample_at = getattr(spot, "updated_at", None)
-                if not isinstance(sample_at, datetime):
-                    sample_at = decision_now
+                sample_at = getattr(spot, "source_quote_at", None)
+                if (not isinstance(sample_at, datetime)
+                        or sample_at.tzinfo is not None
+                        or sample_at.date() != trade_date or sample_at > decision_now):
+                    candidate["primary_confirmation_reset"] = True
+                    logs.append(await _entry_log(
+                        db, account_id=account.id, run_id=run_id, trade_date=trade_date,
+                        trigger=trigger, source=source, code=code, name=display_name,
+                        action="skip_buy", decision="blocked",
+                        reason="源行情时间缺失或不属于当前可见交易日，不能确认分时路径",
+                        price=market_price, candidate_score=score, candidate=candidate,
+                    ))
+                    continue
                 candidate.update(stable_metrics)
                 candidate["confirmation_version"] = "champion_persistent_v1"
                 candidate["confirmation_sample_at"] = sample_at.isoformat()
+                candidate["confirmation_source_quote_at"] = sample_at.isoformat()
                 ready, sample_count, persistence_sec = (
                     await _champion_intraday_confirmation_status(
                         db,
@@ -9502,6 +10473,9 @@ async def run_paper_auto_trade(
                         source=source,
                         current_at=sample_at,
                         account_name=account_name,
+                        **({"current_entry_mode": candidate.get("entry_variant")}
+                           if account_name in {PAPER_ACCOUNT_TENBAGGER, PAPER_ACCOUNT_CHALLENGER_E} else {}),
+                        **({"portfolio_only": True} if portfolio_only else {}),
                     )
                 )
                 if ready and "confirmation_evidence" in candidate and candidate["confirmation_evidence"]["historical_quote_path_confirmed"] != "true":
@@ -9511,7 +10485,7 @@ async def run_paper_auto_trade(
                     )
                 candidate["confirmation_sample_count"] = sample_count
                 candidate["confirmation_persistence_sec"] = round(persistence_sec, 1)
-                logs.append(await _add_auto_log(
+                logs.append(await _entry_log(
                     db,
                     account_id=account.id,
                     run_id=run_id,
@@ -9553,7 +10527,7 @@ async def run_paper_auto_trade(
                 else _conservative_execution_price(spot, "buy")
             )
             if price is None:
-                logs.append(await _add_auto_log(
+                logs.append(await _entry_log(
                     db,
                     account_id=account.id,
                     run_id=run_id,
@@ -9591,7 +10565,7 @@ async def run_paper_auto_trade(
             if value_reject_reason:
                 if "confirmation_evidence" in candidate:
                     candidate["confirmation_evidence"]["current_setup_valid"] = "false"
-                logs.append(await _add_auto_log(
+                logs.append(await _entry_log(
                     db,
                     account_id=account.id,
                     run_id=run_id,
@@ -9620,7 +10594,7 @@ async def run_paper_auto_trade(
             )
             current_now = decision_now
             if _is_late_new_buy_time(current_now) and not _candidate_allows_late_new_buy(current_now, market_sentiment, source, score):
-                logs.append(await _add_auto_log(
+                logs.append(await _entry_log(
                     db,
                     account_id=account.id,
                     run_id=run_id,
@@ -9642,14 +10616,14 @@ async def run_paper_auto_trade(
                 continue
             # 午后“强势市场才开仓”是策略A低吸/异动候选的组合风控，不能覆盖
             # B-F各自经治理或历史回放确定的独立入场条件；尤其C需要消费13:05快照，
-            # E需要允许早盘曾开板后回封的高标在14:00前提交真实排队单。
+            # E需要允许满足非一价触板条件的高标在14:00前提交真实排队单；不认证回封时序。
             if (
                 account_name == PAPER_ACCOUNT_DEFAULT
                 and not experiment_active(account_name, at=current_now)
                 and _is_afternoon_new_buy_time(current_now)
                 and not _candidate_allows_afternoon_new_buy(market_sentiment, source, score)
             ):
-                logs.append(await _add_auto_log(
+                logs.append(await _entry_log(
                     db,
                     account_id=account.id,
                     run_id=run_id,
@@ -9680,6 +10654,14 @@ async def run_paper_auto_trade(
             )
             if "confirmation_evidence" in candidate:
                 candidate["confirmation_evidence"]["current_setup_valid"] = "false" if continuation_reason else "true"
+            if execution_mode == "intraday" and not portfolio_only:
+                _capture_primary_candidate_shadow(
+                    account=account, candidate=candidate, spot=spot, run_id=run_id,
+                    stage="strategy_confirmed" if not continuation_reason else "continuation_filter",
+                    reason=continuation_reason or "original_strategy_confirmed_before_account_budget",
+                    original_candidate=True, original_confirmed=not bool(continuation_reason),
+                    original_gate=not bool(continuation_reason), reported_at=decision_now,
+                )
             if execute_buy_orders and execution_mode == "intraday" and not continuation_reason:
                 from app.push.paper_buy_points import record_buy_point, candidate_reason
                 signal_context = _quote_round_context()
@@ -9687,6 +10669,20 @@ async def run_paper_auto_trade(
                     candidate.get("entry_variant") or candidate.get("buy_point_type")
                     or candidate.get("strategy_label") or source
                 )
+                from app.paper.portfolio_ingress import capture_confirmed_signal
+                captured_signal = await capture_confirmed_signal(
+                    db, account=account, source=source, candidate={**candidate, "name": display_name},
+                    source_signal_id=f"auto-{source}-{signal_context.get('round_id') or trade_date.strftime('%Y%m%d')}-{code}"[:80],
+                    confirmed_at=decision_now, quote_context=signal_context,
+                    price=price, stop_loss_price=stop_loss,
+                    entry_details={"score": score, "queue_if_limit_up": limit_up_queue_order,
+                                   "continuous_participation_probe": continuous_participation_probe},
+                )
+                if portfolio_capture and captured_signal is None:
+                    source_scan_issues.append({"source": source, "code": code,
+                                               "reason_code": "publication_missing"})
+                if portfolio_only:
+                    continue  # Evidence only: never notify or submit for the source wallet.
                 await record_buy_point(
                     db, account=account, strategy_version=_strategy_version(account_name),
                     label=_strategy_display_meta(account)["label"], code=code, name=display_name,
@@ -9711,6 +10707,16 @@ async def run_paper_auto_trade(
                         "confirmation_persistence_sec": candidate.get("confirmation_persistence_sec"),
                     },
                 )
+            if portfolio_only:
+                if continuation_reason:
+                    logs.append(await _entry_log(
+                        db, account_id=account.id, run_id=run_id, trade_date=trade_date,
+                        trigger=trigger, source=source, code=code, name=display_name,
+                        action="skip_buy", decision="blocked", reason=continuation_reason,
+                        candidate=candidate,
+                    ))
+                continue
+
             high_conviction_strong_market_recovery = (
                 strong_market_recovery_day
                 and score >= settings.PAPER_AUTO_DRAWDOWN_HARD_CONVICTION_MIN_SCORE
@@ -9728,7 +10734,7 @@ async def run_paper_auto_trade(
             recovery_buy = _is_drawdown_recovery_buy(
                 account,
                 open_count=open_count,
-                today_new_buy_count=today_new_buy_count + bought + len(queued_codes),
+                today_new_buy_count=today_new_buy_count + bought + len(queued_codes - held_codes),
                 candidate_score=score,
                 allow_profit_position=allow_profit_position_recovery and _is_recovery_buy_time_window(current_now),
                 recovery_max_buys=recovery_max_buys,
@@ -9738,7 +10744,7 @@ async def run_paper_auto_trade(
             pause_reason = _auto_buy_pause_reason(
                 account,
                 open_count=open_count,
-                today_new_buy_count=today_new_buy_count + bought + len(queued_codes),
+                today_new_buy_count=today_new_buy_count + bought + len(queued_codes - held_codes),
                 candidate_score=score,
                 allow_profit_position=allow_profit_position_recovery and _is_recovery_buy_time_window(current_now),
                 recovery_max_buys=recovery_max_buys,
@@ -9763,17 +10769,19 @@ async def run_paper_auto_trade(
                     candidate=candidate,
                 ))
                 continue
-            if today_new_buy_count + bought + len(queued_codes) >= strategy_max_daily_buys:
+            existing_position = position_by_code.get(code)
+            pending_new_count = len(queued_codes - held_codes)
+            if not existing_position and today_new_buy_count + bought + pending_new_count >= strategy_max_daily_buys:
                 if execute_buy_orders:
                     capacity_reason = (
                         f"当前账户今日真实新开仓{today_new_buy_count + bought}只、"
-                        f"待成交委托{len(queued_codes)}只，合计达到策略日限"
+                        f"待成交新开仓委托{pending_new_count}只，合计达到策略日限"
                         f"{strategy_max_daily_buys}只，保留节奏不继续追买"
                     )
                 else:
                     capacity_reason = (
                         f"演练容量已满：当前账户今日真实新开仓{today_new_buy_count}只、"
-                        f"本轮演练候选{bought}只、待成交委托{len(queued_codes)}只，"
+                        f"本轮演练候选{bought}只、待成交新开仓委托{pending_new_count}只，"
                         f"合计达到策略日限{strategy_max_daily_buys}只；演练候选未成交"
                     )
                 logs.append(await _add_auto_log(
@@ -9795,7 +10803,7 @@ async def run_paper_auto_trade(
                 continue
             sector_key = _candidate_sector_key(candidate)
             if (
-                sector_key
+                not existing_position and sector_key
                 and (
                     today_sector_counts.get(sector_key, 0)
                     + run_sector_counts.get(sector_key, 0)
@@ -9818,7 +10826,6 @@ async def run_paper_auto_trade(
                     candidate=candidate,
                 ))
                 continue
-            existing_position = position_by_code.get(code)
             scale_in = False
             if existing_position:
                 current_strategy_version = _strategy_version(account.account_name)
@@ -9847,13 +10854,18 @@ async def run_paper_auto_trade(
                         candidate=candidate,
                     ))
                     continue
+                daily_layers, last_buy_at = await _same_day_buy_layers(
+                    db, account_id=account.id, code=code, now=decision_now,
+                    as_of=_public_order_clock(),
+                )
                 scale_in_reason = _scale_in_reject_reason(
                     candidate,
                     position=existing_position,
                     price=price,
                     score=score,
                     total_assets=float(account.total_assets or account.initial_capital or 0),
-                    bought_code_today=code in today_bought_codes,
+                    bought_code_today=daily_layers > 0 or code in today_bought_codes,
+                    now=decision_now, last_buy_at=last_buy_at, daily_layers=daily_layers,
                 )
                 if scale_in_reason:
                     logs.append(await _add_auto_log(
@@ -9876,6 +10888,14 @@ async def run_paper_auto_trade(
                 scale_in = True
                 candidate["scale_in"] = True
                 candidate["position_cost"] = round(float(existing_position.buy_price or 0), 2)
+                candidate["scale_in_evidence"] = {
+                    "daily_layers_before": daily_layers,
+                    "last_buy_at": last_buy_at.isoformat() if last_buy_at else None,
+                    "cooldown_sec": settings.PAPER_AUTO_SCALE_IN_COOLDOWN_SEC,
+                }
+                # 追加层不能放松原持仓止损；下单与后续落账使用同一止损。
+                stop_loss = max(stop_loss, float(existing_position.stop_loss_price or 0))
+                candidate["stop_loss_price"] = stop_loss
             if not scale_in and open_count >= strategy_max_positions:
                 if execute_buy_orders:
                     position_capacity_reason = (
@@ -9963,6 +10983,12 @@ async def run_paper_auto_trade(
                     open_count=open_count,
                     score=score,
                     position=existing_position if scale_in else None,
+                )
+            if scale_in:
+                # 风险预算覆盖加仓后的整个持仓，不按每笔重复发放2%亏损额度。
+                amount = _scale_in_risk_amount(
+                    amount, position=existing_position, price=price, stop_loss=stop_loss,
+                    total_assets=float(account.total_assets or 0),
                 )
             # 每一种自动买点都先执行一层，避免高分、急拉或单一形态直接放大成重仓。
             # 两个预算任一不足一手都不绕过，防止分层逻辑反向穿透现金/回撤约束。
@@ -10106,13 +11132,13 @@ async def run_paper_auto_trade(
             reason = _candidate_buy_reason(candidate, score, stop_loss)
             if limit_up_queue_order:
                 reason = (
-                    f"{reason}；非一字板回封，按涨停价排队，"
+                    f"{reason}；非一价触板，未认证回封时序，按涨停价排队，"
                     "仅在开板或排队后成交量覆盖前方买一队列时确认成交"
                 )
             if scale_in:
                 reason = f"{reason}；分批建仓：支撑回收再次确认，追加一层"
             if full_conviction and not recovery_buy:
-                reason = f"{reason}；高质量回踩确认：仍只执行首层，下一交易日复核后再加仓"
+                reason = f"{reason}；高质量回踩确认：分层执行，后续须冷却并重新确认才能加仓"
             if recovery_buy:
                 if continuous_participation_probe:
                     reason = f"{reason}；账户深回撤盘面观察模式：按评分分层建仓，保留后续确认加仓空间"
@@ -10139,10 +11165,10 @@ async def run_paper_auto_trade(
                     risk=risk,
                     candidate=candidate,
                 ))
-                bought += 1
                 if not existing_position:
+                    bought += 1
                     dry_run_new_codes.add(code)
-                if sector_key:
+                if sector_key and not existing_position:
                     run_sector_counts[sector_key] = run_sector_counts.get(sector_key, 0) + 1
                 continue
 
@@ -10265,8 +11291,9 @@ async def run_paper_auto_trade(
                 )
                 held_codes.add(code)
                 today_bought_codes.add(code)
-                bought += 1
-                if sector_key:
+                if not existing_position:
+                    bought += 1
+                if sector_key and not existing_position:
                     run_sector_counts[sector_key] = run_sector_counts.get(sector_key, 0) + 1
                 account = await _refresh_account(db, account)
             elif order_status in {"submitted", "partial"}:
@@ -10274,6 +11301,8 @@ async def run_paper_auto_trade(
 
         await db.commit()
         summary = {
+            "source_scan_status": ("degraded" if source_scan_issues else "completed" if allow_buys else "not_scanned"),
+            "source_scan_issues": source_scan_issues,
             "executed": sum(1 for item in logs if item.decision == "executed"),
             "blocked": sum(1 for item in logs if item.decision == "blocked"),
             "skipped": sum(1 for item in logs if item.decision == "skipped"),
@@ -10288,6 +11317,13 @@ async def run_paper_auto_trade(
             "summary": summary,
             "logs": [_auto_log_payload(item) for item in logs],
         }
+
+
+@router.get("/portfolio")
+async def get_portfolio_report(limit: int = Query(default=100, ge=1, le=500), db: AsyncSession = Depends(get_db)):
+    """Read-only shared wallet report; never create, revalue or execute."""
+    from app.paper.portfolio_reporting import portfolio_report
+    return await portfolio_report(db, limit=limit)
 
 
 @router.get("/account")
@@ -10457,7 +11493,10 @@ async def _book_paper_buy(
         )
 
         amount_value = req.price * req.amount
-        commission = _commission(amount_value)
+        from app.trading.paper_authorization import fixed_price_fragment_fee_settings
+        fee_settings = fixed_price_fragment_fee_settings(db)
+        commission = (_commission(amount_value) if fee_settings is None
+                      else _commission(amount_value, fee_settings=fee_settings))
         total_cost = round(amount_value + commission, 2)
         if (account.current_capital or 0) < total_cost:
             raise HTTPException(status_code=400, detail="可用资金不足")
@@ -10620,8 +11659,12 @@ async def _book_paper_sell(
             raise HTTPException(status_code=400, detail=f"A股T+1规则：当前可卖隔夜仓{available_amount}股，今日买入部分不能卖出")
 
         amount_value = req.price * req.amount
-        commission = _commission(amount_value)
-        stamp_tax = _stamp_tax(amount_value)
+        from app.trading.paper_authorization import fixed_price_fragment_fee_settings
+        fee_settings = fixed_price_fragment_fee_settings(db)
+        commission = (_commission(amount_value) if fee_settings is None
+                      else _commission(amount_value, fee_settings=fee_settings))
+        stamp_tax = (_stamp_tax(amount_value) if fee_settings is None
+                     else _stamp_tax(amount_value, fee_settings=fee_settings))
         from app.paper.entry_fee_allocation import load_entry_fee_plan, new_sale_accounting
         fee_plan = await load_entry_fee_plan(db, position, sell_quantity=req.amount, at=trade_now)
         if fee_plan["status"] != "known":
@@ -10855,6 +11898,46 @@ async def paper_trades(
         })
         payloads.append(payload)
     return {"trades": payloads}
+
+
+@router.get("/research/candidate-shadow")
+async def paper_candidate_shadow_report(
+    trade_date: date = Query(..., description="研究记录交易日，不触发补扫或回放"),
+    route: Optional[str] = Query(None, pattern="^(A2?|B2?|C2?|C3|D2?|E2?|F2?)$"),
+    limit: int = Query(200, ge=1, le=500),
+):
+    """Read immutable experiment files only. No trading DB dependency or refresh."""
+    from app.paper.candidate_shadow import read_candidate_shadow_report
+    report = await asyncio.to_thread(
+        read_candidate_shadow_report, trade_date=trade_date, route=route, limit=limit,
+    )
+    # The immutable local evidence retains full sample prefixes. The workbench
+    # receives the owned row view only, not hundreds of repeated quote histories.
+    if "records" in report:
+        report.pop("records")
+        report["raw_evidence_omitted"] = True
+    return report
+
+
+@router.get("/research/c3/events")
+async def paper_c3_research_events(
+    trade_date: Optional[date] = Query(None),
+    keyword: str = Query("", max_length=80),
+    event_type: str = Query("confirmed", max_length=32),
+    version: str = Query("all", pattern="^(all|current)$"),
+    page: int = Query(1, ge=1, le=1000000),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """只读历史检测台账：不建账户、不扫描、不刷新账本、不提交订单。"""
+    from app.paper.c3_records import EVENT_TYPES, list_c3_records
+
+    if event_type not in EVENT_TYPES:
+        raise HTTPException(status_code=422, detail="不支持的 C3 event_type")
+    return await list_c3_records(
+        db, trade_date=trade_date, keyword=keyword, event_type=event_type,
+        version=version, page=page, page_size=page_size,
+    )
 
 
 @router.get("/challengers/comparison")
@@ -11180,7 +12263,8 @@ async def paper_auto_status(
             "empty_position_policy": (
                 "正常交易日持续滚动扫描；不强迫成交。仅A档强趋势同时满足VWAP、位置和至少"
                 f"{settings.PAPER_AUTO_DAILY_PARTICIPATION_MIN_LIQUIDITY_CONFIRMATIONS}项盘口/资金确认时建立首层，"
-                "后续只在下一交易日支撑再次回收时加仓"
+                f"后续须冷却{settings.PAPER_AUTO_SCALE_IN_COOLDOWN_SEC // 60}分钟并重新确认，"
+                f"同日最多{settings.PAPER_AUTO_SCALE_IN_MAX_DAILY_LAYERS}层；加仓不占新开仓名额"
             ),
             "sell_guard": "持仓止损价/硬止损优先，开盘噪声窗口内暂缓小止损和分时弱化卖点",
         },
@@ -11246,7 +12330,25 @@ async def paper_auto_status(
 
 
 def _strategy_status_override(account_name: str) -> dict:
-    """各路线真实执行参数，不把次账户误展示为A的参数。"""
+    """各路线当前默认规则展示；已有持仓仍以首次建仓冻结参数为准。"""
+    def exit_guard(mode: str) -> str:
+        params = _strategy_sell_params_by_name(account_name)
+        common = (
+            f"当前默认止盈{params['take_profit_pct']}%/硬止损{params['stop_loss_pct']}%；"
+            "持仓优先使用首次建仓冻结退出参数，旧证据缺失/冲突显式标记；"
+        )
+        if mode == "midline":
+            return (
+                common + f"基础期限{params['max_hold_days']}个交易日，未盈利到期退出；"
+                f"盈利仓按冻结宽限（当前默认{params['expiry_grace_days']}日）处理，"
+                "宽限用满退出；T+1/盘口与真实可成交约束保留"
+            )
+        return (
+            common + f"基础期限{params['max_hold_days']}个交易日；"
+            "执行短线弱势退出梯级（VWAP/开盘价/MA5/量价/盘口及板块证据），"
+            "独立证据与开盘噪声窗约束保留；T+1不保证止损价成交"
+        )
+
     if account_name == PAPER_ACCOUNT_CHALLENGER_A:
         params = _strategy_sell_params_by_name(account_name)
         return {
@@ -11255,7 +12357,8 @@ def _strategy_status_override(account_name: str) -> dict:
             "position_pct": settings.PAPER_CHALLENGER_A_POSITION_PCT,
             "position_policy": {**params, "daily_max_buys": settings.PAPER_CHALLENGER_A_MAX_DAILY_BUYS},
             "short_trade_rules": {**params, "hard_stop_loss_pct": params["stop_loss_pct"]},
-            "signal_policy": {"buy_source": "momentum_first_retest", "risk_filter": "本策略报价/路径/盘口数据必须完整；情绪仅作分层记录"},
+            "signal_policy": {"buy_source": "momentum_first_retest", "risk_filter": "本策略报价/路径/盘口数据必须完整；情绪仅作分层记录",
+                              "sell_guard": exit_guard("midline")},
         }
     if account_name in PAPER_CHALLENGER_ACCOUNTS:
         from app.paper.account_policy import account_entry_exit_policy
@@ -11265,7 +12368,7 @@ def _strategy_status_override(account_name: str) -> dict:
             PAPER_ACCOUNT_CHALLENGER_B: "B2弱开二板确认",
             PAPER_ACCOUNT_CHALLENGER_C: "C2近期涨停再启动",
             PAPER_ACCOUNT_CHALLENGER_D: "D2竞价修复",
-            PAPER_ACCOUNT_CHALLENGER_E: "E2高标强势/回封实验",
+            PAPER_ACCOUNT_CHALLENGER_E: "E2高标强势/触板实验",
             PAPER_ACCOUNT_CHALLENGER_F2: "F2高标断板回收",
         }
         route = next((key for key, value in PAPER_CHALLENGER_ACCOUNT_BY_ROUTE.items()
@@ -11273,7 +12376,8 @@ def _strategy_status_override(account_name: str) -> dict:
         signal_policy = {
             "buy_source": route,
             "risk_filter": "独立账户参数；T+1/资格/真实报价/现金仓位/撮合约束保留",
-            "sell_guard": "持仓优先读取首次建仓订单冻结退出参数；旧证据缺失会单独标记",
+            "sell_guard": exit_guard("midline" if account_name in {
+                PAPER_ACCOUNT_CHALLENGER_E, PAPER_ACCOUNT_CHALLENGER_F2} else "short"),
         }
         if account_name == PAPER_ACCOUNT_CHALLENGER_E:
             highboard = _highboard_policy(account_name)
@@ -11281,10 +12385,10 @@ def _strategy_status_override(account_name: str) -> dict:
                 "candidate_filter": (
                     f"昨日{highboard['min_consecutive']}-{highboard['max_consecutive']}板；"
                     f"封单≥{highboard['min_seal_amount']}亿；炸板≤{highboard['max_break_count']}次；"
-                    f"入口涨幅≤{highboard['max_entry_change_pct']}%；VWAP/高点回撤策略过滤保留"
+                    f"入口涨幅≤{highboard['max_entry_change_pct']}%；须收复昨收、非一价/跌停，VWAP/高点回撤策略过滤保留"
                 ),
                 "empty_position_policy": (
-                    "每日扫描昨日高标；曾开板回封可排队，只有后续真实盘口/量能证据才成交；"
+                    "每日扫描昨日高标；触板且盘中曾低于涨停价可排队，不认证回封时序；只有后续真实盘口/量能证据才成交；"
                     f"{highboard['queue_cancel_time']}未成交自动撤单"
                 ),
             })
@@ -11324,14 +12428,11 @@ def _strategy_status_override(account_name: str) -> dict:
                 ),
                 "risk_filter": "单笔硬止损仓位上限生效；回撤开仓闸门 unlimited(观测层放开)",
                 "value_entry_guard": (
-                    f"晋级预测概率≥阈值且盘中确认才入场，不因噪音离场"
+                    f"晋级预测概率≥阈值且盘中确认才入场；退出使用独立参数和弱势证据梯级"
                     f"(独立止盈{settings.PAPER_PROMOTION_TAKE_PROFIT_PCT}%/止损{settings.PAPER_PROMOTION_STOP_LOSS_PCT}%/持仓≤{settings.PAPER_PROMOTION_MAX_HOLD_DAYS}天)"
                 ),
                 "empty_position_policy": "每日滚动扫描晋级二板正式快照；概率不足或未确认时不强迫成交",
-                "sell_guard": (
-                    f"策略B独立参数：止盈{settings.PAPER_PROMOTION_TAKE_PROFIT_PCT}%/硬止损{settings.PAPER_PROMOTION_STOP_LOSS_PCT}%/"
-                    f"时间止损{settings.PAPER_PROMOTION_MAX_HOLD_DAYS}天，无小止损/次日不强就走噪音卖点"
-                ),
+                "sell_guard": exit_guard("short"),
             },
             "short_trade_rules": {
                 "take_profit_pct": settings.PAPER_PROMOTION_TAKE_PROFIT_PCT,
@@ -11376,10 +12477,7 @@ def _strategy_status_override(account_name: str) -> dict:
                     f"(独立止盈{settings.PAPER_MAINLINE_TAKE_PROFIT_PCT}%/止损{settings.PAPER_MAINLINE_STOP_LOSS_PCT}%/持仓≤{settings.PAPER_MAINLINE_MAX_HOLD_DAYS}天)"
                 ),
                 "empty_position_policy": "不回退旧批次；09:35主线榜未形成同板块实时扩散确认时不强迫成交",
-                "sell_guard": (
-                    f"策略C独立参数：止盈{settings.PAPER_MAINLINE_TAKE_PROFIT_PCT}%/硬止损{settings.PAPER_MAINLINE_STOP_LOSS_PCT}%/"
-                    f"时间止损{settings.PAPER_MAINLINE_MAX_HOLD_DAYS}天，无短线噪音卖点"
-                ),
+                "sell_guard": exit_guard("short"),
             },
             "short_trade_rules": {
                 "take_profit_pct": settings.PAPER_MAINLINE_TAKE_PROFIT_PCT,
@@ -11416,9 +12514,13 @@ def _strategy_status_override(account_name: str) -> dict:
                     "非一字板，量比≥0.6，过滤ST/停牌/退市"
                 ),
                 "risk_filter": "单笔硬止损仓位上限生效；回撤开仓闸门 unlimited(观测层放开)",
-                "value_entry_guard": "竞价高开+板块确认强攻，仅消费治理快照已标记可执行且盘中确认的候选(独立止盈5%/止损4%/持仓≤2天)",
+                "value_entry_guard": (
+                    "竞价高开+板块确认强攻，仅消费治理快照已标记可执行且盘中确认的候选"
+                    f"(当前默认止盈{settings.PAPER_AUCTION_TAKE_PROFIT_PCT}%/"
+                    f"止损{settings.PAPER_AUCTION_STOP_LOSS_PCT}%/基础期限{settings.PAPER_AUCTION_MAX_HOLD_DAYS}交易日)"
+                ),
                 "empty_position_policy": "每日滚动扫描竞价高开正式快照；竞价字段不完整或上游未判定可执行时不强迫成交",
-                "sell_guard": "策略D独立参数：止盈5%/硬止损4%/时间止损2天，无短线噪音卖点",
+                "sell_guard": exit_guard("short"),
             },
             "short_trade_rules": {
                 "take_profit_pct": settings.PAPER_AUCTION_TAKE_PROFIT_PCT,
@@ -11461,17 +12563,14 @@ def _strategy_status_override(account_name: str) -> dict:
                 ),
                 "risk_filter": "单笔硬止损仓位上限生效；回撤开仓闸门 unlimited(观测层放开)",
                 "value_entry_guard": (
-                    f"连板高标接力：持有≤{settings.PAPER_HIGHBOARD_MAX_HOLD_DAYS}日"
+                    f"连板高标接力：基础期限{settings.PAPER_HIGHBOARD_MAX_HOLD_DAYS}交易日，盈利到期按冻结宽限处理"
                     f"(独立止盈{settings.PAPER_HIGHBOARD_TAKE_PROFIT_PCT}%/止损{settings.PAPER_HIGHBOARD_STOP_LOSS_PCT}%)"
                 ),
                 "empty_position_policy": (
                     "每日滚动扫描昨日高标的低位可成交入口；不满足本策略涨幅上限则等待，"
-                    "不为凑交易改成追板。强势/回封入口由独立E2账户验证"
+                    "不为凑交易改成追板。强势/触板入口由独立E2账户验证；未认证回封时序"
                 ),
-                "sell_guard": (
-                    f"策略E高标接力卖出：止盈{settings.PAPER_HIGHBOARD_TAKE_PROFIT_PCT}%/硬止损{settings.PAPER_HIGHBOARD_STOP_LOSS_PCT}%/"
-                    f"跌破MA20/到期{settings.PAPER_HIGHBOARD_MAX_HOLD_DAYS}日平仓"
-                ),
+                "sell_guard": exit_guard("midline"),
             },
             "short_trade_rules": {
                 "take_profit_pct": settings.PAPER_HIGHBOARD_TAKE_PROFIT_PCT,
@@ -11511,14 +12610,11 @@ def _strategy_status_override(account_name: str) -> dict:
                 ),
                 "risk_filter": "单笔硬止损仓位上限生效；回撤开仓闸门 unlimited(观测层放开)",
                 "value_entry_guard": (
-                    f"断板反包接力：持有≤{settings.PAPER_REVERSAL_MAX_HOLD_DAYS}日"
+                    f"断板反包接力：基础期限{settings.PAPER_REVERSAL_MAX_HOLD_DAYS}交易日，盈利到期按冻结宽限处理"
                     f"(独立止盈{settings.PAPER_REVERSAL_TAKE_PROFIT_PCT}%/止损{settings.PAPER_REVERSAL_STOP_LOSS_PCT}%)"
                 ),
                 "empty_position_policy": "每日滚动扫描涨停池断板反包形态；连板/深跌/放量不满足时不强迫成交",
-                "sell_guard": (
-                    f"策略F断板反包卖出：止盈{settings.PAPER_REVERSAL_TAKE_PROFIT_PCT}%/硬止损{settings.PAPER_REVERSAL_STOP_LOSS_PCT}%/"
-                    f"到期{settings.PAPER_REVERSAL_MAX_HOLD_DAYS}日平仓"
-                ),
+                "sell_guard": exit_guard("midline"),
             },
             "short_trade_rules": {
                 "take_profit_pct": settings.PAPER_REVERSAL_TAKE_PROFIT_PCT,
@@ -11551,20 +12647,55 @@ async def paper_auto_logs(
     limit: int = Query(100, ge=1, le=500),
     today_only: bool = Query(False, description="仅返回今日自动执行日志"),
     account_name: str = Query(PAPER_ACCOUNT_DEFAULT, description="账户名: default=策略A / promotion=策略B"),
+    code: str | None = Query(None, pattern=r"^[0-9]{6}$"),
+    run_id: str | None = Query(None, max_length=128),
+    log_ids: str | None = Query(None, max_length=10500, description="逗号分隔的原日志ID，最多500个；仍严格按账户隔离"),
+    before_id: int | None = Query(None, ge=1, le=9223372036854775807),
+    before_created_at: datetime | None = Query(None, description="可选游标时钟断言，必须匹配before_id所属记录"),
     db: AsyncSession = Depends(get_db),
 ):
-    """自动模拟交易执行日志"""
+    """原日志接口的有界键集翻页/旧引用解引用；logs字段及默认排序保持兼容。"""
+    ids = None
+    if log_ids is not None:
+        parts = log_ids.split(",")
+        if (not 1 <= len(parts) <= 500 or any(not re.fullmatch(r"[0-9]{1,19}", p) for p in parts)):
+            raise HTTPException(400, "日志ID必须为最多500个正整数")
+        ids = {int(part) for part in parts}
+        if any(not 0 < item <= 9223372036854775807 for item in ids):
+            raise HTTPException(400, "日志ID越界")
+    if before_created_at is not None and (before_id is None or before_created_at.tzinfo is not None):
+        raise HTTPException(400, "游标须为本地无时区时间并提供原日志ID")
     account = await _get_or_create_account(db, account_name)
-    stmt = select(PaperAutoTradeLog)
-    stmt = stmt.where(_auto_log_account_scope_filter(account_name, account.id),
-                      PaperAutoTradeLog.action.notin_(("buy_signal", "signal_push")))
+    stmt = select(PaperAutoTradeLog).where(
+        # Exact lookup must never borrow default-account legacy NULL rows.
+        PaperAutoTradeLog.account_id == account.id if ids is not None
+        else _auto_log_account_scope_filter(account_name, account.id),
+        PaperAutoTradeLog.action.notin_(("buy_signal", "signal_push")))
     if today_only:
         stmt = stmt.where(PaperAutoTradeLog.trade_date == date.today())
-    result = await db.execute(
-        stmt.order_by(desc(PaperAutoTradeLog.created_at), desc(PaperAutoTradeLog.id))
-        .limit(limit)
-    )
-    return {"logs": [_auto_log_payload(item) for item in result.scalars().all()]}
+    if code is not None:
+        stmt = stmt.where(PaperAutoTradeLog.code == code)
+    if run_id is not None:
+        stmt = stmt.where(PaperAutoTradeLog.run_id == run_id)
+    if ids is not None:
+        stmt = stmt.where(PaperAutoTradeLog.id.in_(ids))
+    if before_id is not None:
+        anchor = (await db.execute(stmt.where(PaperAutoTradeLog.id == before_id))).scalar_one_or_none()
+        if anchor is None or (before_created_at is not None and anchor.created_at != before_created_at):
+            raise HTTPException(400, "游标不属于当前账户和筛选范围或时钟不匹配")
+        if anchor.created_at is None:
+            stmt = stmt.where(PaperAutoTradeLog.created_at.is_(None), PaperAutoTradeLog.id < anchor.id)
+        else:
+            stmt = stmt.where(or_(
+                PaperAutoTradeLog.created_at < anchor.created_at,
+                and_(PaperAutoTradeLog.created_at == anchor.created_at, PaperAutoTradeLog.id < anchor.id),
+                PaperAutoTradeLog.created_at.is_(None)))
+    result = await db.execute(stmt.order_by(desc(PaperAutoTradeLog.created_at), desc(PaperAutoTradeLog.id)).limit(limit + 1))
+    rows = list(result.scalars().all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return {"logs": [_auto_log_payload(item) for item in rows], "has_more": has_more,
+            "next_cursor": {"before_id": rows[-1].id} if has_more else None}
 
 
 @router.get("/auto/evaluation")
@@ -11942,6 +13073,7 @@ async def paper_auto_run(
                 detail="没有仍新鲜且明细完整的QuoteRound，自动委托失败关闭",
             )
         token = _QUOTE_ROUND_CONTEXT.set(payload)
+    canceled = False
     try:
         return await run_paper_auto_trade(
             db,
@@ -11951,9 +13083,25 @@ async def paper_auto_run(
             execution_mode=req.execution_mode,
             account_name=account_name,
         )
+    except asyncio.CancelledError:
+        canceled = True
+        raise
     finally:
         if token is not None:
             _QUOTE_ROUND_CONTEXT.reset(token)
+        from app.push.paper_buy_points import _FAILED_INGRESS, retry_failed_buy_points
+        task = asyncio.current_task()
+        if not canceled and not (task is not None and task.cancelling()) and db.info.get(_FAILED_INGRESS):
+            try:
+                # Optional cleanup must not replace an original business error.
+                # A new cancellation is BaseException and is never swallowed.
+                await db.close()
+                await asyncio.wait_for(
+                    retry_failed_buy_points(db),
+                    timeout=max(0.1, float(settings.PAPER_BUY_POINT_PUSH_INTERVAL_SEC)),
+                )
+            except Exception as exc:
+                logger.warning("Manual auto-run notification recovery unavailable (%s)", type(exc).__name__)
 
 
 @router.get("/shadow/momentum-retest")

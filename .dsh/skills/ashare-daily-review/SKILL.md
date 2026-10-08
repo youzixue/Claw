@@ -19,6 +19,14 @@ description: "Use for A-share premarket, intraday, or postmarket review; next-se
 6. 把结论标记为：`事实`、`统计关联`、`待验证假设`、`模型决策`。自动归因只说明错误落在召回、排序、校准或交易门禁的哪个位置，不宣称市场因果。
 7. 给出下一交易日预案时，列出触发条件、失效条件、数据时点和观察池；不得承诺收益或把概率写成确定事件。
 
+## 双阶段自动化模式
+
+收到 `<CLAW_AUTOMATION_V1:postmarket>` 或 `<CLAW_AUTOMATION_V1:premarket>` 时，先读取
+`references/automation-contract.md`，检查 `claw_review_guard_status.active`；门禁未激活则停止，不能改用 shell。
+盘前引用上一有效交易日冻结复盘与 DSH 报告，再读 `ashare_premarket_context`；
+新闻按原文、采集、内容可用及分析可用钟约束，覆盖跨周末/长假窗口。外盘最新缓存不是历史 PIT。
+所有定时优化结论仅写待审事项，不自动编辑代码、训练、改参、部署或推送。
+
 ## 预测优化规则
 
 - 保持 Champion 冻结。单日复盘只追加样本和假设，不直接修改权重、阈值或特征。
@@ -39,6 +47,8 @@ description: "Use for A-share premarket, intraday, or postmarket review; next-se
 4. **预测漏斗**：候选池召回、主榜召回与精度、概率校准、可执行门禁。
 5. **误差归因**：命中、召回漏失、排序漏失、门禁拦截、主榜误报；说明因果边界。
 6. **下一步**：继续观察、离线实验或影子验证；不得直接日更生产参数。
+
+复盘十二个独立模拟账户时配合 `claw-paper-review`；设计对照实验使用 `claw-strategy-experiment`；功能修改使用 `claw-safe-feature-iteration`。Skill 不授予写库、调参或部署权限。
 
 ## 参考资料
 

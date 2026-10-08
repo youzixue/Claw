@@ -8,7 +8,7 @@ import numpy as np
 
 from app.promotion.modeling.features import FeatureRow, FeatureVectorizer
 from app.promotion.modeling.logistic import LogisticBinaryClassifier, PlattCalibrator
-from app.promotion.modeling.metrics import classification_metrics
+from app.promotion.modeling.metrics import classification_metrics, partial_classification_metrics
 
 
 @dataclass(slots=True)
@@ -47,9 +47,11 @@ def regime_sliced_metrics(
     baseline: np.ndarray,
     trade_dates: list[str],
     regimes: list[str],
+    *, allow_unknown_labels: bool = False,
 ) -> dict[str, dict]:
     """Report stability by market style instead of hiding aggregate regressions."""
 
+    metrics = partial_classification_metrics if allow_unknown_labels else classification_metrics
     result: dict[str, dict] = {}
     regime_array = np.asarray(regimes, dtype=object)
     for regime in sorted(set(regimes)):
@@ -57,12 +59,12 @@ def regime_sliced_metrics(
         result[regime] = {
             "sample_count": int(len(indexes)),
             "trade_day_count": len({trade_dates[index] for index in indexes}),
-            "challenger_metrics": classification_metrics(
+            "challenger_metrics": metrics(
                 labels[indexes],
                 challenger[indexes],
                 [trade_dates[index] for index in indexes],
             ),
-            "champion_metrics": classification_metrics(
+            "champion_metrics": metrics(
                 labels[indexes],
                 baseline[indexes],
                 [trade_dates[index] for index in indexes],
@@ -71,19 +73,44 @@ def regime_sliced_metrics(
     return result
 
 
+def training_window_rows(
+    rows: list[FeatureRow], *, train_window_days: int | None, calibration_days: int,
+) -> list[FeatureRow]:
+    """Bound fit + calibration by trading sessions, never by stock row counts.
+
+    None preserves the existing expanding-window policy. This option changes
+    offline training only; it does not activate or replace a production model.
+    """
+    if train_window_days is None:
+        return rows
+    minimum = max(int(calibration_days) + 5, 10)
+    if (type(train_window_days) is not int or train_window_days < minimum):
+        raise ValueError(f"train_window_days must be an integer >= {minimum}")
+    selected_dates = set(_date_groups(rows)[-train_window_days:])
+    return [row for row in rows if row.trade_date in selected_dates]
+
+
 def fit_temporally_calibrated_model(
     rows: list[FeatureRow],
     *,
     calibration_days: int = 5,
     allow_unmaterialized_pretraining: bool = False,
+    train_window_days: int | None = None,
+    allow_unknown_labels: bool = False,
 ) -> FittedPromotionModel:
+    rows = training_window_rows(rows, train_window_days=train_window_days,
+                                calibration_days=calibration_days)
+    if any(row.label not in (0, 1, None) for row in rows):
+        raise ValueError("invalid outcome label")
+    if not allow_unknown_labels and any(row.label is None for row in rows):
+        raise ValueError("unknown labels require explicit historical research")
     dates = _date_groups(rows)
     if len(dates) < max(calibration_days + 5, 10):
         raise ValueError("insufficient trade days for temporal fit/calibration split")
     calibration_days = min(max(int(calibration_days), 3), max(len(dates) // 3, 3))
     calibration_dates = set(dates[-calibration_days:])
-    fit_rows = [row for row in rows if row.trade_date not in calibration_dates]
-    calibration_rows = [row for row in rows if row.trade_date in calibration_dates]
+    fit_rows = [row for row in rows if row.trade_date not in calibration_dates and row.label is not None]
+    calibration_rows = [row for row in rows if row.trade_date in calibration_dates and row.label is not None]
     fit_labels = np.asarray([row.label for row in fit_rows], dtype=float)
     calibration_labels = np.asarray([row.label for row in calibration_rows], dtype=float)
     if len(np.unique(fit_labels)) < 2:
@@ -100,10 +127,10 @@ def fit_temporally_calibrated_model(
         vectorizer=vectorizer,
         classifier=classifier,
         calibrator=calibrator,
-        fit_start_date=fit_rows[0].trade_date,
-        fit_end_date=fit_rows[-1].trade_date,
-        calibration_start_date=calibration_rows[0].trade_date,
-        calibration_end_date=calibration_rows[-1].trade_date,
+        fit_start_date=min(row.trade_date for row in fit_rows),
+        fit_end_date=max(row.trade_date for row in fit_rows),
+        calibration_start_date=min(row.trade_date for row in calibration_rows),
+        calibration_end_date=max(row.trade_date for row in calibration_rows),
     )
 
 
@@ -115,7 +142,17 @@ def walk_forward_evaluate(
     step_days: int = 5,
     calibration_days: int = 5,
     allow_unmaterialized_pretraining: bool = False,
+    train_window_days: int | None = None,
+    allow_unknown_labels: bool = False,
 ) -> dict:
+    metrics = partial_classification_metrics if allow_unknown_labels else classification_metrics
+    if any(row.label not in (0, 1, None) for row in rows):
+        raise ValueError("invalid outcome label")
+    if not allow_unknown_labels and any(row.label is None for row in rows):
+        raise ValueError("unknown labels require explicit historical research")
+    # Validate before folds: invalid research settings must not become skipped days.
+    training_window_rows(rows, train_window_days=train_window_days,
+                         calibration_days=calibration_days)
     dates = _date_groups(rows)
     initial_train_days = max(int(initial_train_days), calibration_days + 8)
     validation_days = max(int(validation_days), 1)
@@ -140,7 +177,8 @@ def walk_forward_evaluate(
     train_end_index = initial_train_days
     while train_end_index < len(dates):
         validation_end_index = min(train_end_index + validation_days, len(dates))
-        train_dates = set(dates[:train_end_index])
+        train_start_index = max(0, train_end_index - train_window_days) if train_window_days is not None else 0
+        train_dates = set(dates[train_start_index:train_end_index])
         validation_date_values = set(dates[train_end_index:validation_end_index])
         train_rows = [row for row in rows if row.trade_date in train_dates]
         validation_rows = [row for row in rows if row.trade_date in validation_date_values]
@@ -150,13 +188,14 @@ def walk_forward_evaluate(
             model = fit_temporally_calibrated_model(
                 train_rows, calibration_days=calibration_days,
                 allow_unmaterialized_pretraining=allow_unmaterialized_pretraining,
+                allow_unknown_labels=allow_unknown_labels,
             )
         except ValueError as exc:
             folds.append(
                 {
                     "status": "skipped",
                     "reason": str(exc),
-                    "train_start_date": dates[0],
+                    "train_start_date": dates[train_start_index],
                     "train_end_date": dates[train_end_index - 1],
                     "validation_start_date": dates[train_end_index],
                     "validation_end_date": dates[validation_end_index - 1],
@@ -167,7 +206,7 @@ def walk_forward_evaluate(
         fold_predictions = model.predict(validation_rows)
         fold_labels = np.asarray([row.label for row in validation_rows], dtype=float)
         fold_dates = [row.trade_date for row in validation_rows]
-        fold_metrics = classification_metrics(fold_labels, fold_predictions, fold_dates)
+        fold_metrics = metrics(fold_labels, fold_predictions, fold_dates)
         predictions.extend(fold_predictions.tolist())
         baseline_probabilities.extend(row.baseline_probability for row in validation_rows)
         labels.extend(row.label for row in validation_rows)
@@ -176,13 +215,15 @@ def walk_forward_evaluate(
         folds.append(
             {
                 "status": "completed",
-                "train_start_date": dates[0],
+                "train_start_date": dates[train_start_index],
                 "train_end_date": dates[train_end_index - 1],
                 "validation_start_date": dates[train_end_index],
                 "validation_end_date": dates[validation_end_index - 1],
                 "train_sample_count": len(train_rows),
                 "validation_sample_count": len(validation_rows),
-                "validation_positive_count": int(np.sum(fold_labels)),
+                "validation_positive_count": int(np.nansum(fold_labels)),
+                **({"train_known_count": sum(r.label is not None for r in train_rows),
+                    "validation_unknown_count": int(np.sum(np.isnan(fold_labels)))} if allow_unknown_labels else {}),
                 "metrics": fold_metrics,
                 "fit_contract": {
                     "fit_end_date": model.fit_end_date,
@@ -201,20 +242,24 @@ def walk_forward_evaluate(
     challenger_array = np.asarray(predictions, dtype=float)
     baseline_array = np.asarray(baseline_probabilities, dtype=float)
     return {
+        **({"research_only": True, "unknown_labels_allowed": True} if allow_unknown_labels else {}),
+        "train_window_days": train_window_days,
+        "training_window_policy": "rolling" if train_window_days is not None else "expanding",
         "folds": folds,
         "completed_fold_count": sum(fold["status"] == "completed" for fold in folds),
         "skipped_fold_count": sum(fold["status"] == "skipped" for fold in folds),
         "validation_trade_day_count": len(set(trade_dates)),
-        "challenger_metrics": classification_metrics(
+        "challenger_metrics": metrics(
             label_array, challenger_array, trade_dates
         ),
-        "champion_metrics": classification_metrics(label_array, baseline_array, trade_dates),
+        "champion_metrics": metrics(label_array, baseline_array, trade_dates),
         "regime_metrics": regime_sliced_metrics(
             label_array,
             challenger_array,
             baseline_array,
             trade_dates,
             regimes,
+            allow_unknown_labels=allow_unknown_labels,
         ),
         "predictions": challenger_array,
         "baseline_probabilities": baseline_array,

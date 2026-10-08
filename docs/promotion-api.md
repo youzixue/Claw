@@ -1,5 +1,48 @@
 # 晋级预测接口说明
 
+## 2026-09-29 缺数根因与历史研究读视图
+
+- 2026休市日期由已核验交易所安排与周末规则补存，审计时间为实际修复时间；普通未记录工作日仍未知，不回写历史预测或结局。
+- 新批次完整记录原预测资格全集，补记录行强制不可执行/仅观察；未来全池统计及学习材料可能增加，模型参数与风险门不变。旧阻断研究榜不重建。
+- 既有 `/model-lab/runs` 支持 `compact=true`（可选trade_date/context/limit），仅返回批次摘要；`/runs/{run_id}` 支持 `direction_only=true`，显式读取所选原始研究证明并核验完整性。两模式只读、不初始化存储、不自动回退，也不认证训练资格；默认模式保持兼容。
+- 复盘改为先按原批次选择器筛选身份、再分块读取选中记录；保留legacy规则、同批一致性与原未知/分母口径。详见 [根因与验证记录](promotion-evidence-root-repair-20260929.md)。
+
+## 2026-09-29 复盘与研究字段边界
+
+- `/learning-review` 近交易日窗口保留缺预测日；已知尚未成熟的 T+1 不进入已完成复盘。缺正式榜、空分母或不完整结局的成绩保持 `null`，真实零命中不变；混合窗口不把未知日计为零命中。
+- 有收盘轮次健康证明且成员数一致的新源，可直接使用当日核验板数；不依赖缺失的前日旧池。新源残缺、孤立行或数量不一致仍阻断；旧源仍要求前后池。核验零涨停与未采集分开。
+- `outcome_universe_scope=current_risk_filtered_main_board` 描述主板涨停事件的当前风控读视图，非历史时点可交易资格。方向结果按既有正式名单与有效K线评价；不将当前标签当历史PIT证据。
+- `direction_research` 增加可选 `missing_recordable_count`，缺字段为未知不是0；不支持的证明版本/标签/范围为 unavailable，排名/概率/分母冲突为 blocked，不重建旧研究榜。
+- 排查、真实缺口、边界测试与发布记录见 [复盘研究边界报告](promotion-review-boundaries-20260929.md)。
+
+## 2026-09-29 停复牌核验与子Tab
+
+- 原股票状态任务新增精确当日逐股交易状态核验；只有身份一致、来源完整、无并发变化且可证明为旧自动停牌的限制才解除。人工/ST/退市等独立风险不清除；普通行情采集本身仍没有解除权限。审计与当前投影同事务，不回写历史。
+- 页面拆为市场梯队、晋级候选、预测复盘、研究观察四个子Tab，首次切换按需请求原接口，资源复用、防重入、失败独立重试；未请求不等于数据为空。
+- API字段/概率口径不变；历史缺失或不可评价保留未知。验收及上线记录见 [本轮修复报告](promotion-status-tabs-repair-20260929.md)。
+
+## 2026-09-29 高标漏采追加修复（发布证据见页面修复报告）
+
+- 腾讯观测范围不再由旧停牌/禁止交易标签裁剪：同一原行情轮次查询带风险标签的沪深股票，保留真实源时钟、完整性门与原北交所/退市名称排除。不清除 StockTag、StockBlacklist，不改变交易资格；收盘/K线研究范围默认过滤不变。
+- `/ladder`、`/board-height` 的市场展示与晋级候选权限分离，`scope=non_st_market_with_risk_annotations`：排除ST及退市名称；有效涨停仍纳入高度，保留停牌/退市风险/人工禁买标记和 `is_tradeable=false`。旧停牌标签与当前有效行情冲突时显示“停牌标签待核验 · 禁止交易”，不是自动认证已解除风控。
+- 封板率分子分母、前日续板对照使用相同展示范围；正式候选仍使用原严格信号过滤。旧未知状态不填1、不改写历史预测。上轮“过滤统计池”曾漏掉600825六板等恢复交易股，仅页面与接口对齐不能证明源头完整，必须对照独立的当日问财成员和腾讯实际状态。
+
+## 2026-09-29 页面读视图修复（源码，自测后需受控加载后端）
+
+- `/ladder` 与 `/board-height` 共用交易日及来源质量闸门；新增 `status=ok|source_incomplete|missing`，不完整梯队不作为完整市场显示。新源有明确零涨停轮次时，展示该日的真实零，不回退旧梯队。
+- 梯队 `stocks` 返回全部成员，数量与 `count` 一致；`seal_rate_method=zero_break_share` 明确旧字段 `seal_rate` 是该梯队**零开板占比**，不是封板成功率。
+- 市场指标新源 `seal_rate_method=verified_pool_state`：封板率=当前涨停数/(当前涨停数+当前炸板数)。分子分母使用同日真实源时钟与同一ST/停牌/退市过滤，保留创业板等观察标识；炸板池缺失、过期、数量与轮次不一致时，分母及封板率为 `null`。
+- 历史 `historical_pool` 保留原零开板占比兼容，前端必须分别标注。无可靠分母的旧实时数据不再宣称100%封板。
+- `previous_trade_date` 使用日历中的紧邻交易日，不再以“数据库上一个有涨停记录的日期”代替。缺该日池时 `promotion_rate`/`promoted_count` 为 `null`，`promotion_rate_status=previous_pool_missing_or_incomplete`；已证实前池为零时比率仍为 `null`，状态为 `previous_pool_empty`。
+- 新源已有问财板数时不再查询无关的旧池历史来归一化。以上只修页面读取/统计，不回写旧数据、不生成预测、不调Champion、订单或风控阈值。
+
+## 2026-09-28 数据源迁移（源码，待受控后端发布）
+
+- 涨跌停状态复用腾讯行情轮次；问财SSE按确切交易日低频补充板数、开板次数、首次时间、封单额和原因，本链路不再回退东财。
+- `GET /promotion/board-height` 新增 `source_health`。新源覆盖/终场/字段未齐时，`height`、`limit_up_count`、`seal_rate`、`promotion_rate` 等为 `null`，不是市场为零；页面显示 `--` 和源缺口提示。
+- 不完整的新源行不进入晋级排名；板数未知的待结算预测保持 `pending`，不补成首板或失败标签。旧冻结预测和Champion不重写。
+- 需要037来源证据迁移；其他模块仍有东财入口，不能声称全系统已下线。详见 [迁移与发布边界](promotion-tencent-wencai-migration-20260928.md)。
+
 ## 目标
 
 `/api/v1/promotion` 现在按分赛道口径返回数据：
@@ -103,10 +146,19 @@ python3 scripts/train_promotion_challenger.py \
 - 数据复用 `ledger_dataset` 原有整批完整性、记录交易日历真实 T+1、历史身份、封存两日收盘及其他质量门。先校验完整冻结候选池，再仅以冻结的 `prediction_rank_eligible` 资格选择方向训练样本，不能用当前资格重筛历史或先删坏样本绕过整批门。只有新冻结的嵌套 `probability_factors.direction_research` 证据可用；旧记录没有该证据仍为 unknown，不按当前概率或后来结局回填。
 - 标签 `next_day_close_up_v1` 使用封存的 T+1 收盘相对前收盘是否上涨，不用涨停标签或盘中最高涨幅。参考基线是冻结方向概率，报告名为 `direction_reference_metrics`，不是用涨停模型错标签充当方向 Champion。
 - 独立 logit + Platt 校准通过逐交易日 walk-forward 评估，训练、校准与时间外验证窗口隔离且验证窗口不得重叠。原 AP（average precision）、Brier、ECE 与市场风格等离线质量门仍须通过，不能只看 Top12。
+- 可选 `--train-window-days 60` 按最近60个交易日训练（包含校准尾窗），不传则保持原扩展训练；仅控制研究实验，不改生产Champion。最终研究产物采用与验证相同的窗口；不足窗口、失败fold及材料缺口不会被当成有效命中。2026-09-28历史预训练对照中滚动60日未优于扩展训练，未部署；见 [算法对照报告](promotion-accuracy-research-20260928.md)。
 - 目标要求同时满足：Top12 上涨精度 ≥80%；以整交易日为重采样单位的 500 次 bootstrap（固定 seed=0），单侧95%下界（5%分位，`top12_precision_lower_95`）≥80%；至少30个独立 OOS 交易日；每个评价日固定完整12只名单；没有被排除的批次；原离线质量门全部通过。不按个股独立抽样，不删坏批次、缩名单或挑日凑80%。不得跳过应有的验证交易日或失败 fold 来抬高胜率；缺失评价与失败窗口必须保留诊断并阻止宣称研究达标。
 - `status=insufficient_evidence`、`target_met=null`：材料、有效窗口、完整名单、独立日数或整批覆盖不足；如实保留 `reason` / `diagnostics` / 被排除批次、覆盖及完整性信息，不写成0%或“未上涨”。
 - `status=target_not_met`、`target_met=false`：证据条件具备，但精度、bootstrap下界或质量门没有全部达标；如实展示失败指标，不宣称达标。
 - `status=research_target_met`、`target_met=true`：仅这个离线研究窗口通过上述目标，仍非前向认证、收益承诺、可成交证明或部署批准。所有结果均保持 `manual_review_eligible=false`、`persisted=false`、`production_unchanged=true`；不能由该状态绕过原治理/执行协议。
+
+### 历史召回与独立上涨预训练（9/29研究修复，非API上线）
+
+- 历史面板版本升级 `historical_panel_v3_*`：候选选择只依据T及更早资料；缺失/未认证/价链不连续的T+1结局保留为未知，不释放候选名额。两个研究目标 `promotion` 与 `next_day_close_up` 可使用相同候选特征，但不是已冻结的生产方向证据。
+- 显式历史研究的 `allow_unknown_labels` 仅在训练/校准中使用已知标签，验证必须保留原候选及TopK；AP/Brier/ECE在 `observed_metrics` 中只表示已知子集，TopK同时给出原名单上下界。未知、失败fold及计划验证日缺口不能隐去。
+- 含上述研究标志的结果在验收层强制拒绝。正式方向CLI仍仅接收 `prediction_snapshots`，禁止持久化；不能把历史预训练接成80%认证、影子资格或生产替换。
+- 新实验未证明可上线：固定450预算的四路轮流补位提高已知召回但降低Top12已知命中；独立上涨头有排序线索，但Brier、缺失结局和窗口完整性仍不合格。详见 [首板漏选与独立上涨研究](promotion-recall-direction-20260929.md)。本轮不改API响应或生产Champion。
+- 原 `scripts/analyze_recall_gap.py` 现在读取完整不可变候选池，分开归因池外漏选、池内未进榜、冻结排名资格过滤、主榜命中及快照/排名证据未知；默认 `promotion_2000`，可指定 `promotion_1510`，不跨context混榜。最新失败批次不回退，缺失整条赛道也不冒充明确空池。必须给出 `--as-of`，其含义是校验截止而非历史首次可知认证；输出JSON与Markdown为 `certified=false` 的只读观察，不计算认证召回率。
 
 ### 正式批次只读诊断与逐路线质量合同（9/14修复源码）
 

@@ -4,12 +4,62 @@ Legacy rows remain unknown. This contract does not assert that any currently
 configured public adapter supplies indicative matched price/quantity.
 """
 from datetime import datetime, time
+import hashlib
+import json
 import math
 
 from numpy import bool_
 
 from app.config.settings import settings
 from app.data.fund_flow_clock import local_clock
+
+
+def auction_source_frame_key(row) -> str:
+    """Storage identity, not authorization; re-fetching a quote is not a new frame.
+
+    Missing provider clocks remain missing. Only in that unknown case does the
+    actual observation identify storage; it never becomes source_quote_at.
+    """
+    source = str(getattr(row, "source", None) or "")
+    version = str(getattr(row, "source_version", None) or "")
+    source_clock = local_clock(getattr(row, "source_quote_at", None))
+    observed = local_clock(getattr(row, "observed_at", None))
+    has_source_identity = source_clock is not None and bool(source and version)
+    clock = source_clock if has_source_identity else observed
+    parts = [
+        "auction_source_frame_v1", str(row.code), str(row.trade_date),
+        source, version, "source" if has_source_identity else "observation_unknown_source",
+        clock.isoformat() if clock is not None else "",
+    ]
+    return hashlib.sha256(json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def auction_latest_order():
+    """Deterministic latest row; never fall back to older higher-quality evidence."""
+    from app.models.stock import AuctionData
+    return (
+        AuctionData.auction_time.desc(),
+        AuctionData.observed_at.desc().nulls_last(),
+        AuctionData.received_at.desc().nulls_last(),
+        AuctionData.source_quote_at.desc().nulls_last(),
+        AuctionData.id.desc(),
+    )
+
+
+def latest_auction_ids(trade_date, *, end_time="09:25:30", conditions=()):
+    """Latest-per-code SQL identity shared by health, ranking and factor readers."""
+    from sqlalchemy import func, select
+    from app.models.stock import AuctionData
+    ranked = select(
+        AuctionData.id.label("id"),
+        func.row_number().over(partition_by=AuctionData.code,
+                               order_by=auction_latest_order()).label("position"),
+    ).where(
+        AuctionData.trade_date == trade_date,
+        AuctionData.auction_time.between("09:15:00", end_time),
+        *conditions,
+    ).subquery()
+    return select(ranked.c.id).where(ranked.c.position == 1)
 
 
 def auction_context_complete(context) -> bool:
@@ -109,3 +159,47 @@ def auction_evidence_status(row, *, decision_at=None, require_ratio=True) -> str
     if volume_in_shares(getattr(row, "auction_volume", None), volume_unit) is None:
         return "incomplete_values"
     return "ok"
+
+
+# Diagnostics only: never substitute missing fields or alter the gate above.
+_DIAGNOSTIC_FIELDS = ("auction_price", "prev_close", "auction_volume", "auction_amount", "volume_ratio")
+_DIAGNOSTIC_STATUSES = ("incomplete_values", "invalid_clock", "unverified_basis", "unknown_unit")
+
+
+def diagnose_missing_evidence_fields(row, *, decision_at=None) -> dict:
+    """Name missing inputs, without logging raw vendor payloads or numeric values."""
+    status = auction_evidence_status(row, decision_at=decision_at)
+    code = str(getattr(row, "code", "") or "")
+    safe_code = len(code) == 6 and code.isascii() and code.isdigit()
+    return {
+        "status": status,
+        "missing_positive_fields": {
+            key: 1 for key in _DIAGNOSTIC_FIELDS
+            if row is not None and not positive_number(getattr(row, key, None))
+        },
+        "missing_volume_unit": row is not None and (
+            getattr(row, "volume_unit", None) not in ("share", "lot100")
+            or getattr(row, "amount_unit", None) != "CNY"
+        ),
+        **{f"sample_codes_for_{key}": [code] if safe_code and status == key else []
+           for key in _DIAGNOSTIC_STATUSES},
+        "sample_size_cap": 5,
+    }
+
+
+def merge_diagnoses(diagnoses: list[dict]) -> dict:
+    """Bounded samples and aggregate counts, not a second evidence contract."""
+    merged = {"missing_positive_fields": {}, "missing_volume_unit_rows": 0,
+              "sample_size_cap": 5,
+              **{f"sample_codes_for_{key}": [] for key in _DIAGNOSTIC_STATUSES}}
+    for item in diagnoses:
+        for field, count in item["missing_positive_fields"].items():
+            counts = merged["missing_positive_fields"]
+            counts[field] = counts.get(field, 0) + count
+        merged["missing_volume_unit_rows"] += int(item["missing_volume_unit"])
+        for status in _DIAGNOSTIC_STATUSES:
+            key = f"sample_codes_for_{status}"
+            for code in item[key]:
+                if len(merged[key]) < 5 and code not in merged[key]:
+                    merged[key].append(code)
+    return merged

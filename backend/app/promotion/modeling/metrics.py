@@ -98,6 +98,7 @@ def daily_top_k_metrics(
     trade_dates: list[str],
     *,
     k: int,
+    allow_unknown: bool = False,
 ) -> dict:
     groups: dict[str, list[int]] = defaultdict(list)
     for index, trade_date in enumerate(trade_dates):
@@ -105,13 +106,19 @@ def daily_top_k_metrics(
     selected_count = 0
     hit_count = 0
     positive_count = 0
+    selected_unknown_count = 0
+    unknown_count = int(np.sum(~np.isfinite(labels)))
+    if unknown_count and not allow_unknown:
+        raise ValueError("unknown labels require explicit partial research metrics")
     daily: list[dict] = []
     for trade_date in sorted(groups):
         indexes = np.asarray(groups[trade_date], dtype=int)
         order = indexes[np.argsort(-probabilities[indexes], kind="stable")]
         selected = order[: min(k, len(order))]
-        hits = int(np.sum(labels[selected]))
-        positives = int(np.sum(labels[indexes]))
+        hits = int(np.sum(labels[selected] == 1))
+        positives = int(np.sum(labels[indexes] == 1))
+        selected_unknown = int(np.sum(~np.isfinite(labels[selected])))
+        selected_unknown_count += selected_unknown
         selected_count += len(selected)
         hit_count += hits
         positive_count += positives
@@ -122,6 +129,8 @@ def daily_top_k_metrics(
                 "selected_count": len(selected),
                 "hit_count": hits,
                 "positive_count": positives,
+                **({"unknown_count": int(np.sum(~np.isfinite(labels[indexes]))),
+                    "selected_unknown_count": selected_unknown} if allow_unknown else {}),
             }
         )
     precision = hit_count / selected_count if selected_count else 0.0
@@ -133,10 +142,39 @@ def daily_top_k_metrics(
         "selected_count": selected_count,
         "hit_count": hit_count,
         "positive_count": positive_count,
-        "precision": round(precision, 6),
-        "recall": round(recall, 6),
-        "lift": round(precision / base_rate, 6) if base_rate else 0.0,
+        "precision": round(precision, 6) if not selected_unknown_count and (selected_count or not allow_unknown) else None,
+        "recall": round(recall, 6) if not unknown_count and (positive_count or not allow_unknown) else None,
+        "lift": (round(precision / base_rate, 6) if base_rate else 0.0) if not unknown_count else None,
+        **({"unknown_count": unknown_count, "selected_unknown_count": selected_unknown_count,
+            "precision_lower": round(precision, 6) if selected_count else None,
+            "precision_upper": round((hit_count + selected_unknown_count) / selected_count, 6) if selected_count else None,
+            "observed_precision": round(hit_count / (selected_count - selected_unknown_count), 6)
+                if selected_count > selected_unknown_count else None} if allow_unknown else {}),
         "daily": daily,
+    }
+
+
+def partial_classification_metrics(labels, probabilities, trade_dates, *, top_ks=(5, 12, 30)):
+    """Rank the original list FIRST; unknown outcomes never free a Top-K slot.
+
+    Calibration/AP describe the observed subset only, not a complete cohort.
+    This payload is intentionally separate from deployable acceptance metrics.
+    """
+    y = np.asarray(labels, dtype=float)
+    p = np.asarray(probabilities, dtype=float)
+    known = np.isfinite(y)
+    if (y.ndim != 1 or p.ndim != 1 or len(y) != len(p) or len(y) != len(trade_dates)
+            or not np.all(np.isfinite(p)) or np.any((p < 0) | (p > 1))):
+        raise ValueError("invalid partial research arrays")
+    if np.any(~np.isnan(y) & ~known) or np.any(known & ~np.isin(y, (0, 1))):
+        raise ValueError("outcomes must be binary or unknown")
+    return {
+        "research_only": True, "sample_count": len(y),
+        "evaluable_count": int(np.sum(known)), "unknown_count": int(np.sum(~known)),
+        "observed_metrics": classification_metrics(
+            y[known], p[known], [d for d, keep in zip(trade_dates, known) if keep], top_ks=()),
+        "daily_rank": {str(k): daily_top_k_metrics(y, p, trade_dates, k=k, allow_unknown=True)
+                       for k in top_ks},
     }
 
 
