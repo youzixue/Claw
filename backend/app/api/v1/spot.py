@@ -1,7 +1,7 @@
 """实时行情 + 日K线 API（含技术指标计算 + V2.2量比/换手分类）"""
 
 from datetime import date, datetime
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from loguru import logger
 from sqlalchemy import select, desc, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -407,13 +407,37 @@ async def kline_list(
     code: str,
     limit: int = Query(800, description="返回条数(最大2000)"),
     db: AsyncSession = Depends(get_db),
+    view: str = Query("projection", pattern="^(projection|downloaded)$"),
 ):
     """个股日K线(前复权) + 全量技术指标
 
     返回: OHLCV + MA(5/10/20/60) + BOLL(上/中/下) + MACD(DIF/DEA/柱)
           + RSI(6/14) + KDJ(K/D/J) + VOL_MA(5/10)
     """
-    limit = min(limit, 2000)
+    limit = max(1, min(limit, 2000))
+    if view == "downloaded":
+        import asyncio
+        from app.config.settings import settings
+        from app.data.kline_observations import load_kline_download
+
+        try:
+            snapshot = await asyncio.to_thread(load_kline_download, settings.KLINE_DOWNLOAD_DIR, code)
+        except ValueError as exc:
+            raise HTTPException(status_code=422 if len(code) != 6 or not code.isdigit() else 503,
+                                detail=str(exc)) from exc
+        rows = [{key: row.get(key) for key in (
+            "trade_date", "open", "close", "high", "low", "volume", "amount",
+            "turnover", "change_pct", "prev_close",
+        )} for row in (snapshot or {}).get("klines", [])[-limit:]]
+        return {
+            "code": code, "klines": compute_indicators(rows), "count": len(rows),
+            "view": "downloaded", "historical_pit_eligible": False,
+            "downloaded_at": (snapshot or {}).get("downloaded_at"),
+            "coverage": (snapshot or {}).get("coverage"),
+            "price_basis": (snapshot or {}).get("price_basis"),
+            "warning": "下载时可见的前复权历史，仅供看图；覆盖未认证，不用于历史交易证明。",
+        }
+
     result = await db.execute(
         select(StockKline)
         .where(StockKline.code == code)

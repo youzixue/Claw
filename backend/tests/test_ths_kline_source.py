@@ -98,3 +98,20 @@ async def test_single_row_daily_keeps_unknown_return():
     rows = await source.collect_daily("000001")
     assert rows[0]["prev_close"] is None
     assert rows[0]["change_pct"] is None
+
+
+@pytest.mark.asyncio
+async def test_collect_init_reports_unavailable_years_without_certifying_coverage(monkeypatch):
+    source = ThsKlineSource()
+    source.rate_limit = 0
+    source._fetch_kline = AsyncMock(side_effect=lambda code, suffix: (
+        [_kline("2026-09-14", 10.5)] if suffix in ("last.js", "2026.js") else None
+    ))
+    monkeypatch.setattr("app.data.sources.ths_kline_source.asyncio.sleep", AsyncMock())
+    coverage = {}
+    rows = await source.collect_init("000001", coverage=coverage)
+    assert len(rows) == 1
+    assert coverage["certified"] is False
+    assert coverage["last_rows"] == 1
+    assert 2018 in coverage["unavailable_years"]
+    assert coverage["year_rows"]["2018"] == 0

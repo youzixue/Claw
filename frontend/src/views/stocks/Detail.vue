@@ -191,6 +191,13 @@
       <el-tab-pane label="K线" name="kline">
         <div class="kline-toolbar">
           <div class="kline-indicator-group">
+            <span class="toolbar-label">数据:</span>
+            <el-radio-group v-model="klineView" size="small" @change="reloadKlineView">
+              <el-radio-button value="projection">日常采集</el-radio-button>
+              <el-radio-button value="downloaded">下载历史</el-radio-button>
+            </el-radio-group>
+          </div>
+          <div class="kline-indicator-group">
             <span class="toolbar-label">主图指标:</span>
             <el-radio-group v-model="mainIndicator" size="small">
               <el-radio-button value="ma">MA均线</el-radio-button>
@@ -236,6 +243,19 @@
             </span>
           </div>
         </div>
+        <el-alert
+          v-if="klineView === 'downloaded'"
+          data-testid="downloaded-history-note"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="klineMetadata.downloaded_at
+            ? '历史下载 · ' + klineMetadata.downloaded_at + ' · 前复权快照，仅供看图，覆盖未认证，不用于历史交易证明'
+            : '尚无有效历史下载；请先运行 README 中的新电脑历史下载命令'"
+          :description="klineMetadata.coverage?.unavailable_years?.length
+            ? '未取到年份：' + klineMetadata.coverage.unavailable_years.join('、') + '（可能上市前或源故障，不能认定完整）'
+            : ''"
+        />
         <div class="panel-card kline-panel" :class="{ 'is-dragging': klineIsDragging }" tabindex="0" @keydown="handleKlineKeydown">
           <div v-if="displayIndicators" class="kline-side-panel">
             <div class="kline-side-panel-head">
@@ -617,6 +637,9 @@ const tag = ref('')
 const klines = ref([])
 const klineLoading = ref(false)
 const klineError = ref('')
+const klineView = ref('projection')
+const klineMetadata = ref({})
+let klineRequestId = 0
 const fundFlowList = ref([])
 const score = ref({})
 const resonance = ref({})
@@ -1488,6 +1511,8 @@ const resetStockState = () => {
   profile.value = {}
   tag.value = ''
   klines.value = []
+  klineMetadata.value = {}
+  klineRequestId += 1
   klineLoading.value = false
   klineError.value = ''
   fundFlowList.value = []
@@ -1552,27 +1577,37 @@ const loadStockBaseData = async (stockCode, version = stockLoadVersion) => {
 }
 
 const loadKlineData = async (stockCode, version = stockLoadVersion) => {
-  if (!stockCode || klineLoading.value) return
+  if (!stockCode) return
+  const requestId = ++klineRequestId
+  const view = klineView.value
+  const isCurrent = () => code.value === stockCode && version === stockLoadVersion
+    && requestId === klineRequestId && view === klineView.value
   klineLoaded = true
   klineLoading.value = true
   klineError.value = ''
+  klineMetadata.value = {}
+  klines.value = []
   try {
-    const res = await getStockKline(stockCode, { limit: 800 })
-    if (code.value !== stockCode || version !== stockLoadVersion) return
+    const res = await getStockKline(stockCode, { limit: 800, view })
+    if (!isCurrent()) return
     klines.value = res?.klines || []
+    klineMetadata.value = res || {}
     resetHoveredKline()
     syncKlineGraphicWidth()
   } catch {
-    if (code.value === stockCode && version === stockLoadVersion) {
+    if (isCurrent()) {
       klineLoaded = false
       klines.value = []
       klineError.value = 'K线数据加载失败'
     }
   } finally {
-    if (code.value === stockCode && version === stockLoadVersion) {
-      klineLoading.value = false
-    }
+    if (isCurrent()) klineLoading.value = false
   }
+}
+
+const reloadKlineView = () => {
+  klineLoaded = false
+  loadKlineData(code.value, stockLoadVersion)
 }
 
 onMounted(() => {

@@ -74,6 +74,54 @@ npm install
 npm run dev  # http://localhost:5173
 ```
 
+### 新电脑：下载股票历史日 K 线
+
+先按“本地开发”安装后端依赖。历史下载可在**第一次启动后端之前**执行，
+不需要已有数据库，不开启调度/模拟盘，不发送飞书，也不需要作者的问财 Cookie。
+
+在项目根目录打开终端：
+
+**macOS / Linux**（以下沿用本 README 的 `backend/venv`；若建立的是 `.venv`，把 `venv` 换成 `.venv`）：
+
+```bash
+cd backend
+
+# 先拉两只试跑
+./venv/bin/python -m scripts.backfill_stock_kline_codes --download 000001 600519
+
+# 再拉交易所当前沪深京 A 股列表
+./venv/bin/python -m scripts.backfill_stock_kline_codes --download --all
+
+# 只看进度，不联网
+./venv/bin/python -m scripts.backfill_stock_kline_codes --download --status
+```
+
+**Windows PowerShell**（如果环境目录是 `.venv`，同样替换 `venv`）：
+
+```powershell
+cd backend
+.\venv\Scripts\python.exe -m scripts.backfill_stock_kline_codes --download 000001 600519
+.\venv\Scripts\python.exe -m scripts.backfill_stock_kline_codes --download --all
+.\venv\Scripts\python.exe -m scripts.backfill_stock_kline_codes --download --status
+```
+
+- 默认尝试 **2018 年至下载当天**的同花顺前复权日 K；只保留实际返回的记录，不保证每股/每年都有数据。
+- 可加 `--start-date 2023-01-01 --end-date 2026-09-30` 指定范围；不能指定未来日期。
+- 可先用 `--all --limit 5` 小批试跑。按 `Ctrl+C` 停止后，重跑**相同日期范围**的命令会跳过有效已有文件；
+  空数据、失败和缺失年份会重试，`--refresh` 强制重新抓取但保留旧版本。跨天默认结束日期会变化，想固定断点范围请显式给出 `--end-date`。
+- 全市场需联网、耗时可能较长，采用串行限频，不要同时开多个下载进程。返回码 `2` 表示有部分/空/失败项，
+  不是全市场完整下载成功；最近报告及逐次报告保留这些分母。
+- 下载后正常启动前后端，进入 **个股详情 → K线 → 下载历史**。也可直接打开
+  `http://localhost:5173/stocks/000001` 后切换；“日常采集”仍读取原数据库，两种视图不拼接。
+- 文件保存在项目 `runtime/kline_downloads`，已被 Git 忽略。自定义位置可在自己的环境文件中设置
+  `KLINE_DOWNLOAD_DIR` 为绝对路径，下载命令和后端须使用相同设置。
+- **仅用于看图/描述研究**：当前前复权版本不是历史首知/PIT 数据；列表是[交易所当前上市池](https://github.com/akfamily/akshare/blob/main/akshare/stock/stock_info.py)，
+  不包含完整历史退市样本。缺失年份可能是上市前，也可能是上游不可用，页面会明确提示。
+- 不写 `stock_kline`，不回填历史资金流、新闻、竞价或模拟盘订单，不自动激活策略。
+  只需股票历史图表时，启动后端前设置 `CLAW_DISABLE_SCHEDULER=1` 可关闭日常采集及自动模拟盘调度。
+- 页面“数据治理 → 数据回填”当前只登记任务；不要把它当作已执行的历史下载。
+- 旧[全量回填脚本](<scripts/backfill_kline.py>)的跳过/强制删数据行为不适合新电脑初始化，不要用 `--force-codes` 删除历史来补数据。
+
 ### 2. Docker 部署
 
 ```bash

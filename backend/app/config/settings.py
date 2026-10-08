@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # === 数据源 ===
+    # 新电脑历史下载仅供显式图表查看，不进入策略/回测历史投影。
+    KLINE_DOWNLOAD_DIR: Path = _BACKEND_DIR.parent / "runtime" / "kline_downloads"
     # AkShare (同花顺)
     AKSHARE_RATE_LIMIT: float = 0.5  # 秒/次
     # 东财

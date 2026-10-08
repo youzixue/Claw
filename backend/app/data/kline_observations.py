@@ -11,7 +11,10 @@ from datetime import date, datetime
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import re
+import tempfile
 
 from sqlalchemy import select, tuple_, or_
 from sqlalchemy.dialects.sqlite import insert
@@ -209,3 +212,119 @@ async def persist_kline_observations(
         "evidence_scope": "unreviewed_distinct_content_not_poll_history",
         "recorded_at": now.isoformat(), "recorded_at_is_commit_time": False,
     }
+
+
+# Offline download files are an explicit chart view, not a database projection.
+DOWNLOAD_PROTOCOL = "kline_chart_download_v1"
+DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024
+
+
+def write_download_json(path: Path, payload: dict) -> None:
+    """Atomically publish a local manifest; never expose half-written JSON."""
+    path = Path(path).resolve()
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".download-", dir=path.parent)
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists() and temporary.resolve().parent == path.parent:
+            temporary.unlink()
+
+
+def _download_code(code: str) -> str:
+    if not re.fullmatch(r"[0-9]{6}", str(code)):
+        raise ValueError("历史下载需要6位股票代码")
+    return code
+
+
+def _validate_download(snapshot: dict, code: str) -> None:
+    if (snapshot.get("protocol_version") != DOWNLOAD_PROTOCOL
+            or snapshot.get("code") != code
+            or snapshot.get("scope") != "chart_only"
+            or snapshot.get("historical_pit_eligible") is not False
+            or snapshot.get("coverage", {}).get("certified") is not False):
+        raise ValueError("历史下载元数据无效")
+    downloaded_at = datetime.fromisoformat(snapshot["downloaded_at"])
+    if downloaded_at.tzinfo is None:
+        raise ValueError("历史下载时钟缺少时区")
+    start, end = date.fromisoformat(snapshot["start_date"]), date.fromisoformat(snapshot["end_date"])
+    if not date(2018, 1, 1) <= start <= end <= downloaded_at.date():
+        raise ValueError("历史下载日期范围无效")
+    rows = snapshot.get("klines")
+    if not isinstance(rows, list) or not rows or len(rows) > 10000:
+        raise ValueError("历史下载为空或超出上限")
+    previous = None
+    for row in rows:
+        day = date.fromisoformat(row["trade_date"])
+        if (row.get("code") != code or row.get("source") != "ths"
+                or not start <= day <= end or (previous is not None and day <= previous)
+                or kline_quality_issues(row)):
+            raise ValueError("历史下载行情身份/日期/质量无效")
+        previous = day
+
+
+def save_kline_download(root: Path, code: str, records: list[dict], *,
+                        start: date, end: date, downloaded_at: datetime,
+                        coverage: dict) -> dict:
+    """Keep a full single-download THS series; do not splice adjustment vintages."""
+    code = _download_code(code)
+    rows = [{key: _owned_leaf(row.get(key)) for key in BAR_FIELDS} for row in records]
+    rows.sort(key=lambda row: row["trade_date"])
+    snapshot = {
+        "protocol_version": DOWNLOAD_PROTOCOL, "code": code, "scope": "chart_only",
+        "source_version": SOURCE_VERSIONS["ths"], "price_basis": "forward_adjusted_as_observed",
+        "historical_pit_eligible": False, "downloaded_at": downloaded_at.isoformat(),
+        "start_date": start.isoformat(), "end_date": end.isoformat(),
+        "coverage": {**coverage, "certified": False}, "klines": rows,
+    }
+    _validate_download(snapshot, code)
+    encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(encoded) > DOWNLOAD_MAX_BYTES:
+        raise ValueError("历史下载文件超出上限")
+    digest = hashlib.sha256(encoded).hexdigest()
+    directory = Path(root).resolve() / code
+    # Version files remain intact if a later download fails.
+    version = directory / f"{digest}.json"
+    if not version.exists():
+        write_download_json(version, snapshot)
+    write_download_json(directory / "latest.json",
+                        {"protocol_version": DOWNLOAD_PROTOCOL, "sha256": digest})
+    return {"rows": len(rows), "sha256": digest, "downloaded_at": snapshot["downloaded_at"],
+            "min_date": rows[0]["trade_date"], "max_date": rows[-1]["trade_date"],
+            "coverage": snapshot["coverage"]}
+
+
+def load_kline_download(root: Path, code: str) -> dict | None:
+    """Read one validated snapshot without connecting to or updating a database."""
+    code = _download_code(code)
+    directory = Path(root).resolve() / code
+    pointer_path = directory / "latest.json"
+    if not pointer_path.is_file():
+        return None
+    try:
+        if pointer_path.stat().st_size > 4096:
+            raise ValueError("历史下载索引超出上限")
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        digest = pointer.get("sha256", "")
+        if (pointer.get("protocol_version") != DOWNLOAD_PROTOCOL
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise ValueError("历史下载索引无效")
+        path = directory / f"{digest}.json"
+        if path.resolve().parent != directory.resolve() or path.stat().st_size > DOWNLOAD_MAX_BYTES:
+            raise ValueError("历史下载文件路径或大小无效")
+        encoded = path.read_bytes()
+        if hashlib.sha256(encoded).hexdigest() != digest:
+            raise ValueError("历史下载校验失败")
+        snapshot = json.loads(encoded)
+        _validate_download(snapshot, code)
+        return snapshot
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError("历史下载不可用，请重新下载；旧交易数据未改动") from exc

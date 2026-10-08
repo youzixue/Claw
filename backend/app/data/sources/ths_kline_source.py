@@ -219,7 +219,7 @@ class ThsKlineSource(DataSourceBase):
 
         return klines
 
-    async def collect_init(self, code: str) -> list[dict]:
+    async def collect_init(self, code: str, *, coverage: dict | None = None) -> list[dict]:
         """全量采集: 先last.js获取元数据, 再按年份采集
 
         Args:
@@ -229,9 +229,13 @@ class ThsKlineSource(DataSourceBase):
             K线数据列表
         """
         all_klines = []
+        if coverage is not None:
+            coverage.update(last_rows=0, year_rows={}, unavailable_years=[], certified=False)
 
         # 1. 先取last.js(最近140条+元数据)
         last_data = await self._fetch_kline(code, "last.js")
+        if coverage is not None:
+            coverage["last_rows"] = len(last_data or [])
         if not last_data:
             return []
 
@@ -240,11 +244,15 @@ class ThsKlineSource(DataSourceBase):
         # 2. 日K按年份采集，固定从2018开始(日K last.js只有~140条≈半年)
         start_year = 2018
 
-        current_year = date.today().year
+        current_year = local_now().year
 
         # 3. 按年份采集
         for year in range(start_year, current_year + 1):
             year_data = await self._fetch_kline(code, f"{year}.js")
+            if coverage is not None:
+                coverage["year_rows"][str(year)] = len(year_data or [])
+                if not year_data:
+                    coverage["unavailable_years"].append(year)
             if year_data:
                 all_klines.extend(year_data)
             await asyncio.sleep(self.rate_limit)

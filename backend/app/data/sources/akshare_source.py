@@ -153,6 +153,10 @@ class AkShareSource(DataSourceBase):
 
     # ===== 行情 =====
 
+    async def get_stock_list(self) -> pd.DataFrame:
+        """交易所当前沪深京A股代码/名称；不代表历史证券池或交易授权。"""
+        return await self._safe_call("stock_info_a_code_name", ak.stock_info_a_code_name)
+
     async def get_stock_history(self, symbol: str, period: str = "daily",
                                 start_date: str = "", end_date: str = "",
                                 adjust: str = "qfq") -> pd.DataFrame:
